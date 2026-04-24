@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Caeron Gateway</title>
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        slate: {
+                            850: '#151f32',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            background-color: #0f172a;
+            color: #f8fafc;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            -webkit-tap-highlight-color: transparent;
+        }
+        
+        .toast-enter-active, .toast-leave-active {
+            transition: all 0.3s ease;
+        }
+        .toast-enter-from {
+            opacity: 0;
+            transform: translateY(20px);
+        }
+        .toast-leave-to {
+            opacity: 0;
+            transform: translateY(-20px);
+        }
+
+        /* 隐藏滚动条但保留功能 */
+        .hide-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+        .hide-scrollbar {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+    </style>
+</head>
+<body class="bg-[#deebec] text-[#2c3e50] min-h-screen pb-20">
+    <div id="app" class="max-w-md mx-auto w-full">
+        <!-- 头部导航 -->
+        <header class="sticky top-0 z-30 bg-white/90 backdrop-blur-md border-b border-[#aecfd1] px-4 py-3 flex justify-between items-center">
+            <h1 class="text-xl font-bold bg-gradient-to-r from-blue-400 to-cyan-300 bg-clip-text text-transparent">
+                Caeron Gateway
+            </h1>
+            <div class="text-xs text-[#5a7a7d] font-mono">v0.1.0</div>
+        </header>
+
+        <nav class="flex overflow-x-auto hide-scrollbar border-b border-[#aecfd1] bg-white px-2">
+            <button @click="currentTab = 'providers'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'providers', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'providers'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">供应商管理</button>
+            <button @click="currentTab = 'rules'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'rules', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'rules'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">提示词注入</button>
+        </nav>
+
+        <!-- 主要内容区域 -->
+        <main class="p-4">
+            <!-- 供应商管理 -->
+            <section v-show="currentTab === 'providers'">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-lg font-semibold text-[#2c3e50]">供应商管理</h2>
+                    <button @click="openAddProviderModal" class="bg-[#4199a0] hover:bg-[#77b5b4] text-white px-3 py-1.5 rounded-lg text-sm font-medium transition-colors">
+                        + 添加
+                    </button>
+                </div>
+
+                <!-- 供应商列表 -->
+                <div class="space-y-3">
+                    <div v-if="loading.providers" class="text-center py-8 text-[#77b5b4]">加载中...</div>
+                    <div v-else-if="providers.length === 0" class="text-center py-8 text-[#77b5b4] bg-white/50 rounded-xl border border-[#aecfd1]/50">
+                        暂无供应商，请点击上方添加
+                    </div>
+                    
+                    <div v-for="provider in providers" :key="provider.id" 
+                         class="bg-white rounded-xl p-4 border transition-colors"
+                         :class="[provider.is_enabled ? (provider.is_healthy ? 'border-[#aecfd1]' : 'border-red-900/50 bg-red-900/10') : 'border-[#aecfd1]/50 opacity-60']">
+                        
+                        <!-- 卡片头部 -->
+                        <div class="flex justify-between items-start mb-2">
+                            <div class="flex items-center gap-2">
+                                <div class="w-2.5 h-2.5 rounded-full" 
+                                     :class="[!provider.is_enabled ? 'bg-slate-500' : (provider.is_healthy ? 'bg-emerald-500' : 'bg-red-500')]">
+                                </div>
+                                <h3 class="font-medium text-[#2c3e50]">{{ provider.name }}</h3>
+                                <span v-if="provider.priority === 0" class="text-[10px] bg-[#4199a0]/20 text-[#4199a0] px-1.5 py-0.5 rounded border border-[#4199a0]/30">主</span>
+                                <span class="text-[10px] bg-[#aecfd1] text-[#5a7a7d] px-1.5 py-0.5 rounded">P{{ provider.priority }}</span>
+                            </div>
+                            
+                            <div class="flex gap-2">
+                                <button @click="testProvider(provider.id)" :disabled="loading.test === provider.id" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
+                                    <svg v-if="loading.test === provider.id" class="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                    <svg v-else class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                                </button>
+                                <button @click="editProvider(provider)" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- 卡片内容 -->
+                        <div class="space-y-1.5 text-xs">
+                            <div class="flex text-[#5a7a7d]">
+                                <span class="w-12 shrink-0">URL:</span>
+                                <span class="text-[#5a7a7d] font-mono truncate">{{ provider.api_base_url }}</span>
+                            </div>
+                            <div class="flex text-[#5a7a7d]">
+                                <span class="w-12 shrink-0">Key:</span>
+                                <span class="text-[#77b5b4] font-mono">{{ provider.api_key_masked }}</span>
+                            </div>
+                            
+                            <!-- 支持的模型 -->
+                            <div class="mt-2 pt-2 border-t border-[#aecfd1]/50">
+                                <div class="flex flex-wrap gap-1">
+                                    <template v-if="parseModels(provider.supported_models).length">
+                                        <span v-for="m in parseModels(provider.supported_models)" :key="m" class="text-[10px] bg-[#aecfd1]/50 text-[#5a7a7d] px-1.5 py-0.5 rounded">
+                                            {{ m }}
+                                        </span>
+                                    </template>
+                                    <span v-else class="text-[10px] text-[#77b5b4] italic">通配所有模型</span>
+                                </div>
+                            </div>
+
+                            <!-- 错误信息 -->
+                            <div v-if="!provider.is_healthy && provider.last_error" class="mt-2 p-2 bg-red-900/20 text-red-400 rounded border border-red-900/30 font-mono text-[10px] break-all">
+                                {{ provider.last_error }}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 提示词注入规则管理 -->
+            <section v-show="currentTab === 'rules'">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-lg font-semibold text-[#2c3e50]">注入规则</h2>
+                    <button @click="openAddRuleModal" class="bg-[#4199a0] hover:bg-[#77b5b4] text-white px-3 py-1.5 rounded-lg text-sm font-medium transition-colors">
+                        + 添加
+                    </button>
+                </div>
+
+                <div class="space-y-3">
+                    <div v-if="loading.rules" class="text-center py-8 text-[#77b5b4]">加载中...</div>
+                    <div v-else-if="rules.length === 0" class="text-center py-8 text-[#77b5b4] bg-white/50 rounded-xl border border-[#aecfd1]/50">
+                        暂无规则，请点击上方添加
+                    </div>
+                    
+                    <div v-for="rule in rules" :key="rule.id" 
+                         class="bg-white rounded-xl p-4 border transition-colors"
+                         :class="[rule.is_enabled ? 'border-[#aecfd1]' : 'border-[#aecfd1]/50 opacity-60']">
+                        
+                        <!-- 卡片头部 -->
+                        <div class="flex justify-between items-start mb-2">
+                            <div class="flex items-center gap-2">
+                                <div class="w-2.5 h-2.5 rounded-full" :class="[rule.is_enabled ? 'bg-emerald-500' : 'bg-slate-500']"></div>
+                                <h3 class="font-medium text-[#2c3e50]">{{ rule.name }}</h3>
+                                <span class="text-[10px] bg-[#aecfd1] text-[#5a7a7d] px-1.5 py-0.5 rounded">优先级: {{ rule.priority }}</span>
+                            </div>
+                            
+                            <div class="flex gap-2">
+                                <button @click="editRule(rule)" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- 卡片内容 -->
+                        <div class="space-y-1.5 text-xs text-[#5a7a7d]">
+                            <div class="flex"><span class="w-16 shrink-0">位置:</span><span class="text-[#5a7a7d]">{{ {'system_prepend':'系统消息-前置','system_append':'系统消息-追加','user_prepend':'用户消息-前置','user_append':'用户消息-追加','dialog_start':'对话开头','before_latest':'最新消息前','at_depth_N':'指定深度插入'}[rule.position] || rule.position }} <span v-if="rule.position === 'at_depth_N'">(深度: {{ rule.depth }})</span></span></div>
+                            <div class="flex"><span class="w-16 shrink-0">角色:</span><span class="text-[#5a7a7d]">{{ {'system':'系统','user':'用户','assistant':'助手','user_wrapped_system':'用户包装的系统消息','assistant_prefill':'助手预填充'}[rule.role] || rule.role }}</span></div>
+                            <div v-if="rule.match_condition && rule.match_condition !== '{}'" class="flex">
+                                <span class="w-16 shrink-0">条件:</span>
+                                <span class="text-[#5a7a7d] font-mono text-[10px]">{{ rule.match_condition }}</span>
+                            </div>
+                            <div class="mt-2 p-2 bg-[#deebec] rounded text-[10px] font-mono text-[#5a7a7d] whitespace-pre-wrap max-h-24 overflow-y-auto hide-scrollbar">{{ rule.content }}</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- 供应商表单弹窗 -->
+        <div v-if="showProviderModal" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-white/90 backdrop-blur-sm p-4">
+            <div class="bg-white w-full max-w-md rounded-t-2xl sm:rounded-2xl shadow-2xl border border-[#aecfd1] flex flex-col max-h-[90vh]">
+                <div class="p-4 border-b border-[#aecfd1] flex justify-between items-center shrink-0">
+                    <h3 class="text-lg font-semibold">{{ editingProvider ? '编辑供应商' : '添加供应商' }}</h3>
+                    <button @click="showProviderModal = false" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                
+                <div class="p-4 overflow-y-auto hide-scrollbar space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">名称</label>
+                        <input v-model="providerForm.name" type="text" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0] focus:ring-1 focus:ring-[#4199a0]" placeholder="例如: SiliconFlow">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">API Base URL</label>
+                        <input v-model="providerForm.api_base_url" type="text" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] font-mono text-sm focus:outline-none focus:border-[#4199a0]" placeholder="https://api.example.com/v1">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">API Key</label>
+                        <input v-model="providerForm.api_key" :type="editingProvider ? 'password' : 'text'" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] font-mono text-sm focus:outline-none focus:border-[#4199a0]" placeholder="sk-...">
+                        <p v-if="editingProvider" class="text-[10px] text-[#77b5b4] mt-1">留空表示不修改</p>
+                    </div>
+
+                    <div>
+                        <div class="flex justify-between items-center mb-1">
+                            <label class="block text-sm font-medium text-[#5a7a7d]">支持的模型 (逗号分隔)</label>
+                            <button type="button" @click="fetchUpstreamModels" :disabled="loading.fetchModels" class="text-xs bg-[#4199a0] hover:bg-[#77b5b4] text-white px-2 py-1 rounded transition-colors flex items-center">
+                                <svg v-if="loading.fetchModels" class="animate-spin -ml-1 mr-1 h-3 w-3 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                                拉取模型列表
+                            </button>
+                        </div>
+                        <textarea v-model="providerForm.supported_models" rows="2" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] font-mono text-sm focus:outline-none focus:border-[#4199a0]" placeholder="gpt-4o, claude-3-opus-20240229&#10;留空则匹配所有模型"></textarea>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-[#5a7a7d] mb-1">优先级</label>
+                            <input v-model.number="providerForm.priority" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]" placeholder="0">
+                            <p class="text-[10px] text-[#77b5b4] mt-1">数字越小优先级越高</p>
+                        </div>
+                        <div class="flex items-center mt-6">
+                            <label class="flex items-center cursor-pointer">
+                                <div class="relative">
+                                    <input v-model="providerForm.is_enabled" type="checkbox" class="sr-only">
+                                    <div class="block w-10 h-6 rounded-full transition-colors" :class="providerForm.is_enabled ? 'bg-[#4199a0]' : 'bg-gray-300'"></div>
+                                    <div class="dot absolute left-1 top-1 bg-white shadow w-4 h-4 rounded-full transition" :class="{'transform translate-x-4': providerForm.is_enabled}"></div>
+                                </div>
+                                <div class="ml-3 text-sm font-medium text-[#5a7a7d]">启用</div>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="p-4 border-t border-[#aecfd1] flex justify-between shrink-0 bg-white rounded-b-2xl">
+                    <button v-if="editingProvider" @click="deleteProvider" class="text-red-400 hover:bg-red-400/10 px-3 py-2 rounded-lg text-sm font-medium transition-colors">
+                        删除
+                    </button>
+                    <div v-else></div> <!-- 占位符以保持布局 -->
+                    
+                    <div class="flex gap-2">
+                        <button @click="showProviderModal = false" class="text-[#5a7a7d] hover:bg-[#aecfd1] px-4 py-2 rounded-lg text-sm font-medium transition-colors">
+                            取消
+                        </button>
+                        <button @click="saveProvider" :disabled="loading.save" class="bg-[#4199a0] hover:bg-[#77b5b4] disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center">
+                            <svg v-if="loading.save" class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                            保存
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 模型选择弹窗 -->
+        <div v-if="showModelModal" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-white/90 backdrop-blur-sm p-4">
+            <div class="bg-white w-full max-w-md rounded-t-2xl sm:rounded-2xl shadow-2xl border border-[#aecfd1] flex flex-col max-h-[90vh]">
+                <div class="p-4 border-b border-[#aecfd1] flex justify-between items-center shrink-0">
+                    <h3 class="text-lg font-semibold text-[#2c3e50]">选择模型</h3>
+                    <button @click="showModelModal = false" class="text-[#77b5b4] hover:text-[#4199a0] text-xl leading-none">&times;</button>
+                </div>
+                <div class="p-4 border-b border-[#aecfd1] shrink-0">
+                    <input v-model="modelSearchText" type="text" placeholder="搜索模型..." class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                    <div class="flex items-center justify-between mt-2">
+                        <label class="flex items-center cursor-pointer text-sm text-[#5a7a7d]">
+                            <input type="checkbox" :checked="isAllModelsSelected" @change="toggleAllModels" class="mr-2 accent-[#4199a0]">
+                            全选当前列表
+                        </label>
+                        <span class="text-xs text-[#77b5b4]">已选 {{ selectedModels.length }} 个</span>
+                    </div>
+                </div>
+                <div class="p-4 overflow-y-auto flex-1">
+                    <div v-if="filteredModels.length === 0" class="text-center text-sm text-[#77b5b4] py-8">没有找到模型</div>
+                    <label v-for="model in filteredModels" :key="model" class="flex items-center py-2 px-2 rounded-lg hover:bg-[#deebec] cursor-pointer transition-colors">
+                        <input type="checkbox" :value="model" v-model="selectedModels" class="mr-3 accent-[#4199a0]">
+                        <span class="text-sm text-[#2c3e50] font-mono break-all">{{ model }}</span>
+                    </label>
+                </div>
+                <div class="p-4 border-t border-[#aecfd1] flex justify-end gap-2 shrink-0 bg-white rounded-b-2xl">
+                    <button @click="showModelModal = false" class="text-[#5a7a7d] hover:bg-[#aecfd1] px-4 py-2 rounded-lg text-sm font-medium transition-colors">取消</button>
+                    <button @click="confirmModelSelection" class="bg-[#4199a0] hover:bg-[#77b5b4] text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors">确认选择</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 规则表单弹窗 -->
+        <div v-if="showRuleModal" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-white/90 backdrop-blur-sm p-4">
+            <div class="bg-white w-full max-w-md rounded-t-2xl sm:rounded-2xl shadow-2xl border border-[#aecfd1] flex flex-col max-h-[90vh]">
+                <div class="p-4 border-b border-[#aecfd1] flex justify-between items-center shrink-0">
+                    <h3 class="text-lg font-semibold">{{ editingRule ? '编辑规则' : '添加规则' }}</h3>
+                    <button @click="showRuleModal = false" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                
+                <div class="p-4 overflow-y-auto hide-scrollbar space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">规则名称</label>
+                        <input v-model="ruleForm.name" type="text" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">内容 (支持 {cur_datetime}, {user_name} 等变量)</label>
+                        <textarea v-model="ruleForm.content" rows="4" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] font-mono text-sm focus:outline-none focus:border-[#4199a0]"></textarea>
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-[#5a7a7d] mb-1">注入位置</label>
+                            <select v-model="ruleForm.position" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                                <option value="system_prepend">系统消息前置</option>
+                                <option value="system_append">系统消息追加</option>
+                                <option value="dialog_start">对话开头</option>
+                                <option value="before_latest">最新消息之前</option>
+                                <option value="at_depth_N">指定深度插入</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-[#5a7a7d] mb-1">角色模拟</label>
+                            <select v-model="ruleForm.role" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                                <option value="system">系统消息</option>
+                                <option value="user_wrapped_system">用户包装的系统消息</option>
+                                <option value="assistant_prefill">助手预填充</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-[#5a7a7d] mb-1">优先级 (数字越小越优先)</label>
+                            <input v-model.number="ruleForm.priority" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                        </div>
+                        <div v-if="ruleForm.position === 'at_depth_N'">
+                            <label class="block text-sm font-medium text-[#5a7a7d] mb-1">Depth (倒数第N条)</label>
+                            <input v-model.number="ruleForm.depth" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                        </div>
+                        <div v-else class="flex items-center mt-6">
+                            <label class="flex items-center cursor-pointer">
+                                <div class="relative">
+                                    <input v-model="ruleForm.is_enabled" type="checkbox" class="sr-only">
+                                    <div class="block border border-[#aecfd1] w-10 h-6 rounded-full" :class="ruleForm.is_enabled ? 'bg-[#4199a0]' : 'bg-white'"></div>
+                                    <div class="dot absolute left-1 top-1 bg-white shadow w-4 h-4 rounded-full transition" :class="{'transform translate-x-4 bg-[#4199a0]': ruleForm.is_enabled}"></div>
+                                </div>
+                                <div class="ml-3 text-sm font-medium text-[#5a7a7d]">启用</div>
+                            </label>
+                        </div>
+                    </div>
+                    <div v-if="ruleForm.position === 'at_depth_N'" class="flex items-center">
+                        <label class="flex items-center cursor-pointer">
+                            <div class="relative">
+                                <input v-model="ruleForm.is_enabled" type="checkbox" class="sr-only">
+                                <div class="block border border-[#aecfd1] w-10 h-6 rounded-full" :class="ruleForm.is_enabled ? 'bg-[#4199a0]' : 'bg-white'"></div>
+                                <div class="dot absolute left-1 top-1 bg-white shadow w-4 h-4 rounded-full transition" :class="{'transform translate-x-4 bg-[#4199a0]': ruleForm.is_enabled}"></div>
+                            </div>
+                            <div class="ml-3 text-sm font-medium text-[#5a7a7d]">启用</div>
+                        </label>
+                    </div>
+
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">匹配条件</label>
+                        <textarea v-model="ruleForm.match_condition" rows="2" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] font-mono text-[10px] focus:outline-none focus:border-[#4199a0]" placeholder='{"match_model": "gpt-4", "match_length_min": 5}'></textarea>
+                        <p class="text-[10px] text-[#77b5b4] mt-1">设定规则的生效条件，留空则对所有请求生效。示例：{"match_model": "gpt-4o", "match_length_min": 5}</p>
+                    </div>
+                </div>
+
+                <div class="p-4 border-t border-[#aecfd1] flex justify-between shrink-0 bg-white rounded-b-2xl">
+                    <button v-if="editingRule" @click="deleteRule" class="text-red-400 hover:bg-red-400/10 px-3 py-2 rounded-lg text-sm font-medium transition-colors">
+                        删除
+                    </button>
+                    <div v-else></div>
+                    
+                    <div class="flex gap-2">
+                        <button @click="showRuleModal = false" class="text-[#5a7a7d] hover:bg-[#aecfd1] px-4 py-2 rounded-lg text-sm font-medium transition-colors">
+                            取消
+                        </button>
+                        <button @click="saveRule" :disabled="loading.saveRule" class="bg-[#4199a0] hover:bg-[#77b5b4] disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center">
+                            <svg v-if="loading.saveRule" class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                            保存
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <Transition name="toast">
+            <div v-if="toast.show" class="fixed top-4 left-0 right-0 z-50 flex justify-center px-4 pointer-events-none">
+                <div class="bg-white border shadow-lg rounded-full px-4 py-2 flex items-center gap-2"
+                     :class="toast.type === 'error' ? 'border-red-500/50 text-red-200' : (toast.type === 'success' ? 'border-emerald-500/50 text-emerald-200' : 'border-[#4199a0]/50 text-blue-200')">
+                    <svg v-if="toast.type === 'success'" class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                    <svg v-else-if="toast.type === 'error'" class="w-4 h-4 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    <svg v-else class="w-4 h-4 text-[#4199a0]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    <span class="text-sm">{{ toast.message }}</span>
+                </div>
+            </div>
+        </Transition>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted, reactive } = Vue;
+
+        createApp({
+            setup() {
+                // 状态
+                const currentTab = ref('providers');
+                const providers = ref([]);
+                const rules = ref([]);
+                const loading = reactive({
+                    providers: false,
+                    rules: false,
+                    save: false,
+                    saveRule: false,
+                    fetchModels: false,
+                    test: null
+                });
+                
+                // 模型选择弹窗状态
+                const showModelModal = ref(false);
+                const availableModels = ref([]);
+                const modelSearchText = ref('');
+                const selectedModels = ref([]);
+
+                
+                // 弹窗表单状态
+                const showProviderModal = ref(false);
+                const showRuleModal = ref(false);
+                const editingProvider = ref(null);
+                const editingRule = ref(null);
+                const providerForm = reactive({
+                    name: '',
+                    api_base_url: '',
+                    api_key: '',
+                    supported_models: '',
+                    priority: 0,
+                    is_enabled: true
+                });
+                const ruleForm = reactive({
+                    name: '',
+                    content: '',
+                    position: 'system_append',
+                    role: 'system',
+                    priority: 0,
+                    depth: 0,
+                    match_condition: '{}',
+                    is_enabled: true
+                });
+
+                // Toast 状态
+                const toast = reactive({ show: false, message: '', type: 'info' });
+                let toastTimer = null;
+
+                const showToast = (message, type = 'info') => {
+                    toast.message = message;
+                    toast.type = type;
+                    toast.show = true;
+                    if (toastTimer) clearTimeout(toastTimer);
+                    toastTimer = setTimeout(() => { toast.show = false; }, 3000);
+                };
+
+                // 工具函数
+                const parseModels = (modelsStr) => {
+                    if (!modelsStr) return [];
+                    try {
+                        const parsed = JSON.parse(modelsStr);
+                        return Array.isArray(parsed) ? parsed : [];
+                    } catch {
+                        return modelsStr.split(',').map(m => m.trim()).filter(Boolean);
+                    }
+                };
+
+                const formatModelsForForm = (modelsStr) => {
+                    const parsed = parseModels(modelsStr);
+                    return parsed.join(', ');
+                };
+
+                
+                const filteredModels = Vue.computed(() => {
+                    if (!modelSearchText.value) return availableModels.value;
+                    const l = modelSearchText.value.toLowerCase();
+                    return availableModels.value.filter(m => m.toLowerCase().includes(l));
+                });
+                const isAllModelsSelected = Vue.computed(() => {
+                    return filteredModels.value.length > 0 && filteredModels.value.every(m => selectedModels.value.includes(m));
+                });
+                const toggleAllModels = (e) => {
+                    if (e.target.checked) {
+                        const newSelected = new Set([...selectedModels.value, ...filteredModels.value]);
+                        selectedModels.value = Array.from(newSelected);
+                    } else {
+                        selectedModels.value = selectedModels.value.filter(m => !filteredModels.value.includes(m));
+                    }
+                };
+                
+                const fetchUpstreamModels = async () => {
+                    if (!providerForm.api_base_url || (!editingProvider.value && !providerForm.api_key)) {
+                        showToast('请先填写 API Base URL 和 API Key', 'error');
+                        return;
+                    }
+                    loading.fetchModels = true;
+                    try {
+                        const res = await fetch('/admin/api/providers/fetch-models', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                base_url: providerForm.api_base_url,
+                                api_key: providerForm.api_key || (editingProvider.value ? editingProvider.value.api_key : '')
+                            })
+                        });
+                        const data = await res.json();
+                        if (!res.ok) throw new Error(data.detail || '拉取失败');
+                        
+                        availableModels.value = data.models || [];
+                        selectedModels.value = parseModels(providerForm.supported_models);
+                        modelSearchText.value = '';
+                        showModelModal.value = true;
+                    } catch (err) {
+                        showToast(`拉取模型失败: ${err.message}`, 'error');
+                    } finally {
+                        loading.fetchModels = false;
+                    }
+                };
+                
+                const confirmModelSelection = () => {
+                    providerForm.supported_models = selectedModels.value.join(', ');
+                    showModelModal.value = false;
+                };
+                // API 调用
+                const fetchProviders = async () => {
+                    loading.providers = true;
+                    try {
+                        const res = await fetch('/admin/api/providers');
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        providers.value = await res.json();
+                    } catch (error) {
+                        showToast(`加载供应商失败: ${error.message}`, 'error');
+                    } finally {
+                        loading.providers = false;
+                    }
+                };
+
+                const saveProvider = async () => {
+                    if (!providerForm.name || !providerForm.api_base_url || (!editingProvider.value && !providerForm.api_key)) {
+                        showToast('请填写必填字段', 'error');
+                        return;
+                    }
+
+                    loading.save = true;
+                    try {
+                        const url = editingProvider.value 
+                            ? `/admin/api/providers/${editingProvider.value.id}` 
+                            : '/admin/api/providers';
+                        const method = editingProvider.value ? 'PUT' : 'POST';
+                        
+                        // 构造 payload
+                        const payload = { ...providerForm };
+                        if (editingProvider.value && !payload.api_key) {
+                            delete payload.api_key; // 不修改 key
+                        }
+
+                        const res = await fetch(url, {
+                            method,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+
+                        if (!res.ok) {
+                            const err = await res.json();
+                            throw new Error(err.detail || '保存失败');
+                        }
+
+                        showToast(editingProvider.value ? '已更新供应商' : '已添加供应商', 'success');
+                        showProviderModal.value = false;
+                        await fetchProviders();
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    } finally {
+                        loading.save = false;
+                    }
+                };
+
+                const deleteProvider = async () => {
+                    if (!confirm(`确定要删除供应商 "${providerForm.name}" 吗？此操作不可撤销。`)) return;
+                    
+                    try {
+                        const res = await fetch(`/admin/api/providers/${editingProvider.value.id}`, { method: 'DELETE' });
+                        if (!res.ok) throw new Error('删除失败');
+                        
+                        showToast('已删除', 'success');
+                        showProviderModal.value = false;
+                        await fetchProviders();
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    }
+                };
+
+                const testProvider = async (id) => {
+                    loading.test = id;
+                    try {
+                        const res = await fetch(`/admin/api/providers/${id}/test`, { method: 'POST' });
+                        const data = await res.json();
+                        
+                        if (data.success) {
+                            showToast(data.message, 'success');
+                        } else {
+                            showToast(`测试失败: ${data.error}`, 'error');
+                        }
+                        
+                        // 刷新列表以更新健康状态
+                        await fetchProviders();
+                    } catch (error) {
+                        showToast(`请求失败: ${error.message}`, 'error');
+                    } finally {
+                        loading.test = null;
+                    }
+                };
+
+                // Rules API
+                const fetchRules = async () => {
+                    loading.rules = true;
+                    try {
+                        const res = await fetch('/admin/api/rules');
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        rules.value = await res.json();
+                    } catch (error) {
+                        showToast(`加载规则失败: ${error.message}`, 'error');
+                    } finally {
+                        loading.rules = false;
+                    }
+                };
+
+                const saveRule = async () => {
+                    if (!ruleForm.name || !ruleForm.content) {
+                        showToast('请填写必填字段', 'error');
+                        return;
+                    }
+                    try {
+                        // 验证 JSON
+                        if (ruleForm.match_condition) {
+                            JSON.parse(ruleForm.match_condition);
+                        }
+                    } catch {
+                        showToast('匹配条件必须是有效的 JSON', 'error');
+                        return;
+                    }
+
+                    loading.saveRule = true;
+                    try {
+                        const url = editingRule.value 
+                            ? `/admin/api/rules/${editingRule.value.id}` 
+                            : '/admin/api/rules';
+                        const method = editingRule.value ? 'PUT' : 'POST';
+                        
+                        const payload = { ...ruleForm };
+                        payload.is_enabled = payload.is_enabled ? 1 : 0;
+
+                        const res = await fetch(url, {
+                            method,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+
+                        if (!res.ok) throw new Error('保存失败');
+
+                        showToast(editingRule.value ? '已更新规则' : '已添加规则', 'success');
+                        showRuleModal.value = false;
+                        await fetchRules();
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    } finally {
+                        loading.saveRule = false;
+                    }
+                };
+
+                const deleteRule = async () => {
+                    if (!confirm(`确定要删除规则 "${ruleForm.name}" 吗？`)) return;
+                    try {
+                        const res = await fetch(`/admin/api/rules/${editingRule.value.id}`, { method: 'DELETE' });
+                        if (!res.ok) throw new Error('删除失败');
+                        showToast('已删除', 'success');
+                        showRuleModal.value = false;
+                        await fetchRules();
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    }
+                };
+
+                // UI 交互
+                const openAddProviderModal = () => {
+                    editingProvider.value = null;
+                    Object.assign(providerForm, {
+                        name: '',
+                        api_base_url: '',
+                        api_key: '',
+                        supported_models: '',
+                        priority: 0,
+                        is_enabled: true
+                    });
+                    showProviderModal.value = true;
+                };
+
+                const editProvider = (provider) => {
+                    editingProvider.value = provider;
+                    Object.assign(providerForm, {
+                        name: provider.name,
+                        api_base_url: provider.api_base_url,
+                        api_key: '', // 编辑时不显示 key
+                        supported_models: formatModelsForForm(provider.supported_models),
+                        priority: provider.priority,
+                        is_enabled: Boolean(provider.is_enabled)
+                    });
+                    showProviderModal.value = true;
+                };
+
+                const openAddRuleModal = () => {
+                    editingRule.value = null;
+                    Object.assign(ruleForm, {
+                        name: '', content: '', position: 'system_append', role: 'system',
+                        priority: 0, depth: 0, match_condition: '{}', is_enabled: true
+                    });
+                    showRuleModal.value = true;
+                };
+
+                const editRule = (rule) => {
+                    editingRule.value = rule;
+                    Object.assign(ruleForm, {
+                        name: rule.name, content: rule.content, position: rule.position,
+                        role: rule.role, priority: rule.priority, depth: rule.depth,
+                        match_condition: rule.match_condition || '{}', is_enabled: Boolean(rule.is_enabled)
+                    });
+                    showRuleModal.value = true;
+                };
+
+                // 初始化
+                onMounted(() => {
+                    fetchProviders();
+                    fetchRules();
+                });
+
+                return {
+                    currentTab,
+                    providers, rules, loading, 
+                    showProviderModal, showRuleModal, editingProvider, editingRule, providerForm, ruleForm,
+                    toast,
+                    parseModels, openAddProviderModal, editProvider,
+                    saveProvider, deleteProvider, testProvider,
+                    openAddRuleModal, editRule, saveRule, deleteRule,
+                    showModelModal, availableModels, modelSearchText, selectedModels, filteredModels, isAllModelsSelected, toggleAllModels, fetchUpstreamModels, confirmModelSelection
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
