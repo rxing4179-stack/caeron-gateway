@@ -40,9 +40,18 @@ async def init_db():
                 is_healthy INTEGER DEFAULT 1,
                 last_error TEXT,
                 last_used_at TEXT,
+                unhealthy_since TEXT,
+                fail_count INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now'))
             )
         ''')
+
+        # Migration: 为已有 providers 表添加新字段（忽略已存在的情况）
+        for col, col_def in [('unhealthy_since', 'TEXT'), ('fail_count', 'INTEGER DEFAULT 0')]:
+            try:
+                await db.execute(f'ALTER TABLE providers ADD COLUMN {col} {col_def}')
+            except Exception:
+                pass  # 字段已存在则忽略
 
         # ==================== 配置表 ====================
         await db.execute('''
@@ -70,6 +79,113 @@ async def init_db():
                 updated_at TEXT DEFAULT (datetime('now'))
             )
         ''')
+
+        # ==================== 对话表 ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT UNIQUE NOT NULL,
+                provider_id INTEGER,
+                model TEXT,
+                started_at TEXT DEFAULT (datetime('now')),
+                last_message_at TEXT,
+                message_count INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        ''')
+
+        # ==================== 消息表（原文存档） ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                message_index INTEGER,
+                token_count INTEGER,
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+            )
+        ''')
+
+        # ==================== 总结表（多层级） ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT,
+                level TEXT NOT NULL,
+                tag TEXT DEFAULT '',
+                content TEXT NOT NULL,
+                message_range_start INTEGER,
+                message_range_end INTEGER,
+                period_start TEXT,
+                period_end TEXT,
+                parent_summary_id INTEGER,
+                is_active INTEGER DEFAULT 1,
+                token_count INTEGER,
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
+                FOREIGN KEY (parent_summary_id) REFERENCES summaries(id)
+            )
+        ''')
+
+        # Migration: summaries表添加tag字段
+        try:
+            await db.execute("ALTER TABLE summaries ADD COLUMN tag TEXT DEFAULT ''")
+        except Exception:
+            pass  # 字段已存在则忽略
+
+        # ==================== 记忆表（便签墙） ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                category TEXT,
+                sentiment TEXT DEFAULT 'neutral',
+                intensity INTEGER DEFAULT 3,
+                relationship_importance INTEGER DEFAULT 3,
+                weight REAL DEFAULT 0.5,
+                frequency INTEGER DEFAULT 1,
+                is_core INTEGER DEFAULT 0,
+                embedding BLOB,
+                source_message_id INTEGER,
+                source_summary_id INTEGER,
+                last_accessed_at TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (source_message_id) REFERENCES messages(id),
+                FOREIGN KEY (source_summary_id) REFERENCES summaries(id)
+            )
+        ''')
+
+        # ==================== 窗口表（手动分组） ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS windows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                color TEXT DEFAULT '#4a90d9',
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        ''')
+
+        # conversations 表添加 window_id 列（如果不存在）
+        try:
+            await db.execute('ALTER TABLE conversations ADD COLUMN window_id INTEGER REFERENCES windows(id)')
+        except Exception:
+            pass  # 列已存在则忽略
+
+        # ==================== 索引 ====================
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_summaries_conversation ON summaries(conversation_id)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_summaries_level ON summaries(level)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_summaries_active ON summaries(is_active)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_memories_weight ON memories(weight DESC)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_memories_core ON memories(is_core)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)')
 
         await db.commit()
         logger.info("数据库初始化完成")

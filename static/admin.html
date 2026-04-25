@@ -1,6 +1,26 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+    <script>
+    window.onerror = function(msg, url, line, col, error) {
+        var d = document.createElement('div');
+        d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#ff4444;color:white;padding:16px;font-size:14px;font-family:monospace;white-space:pre-wrap;word-break:break-all;max-height:50vh;overflow:auto';
+        d.textContent = 'JS ERROR:
+' + msg + '
+File: ' + url + '
+Line: ' + line + ', Col: ' + col + '
+' + (error && error.stack ? error.stack : '');
+        document.body ? document.body.prepend(d) : document.addEventListener('DOMContentLoaded', function(){document.body.prepend(d)});
+        return false;
+    };
+    window.addEventListener('unhandledrejection', function(e) {
+        var d = document.createElement('div');
+        d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#ff6600;color:white;padding:16px;font-size:14px;font-family:monospace;white-space:pre-wrap;word-break:break-all;max-height:50vh;overflow:auto';
+        d.textContent = 'PROMISE ERROR:
+' + (e.reason ? (e.reason.stack || e.reason.message || String(e.reason)) : 'unknown');
+        document.body ? document.body.prepend(d) : document.addEventListener('DOMContentLoaded', function(){document.body.prepend(d)});
+    });
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Caeron Gateway</title>
@@ -50,6 +70,12 @@
             -ms-overflow-style: none;
             scrollbar-width: none;
         }
+        .line-clamp-2 {
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
     </style>
 </head>
 <body class="bg-[#deebec] text-[#2c3e50] min-h-screen pb-20">
@@ -65,6 +91,8 @@
         <nav class="flex overflow-x-auto hide-scrollbar border-b border-[#aecfd1] bg-white px-2">
             <button @click="currentTab = 'providers'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'providers', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'providers'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">供应商管理</button>
             <button @click="currentTab = 'rules'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'rules', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'rules'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">提示词注入</button>
+            <button @click="currentTab = 'conversations'; viewMode === 'windows' ? fetchWindows() : fetchConversations()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'conversations', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'conversations'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">对话记录</button>
+            <button @click="currentTab = 'memory'; fetchSummaries(); fetchSummaryStats()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'memory', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'memory'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">记忆总览</button>
         </nav>
 
         <!-- 主要内容区域 -->
@@ -82,7 +110,7 @@
                 <div class="space-y-3">
                     <div v-if="loading.providers" class="text-center py-8 text-[#77b5b4]">加载中...</div>
                     <div v-else-if="providers.length === 0" class="text-center py-8 text-[#77b5b4] bg-white/50 rounded-xl border border-[#aecfd1]/50">
-                        暂无供应商，请点击上方添加
+                        暂无供应���������������������，请点击上方添加
                     </div>
                     
                     <div v-for="provider in providers" :key="provider.id" 
@@ -180,7 +208,7 @@
                         <!-- 卡片内容 -->
                         <div class="space-y-1.5 text-xs text-[#5a7a7d]">
                             <div class="flex"><span class="w-16 shrink-0">位置:</span><span class="text-[#5a7a7d]">{{ {'system_prepend':'系统消息-前置','system_append':'系统消息-追加','user_prepend':'用户消息-前置','user_append':'用户消息-追加','dialog_start':'对话开头','before_latest':'最新消息前','at_depth_N':'指定深度插入'}[rule.position] || rule.position }} <span v-if="rule.position === 'at_depth_N'">(深度: {{ rule.depth }})</span></span></div>
-                            <div class="flex"><span class="w-16 shrink-0">角色:</span><span class="text-[#5a7a7d]">{{ {'system':'系统','user':'用户','assistant':'助手','user_wrapped_system':'用户包装的系统消息','assistant_prefill':'助手预填充'}[rule.role] || rule.role }}</span></div>
+                            <div class="flex"><span class="w-16 shrink-0">角色:</span><span class="text-[#5a7a7d]">{{ {'system':'系统','user':'用户','assistant':'助手','user_wrapped_system':'用户包装的系统消息','assistant_prefill':'助��预��充'}[rule.role] || rule.role }}</span></div>
                             <div v-if="rule.match_condition && rule.match_condition !== '{}'" class="flex">
                                 <span class="w-16 shrink-0">条件:</span>
                                 <span class="text-[#5a7a7d] font-mono text-[10px]">{{ rule.match_condition }}</span>
@@ -190,7 +218,443 @@
                     </div>
                 </div>
             </section>
+
+            <!-- 对话记录 -->
+            <section v-show="currentTab === 'conversations'">
+                <!-- 顶部工具栏 -->
+                <div class="mb-4 space-y-3">
+                    <div class="flex justify-between items-center">
+                        <h2 class="text-lg font-semibold text-[#2c3e50]">对话记录</h2>
+                        <div class="flex items-center gap-2">
+                            <!-- 视图切换 -->
+                            <div class="flex bg-[#deebec] rounded-lg p-0.5">
+                                <button @click="viewMode = 'windows'; fetchWindows()" :class="viewMode === 'windows' ? 'bg-white text-[#4199a0] shadow-sm' : 'text-[#5a7a7d]'" class="px-2 py-1 text-[10px] rounded-md transition-all" title="按窗口分组">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                                </button>
+                                <button @click="viewMode = 'flat'; fetchConversations()" :class="viewMode === 'flat' ? 'bg-white text-[#4199a0] shadow-sm' : 'text-[#5a7a7d]'" class="px-2 py-1 text-[10px] rounded-md transition-all" title="平铺列表">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
+                                </button>
+                            </div>
+                            <button @click="viewMode === 'windows' ? fetchWindows() : fetchConversations()" class="text-[#5a7a7d] hover:text-[#4199a0] p-1" title="刷新">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- 搜索框 -->
+                    <div class="relative">
+                        <input v-model="searchQuery" @input="debounceSearch" type="text" placeholder="搜索消息内容..."
+                               class="w-full bg-white border border-[#aecfd1] rounded-lg pl-9 pr-8 py-2 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0] focus:ring-1 focus:ring-[#4199a0]">
+                        <svg class="absolute left-3 top-2.5 w-4 h-4 text-[#77b5b4]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                        <button v-if="searchQuery" @click="searchQuery = ''; searchResults = []" class="absolute right-3 top-2.5 text-[#77b5b4] hover:text-[#4199a0]">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                        </button>
+                    </div>
+
+                    <!-- 时间筛选 -->
+                    <div class="flex gap-2 items-center text-sm flex-wrap">
+                        <span class="text-[#5a7a7d] shrink-0 text-xs">时间:</span>
+                        <input v-model="dateStart" @change="viewMode === 'windows' ? fetchWindows() : fetchConversations()" type="date" class="bg-white border border-[#aecfd1] rounded-lg px-2 py-1 text-xs text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                        <span class="text-[#77b5b4] text-xs">至</span>
+                        <input v-model="dateEnd" @change="viewMode === 'windows' ? fetchWindows() : fetchConversations()" type="date" class="bg-white border border-[#aecfd1] rounded-lg px-2 py-1 text-xs text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                        <button v-if="dateStart || dateEnd" @click="dateStart = ''; dateEnd = ''; viewMode === 'windows' ? fetchWindows() : fetchConversations()" class="text-[10px] text-[#77b5b4] hover:text-[#4199a0] underline">清除</button>
+                    </div>
+                </div>
+
+                <!-- 搜索结果区 -->
+                <div v-if="searchResults.length > 0" class="mb-4">
+                    <h3 class="text-sm font-medium text-[#5a7a7d] mb-2">搜索结果 ({{ searchResults.length }}条)</h3>
+                    <div class="space-y-2">
+                        <div v-for="sr in searchResults" :key="sr.id" class="bg-white rounded-lg border border-[#aecfd1] p-3">
+                            <div class="flex items-center gap-2 mb-1">
+                                <span class="text-[10px] font-mono bg-[#4199a0]/20 text-[#4199a0] px-1 py-0.5 rounded">{{ sr.conversation_id.slice(0, 8) }}</span>
+                                <span class="text-[10px] px-1.5 py-0.5 rounded" :class="sr.role === 'user' ? 'bg-[#4199a0] text-white' : 'bg-[#aecfd1] text-[#5a7a7d]'">{{ sr.role }}</span>
+                                <span class="text-[10px] text-[#77b5b4]">{{ sr.model || '' }}</span>
+                                <span class="text-[10px] text-[#77b5b4] ml-auto">{{ formatTime(sr.created_at) }}</span>
+                            </div>
+                            <p class="text-sm text-[#2c3e50] whitespace-pre-wrap break-words" v-html="highlightSearch(sr.snippet)"></p>
+                        </div>
+                    </div>
+                </div>
+                <div v-else-if="searchQuery && !loading.search" class="mb-4 text-center py-4 text-sm text-[#77b5b4]">
+                    无���������������������索结果
+                </div>
+                <div v-if="loading.search" class="mb-4 text-center py-4 text-sm text-[#77b5b4]">搜索中...</div>
+
+                <!-- 窗口分组视图 -->
+                <div v-show="!searchQuery && viewMode === 'windows'" class="space-y-3">
+                    <!-- 创建窗口按钮 -->
+                    <div class="flex justify-end mb-1">
+                        <button @click="openCreateWindowModal()" class="flex items-center gap-1.5 bg-[#4199a0] hover:bg-[#357e84] text-white text-xs px-3 py-1.5 rounded-lg transition-colors shadow-sm">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                            创建窗口
+                        </button>
+                    </div>
+                    <div v-if="loading.conversations" class="text-center py-8 text-[#77b5b4]">加载中...</div>
+                    <div v-else-if="windows.length === 0" class="text-center py-8 text-[#77b5b4] bg-white/50 rounded-xl border border-[#aecfd1]/50">
+                        暂无窗口，点击上方按钮创建
+                    </div>
+
+                    <div v-for="win in windows" :key="win.window_id ?? 'unassigned'" class="bg-white rounded-xl border overflow-hidden" :style="{ borderColor: win.color || '#aecfd1' }">
+                        <!-- 窗口卡片头部 -->
+                        <div class="p-3 cursor-pointer hover:bg-[#deebec]/30 transition-colors" @click="toggleWindow(win)">
+                            <div class="flex justify-between items-start">
+                                <div class="flex-1 min-w-0 mr-3">
+                                    <div class="flex items-center gap-2 mb-1">
+                                        <span v-if="win.color" class="w-2.5 h-2.5 rounded-full shrink-0" :style="{ backgroundColor: win.color }"></span>
+                                        <span v-if="win.is_manual" class="text-[10px] bg-[#4199a0]/15 text-[#4199a0] px-1.5 py-0.5 rounded font-medium">窗口</span>
+                                        <span v-else class="text-[10px] bg-gray-200 text-gray-500 px-1.5 py-0.5 rounded font-medium">未归类</span>
+                                        <span class="text-[10px] bg-[#aecfd1]/60 text-[#5a7a7d] px-1.5 py-0.5 rounded">{{ win.conversations.length }} 段对话</span>
+                                        <span class="text-[10px] bg-[#aecfd1]/60 text-[#5a7a7d] px-1.5 py-0.5 rounded">{{ win.total_messages }} 条消息</span>
+                                    </div>
+                                    <p class="text-sm text-[#2c3e50] font-medium line-clamp-2">{{ win.title }}</p>
+                                    <p v-if="win.description" class="text-[10px] text-[#77b5b4] mt-0.5 line-clamp-1">{{ win.description }}</p>
+                                    <div class="text-[10px] text-[#77b5b4] mt-1">
+                                        {{ formatTime(win.first_active) }} ~ {{ formatTime(win.last_active) }}
+                                    </div>
+                                </div>
+                                <div class="flex items-center gap-1 shrink-0 mt-1">
+                                    <template v-if="win.is_manual">
+                                        <button @click.stop="openEditWindowModal(win)" class="text-[#77b5b4] hover:text-[#4199a0] p-1" title="编辑窗口">
+                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                                        </button>
+                                        <button @click.stop="deleteWindow(win.window_id)" class="text-[#77b5b4] hover:text-red-400 p-1" title="删除窗口">
+                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                        </button>
+                                    </template>
+                                    <svg class="w-4 h-4 text-[#77b5b4] transition-transform" :class="{'rotate-180': win._expanded}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 窗口展开后的对话列表 -->
+                        <div v-if="win._expanded" class="border-t border-[#aecfd1]/50 bg-[#f7fafa] p-3 space-y-2">
+                            <div v-for="conv in win.conversations" :key="conv.conversation_id" class="bg-white rounded-lg border border-[#aecfd1]/70 overflow-hidden">
+                                <!-- 对话卡片头部 (窗口内) -->
+                                <div class="p-3 cursor-pointer hover:bg-[#deebec]/30 transition-colors" @click="toggleConversation(conv)">
+                                    <div class="flex justify-between items-start">
+                                        <div class="flex-1 min-w-0 mr-3">
+                                            <div class="flex items-center gap-2 mb-1">
+                                                <span class="text-[10px] bg-[#4199a0]/20 text-[#4199a0] px-1.5 py-0.5 rounded font-mono">{{ conv.conversation_id.slice(0, 8) }}</span>
+                                                <span class="text-[10px] bg-[#aecfd1] text-[#5a7a7d] px-1.5 py-0.5 rounded">{{ conv.message_count }} 条</span>
+                                            </div>
+                                            <p class="text-xs text-[#2c3e50] truncate">{{ conv.preview || '(空消息)' }}</p>
+                                            <div class="text-[10px] text-[#77b5b4] mt-1">
+                                                <span>{{ formatTime(conv.last_message_at || conv.created_at) }}</span>
+                                            </div>
+                                        </div>
+                                        <div class="flex items-center gap-1">
+                                            <button v-if="win.is_manual" @click.stop="unassignConversation(conv.conversation_id)" class="text-[#77b5b4] hover:text-amber-500 p-1" title="移出窗口">
+                                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                                            </button>
+                                            <button v-if="!win.is_manual" @click.stop="openAssignModal(conv.conversation_id)" class="text-[#77b5b4] hover:text-[#4199a0] p-1" title="分配到窗口">
+                                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                                            </button>
+                                            <button @click.stop="deleteConversation(conv.conversation_id)" class="text-[#77b5b4] hover:text-red-400 p-1" title="删除">
+                                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                            </button>
+                                            <svg class="w-3.5 h-3.5 text-[#77b5b4] transition-transform" :class="{'rotate-180': conv._expanded}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- 展开的消息列表 (窗口内对话) -->
+                                <div v-if="conv._expanded" class="border-t border-[#aecfd1]/50 bg-[#f7fafa] max-h-[60vh] overflow-y-auto hide-scrollbar">
+                                    <div v-if="conv._loadingMessages" class="text-center py-6 text-[#77b5b4] text-sm">加载消息中...</div>
+                                    <div v-else class="p-3 space-y-2">
+                                        <template v-for="msg in conv._messages" :key="msg.id">
+                                            <!-- 复用和平铺视图完全相同的消息渲染 -->
+                                            <div v-if="isSummary(msg)" class="flex flex-col items-center">
+                                                <button @click="msg._showDetail = !msg._showDetail" class="text-[10px] bg-[#d4eaeb]/60 text-[#5a8a8d] px-3 py-1 rounded-full hover:bg-[#d4eaeb]">
+                                                    对话摘要 {{ msg._showDetail ? '(收起)' : '(点击展开)' }}
+                                                </button>
+                                                <div v-if="msg._showDetail" class="mt-2 w-full bg-[#edf5f5]/70 border border-[#c5dfe0]/50 rounded-lg p-3 text-[10px] text-[#5a8a8d] font-mono whitespace-pre-wrap break-all max-h-[200px] overflow-y-auto">
+                                                    {{ msg.content.slice(0, 2000) }}{{ msg.content.length > 2000 ? ' ...(已截断)' : '' }}
+                                                </div>
+                                            </div>
+                                            <div v-else-if="msg.role === 'system'" class="flex flex-col items-center">
+                                                <button @click="msg._showDetail = !msg._showDetail" class="text-[10px] bg-[#d4eaeb]/60 text-[#5a8a8d] px-3 py-1 rounded-full hover:bg-[#d4eaeb]">
+                                                    [系统提示] {{ msg._showDetail ? '收起' : '展开' }}
+                                                </button>
+                                                <div v-if="msg._showDetail" class="mt-2 w-full bg-[#edf5f5]/70 border border-[#c5dfe0]/50 rounded-lg p-3 text-[10px] text-[#5a8a8d] font-mono whitespace-pre-wrap break-all max-h-[200px] overflow-y-auto">
+                                                    {{ msg.content?.slice(0, 1000) }}{{ msg.content?.length > 1000 ? '...' : '' }}
+                                                </div>
+                                            </div>
+                                            <div v-else-if="msg.role === 'assistant' && isEmptyOrToolCall(msg)" class="flex justify-center">
+                                                <span class="text-[10px] bg-amber-100/70 text-amber-600 px-2 py-0.5 rounded-full">工具调用</span>
+                                            </div>
+                                            <div v-else-if="msg.role === 'user'" class="flex flex-col items-end">
+                                                <div class="max-w-[85%]">
+                                                    <div class="bg-[#4199a0] text-white rounded-2xl rounded-br-md px-3 py-2 text-sm whitespace-pre-wrap break-words">
+                                                        {{ getUserText(msg.content) }}
+                                                    </div>
+                                                    <div v-if="hasAttachment(msg.content)" class="mt-1 text-right">
+                                                        <button @click="msg._showDetail = !msg._showDetail" class="text-[10px] text-[#5a8a8d] hover:text-[#4d7a7d]">
+                                                            附加信息 {{ msg._showDetail ? '(收起)' : '(展开)' }}
+                                                        </button>
+                                                        <div v-if="msg._showDetail" class="mt-1 bg-[#edf5f5]/70 border border-[#c5dfe0]/50 rounded-lg p-2 text-[10px] text-[#5a8a8d] font-mono whitespace-pre-wrap break-all max-h-[150px] overflow-y-auto text-left">
+                                                            {{ getAttachmentText(msg.content) }}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <div v-else-if="msg.role === 'assistant'" class="flex flex-col items-start">
+                                                <div class="max-w-[85%]">
+                                                    <div v-if="hasThinking(msg.content)" class="mb-1">
+                                                        <button @click="msg._showThinking = !msg._showThinking" class="text-[10px] bg-[#c8e4e5]/60 text-[#4d7a7d] px-2 py-0.5 rounded-full hover:bg-[#c8e4e5]">
+                                                            思考过程 {{ msg._showThinking ? '(收起)' : '(展开)' }}
+                                                        </button>
+                                                        <div v-if="msg._showThinking" class="mt-1 bg-[#e8f2f2]/70 border border-[#b8d8d9]/50 rounded-lg p-2 text-[10px] text-[#4d7a7d] whitespace-pre-wrap break-words max-h-[200px] overflow-y-auto">
+                                                            {{ getThinking(msg.content) }}
+                                                        </div>
+                                                    </div>
+                                                    <div v-if="getAssistantText(msg.content)" class="bg-white border border-[#aecfd1] rounded-2xl rounded-bl-md px-3 py-2 text-sm text-[#2c3e50] whitespace-pre-wrap break-words">
+                                                        {{ getAssistantText(msg.content).slice(0, 800) }}{{ getAssistantText(msg.content).length > 800 ? ' ...(已截断)' : '' }}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 平铺对话列表 -->
+                <div v-show="!searchQuery && viewMode === 'flat'" class="space-y-3">
+                    <div v-if="loading.conversations" class="text-center py-8 text-[#77b5b4]">加载中...</div>
+                    <div v-else-if="conversations.length === 0" class="text-center py-8 text-[#77b5b4] bg-white/50 rounded-xl border border-[#aecfd1]/50">
+                        暂无对话记录
+                    </div>
+
+                    <div v-for="conv in conversations" :key="conv.conversation_id" class="bg-white rounded-xl border border-[#aecfd1] overflow-hidden">
+                        <!-- 对话卡片头部 -->
+                        <div class="p-4 cursor-pointer hover:bg-[#deebec]/50 transition-colors" @click="toggleConversation(conv)">
+                            <div class="flex justify-between items-start">
+                                <div class="flex-1 min-w-0 mr-3">
+                                    <div class="flex items-center gap-2 mb-1">
+                                        <span class="text-[10px] bg-[#4199a0]/20 text-[#4199a0] px-1.5 py-0.5 rounded font-mono">{{ conv.conversation_id.slice(0, 8) }}</span>
+                                        <span class="text-[10px] bg-[#aecfd1] text-[#5a7a7d] px-1.5 py-0.5 rounded">{{ conv.message_count }} 条</span>
+                                    </div>
+                                    <p class="text-sm text-[#2c3e50] truncate">{{ conv.preview || '(空消息)' }}</p>
+                                    <div class="flex items-center gap-3 mt-1 text-[10px] text-[#77b5b4]">
+                                        <span>模型: {{ conv.model || '未知' }}</span>
+                                        <span>{{ formatTime(conv.last_message_at || conv.created_at) }}</span>
+                                    </div>
+                                </div>
+                                <div class="flex items-center gap-1">
+                                    <button @click.stop="deleteConversation(conv.conversation_id)" class="text-[#77b5b4] hover:text-red-400 p-1" title="删除">
+                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                    </button>
+                                    <svg class="w-4 h-4 text-[#77b5b4] transition-transform" :class="{'rotate-180': conv._expanded}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 展开的消息列表 -->
+                        <div v-if="conv._expanded" class="border-t border-[#aecfd1] bg-[#f7fafa] max-h-[60vh] overflow-y-auto hide-scrollbar">
+                            <div v-if="conv._loadingMessages" class="text-center py-6 text-[#77b5b4] text-sm">加载消息中...</div>
+                            <div v-else class="p-3 space-y-2">
+                                <template v-for="msg in conv._messages" :key="msg.id">
+
+                                    <!-- 对话摘要 -->
+                                    <div v-if="isSummary(msg)" class="flex flex-col items-center">
+                                        <button @click="msg._showDetail = !msg._showDetail" class="text-[10px] bg-[#d4eaeb]/60 text-[#5a8a8d] px-3 py-1 rounded-full hover:bg-[#d4eaeb]">
+                                            对话摘要 {{ msg._showDetail ? '(收起)' : '(点击展开)' }}
+                                        </button>
+                                        <div v-if="msg._showDetail" class="mt-2 w-full bg-[#edf5f5]/70 border border-[#c5dfe0]/50 rounded-lg p-3 text-[10px] text-[#5a8a8d] font-mono whitespace-pre-wrap break-all max-h-[200px] overflow-y-auto">
+                                            {{ msg.content.slice(0, 2000) }}{{ msg.content.length > 2000 ? ' ...(已截断)' : '' }}
+                                        </div>
+                                    </div>
+
+                                    <!-- system消息 -->
+                                    <div v-else-if="msg.role === 'system'" class="flex flex-col items-center">
+                                        <button @click="msg._showDetail = !msg._showDetail" class="text-[10px] bg-[#d4eaeb]/60 text-[#5a8a8d] px-3 py-1 rounded-full hover:bg-[#d4eaeb]">
+                                            [系统提示] {{ msg._showDetail ? '收起' : '展开' }}
+                                        </button>
+                                        <div v-if="msg._showDetail" class="mt-2 w-full bg-[#edf5f5]/70 border border-[#c5dfe0]/50 rounded-lg p-3 text-[10px] text-[#5a8a8d] font-mono whitespace-pre-wrap break-all max-h-[200px] overflow-y-auto">
+                                            {{ msg.content?.slice(0, 1000) }}{{ msg.content?.length > 1000 ? '...' : '' }}
+                                        </div>
+                                    </div>
+
+                                    <!-- 空assistant / 工具调用 -->
+                                    <div v-else-if="msg.role === 'assistant' && isEmptyOrToolCall(msg)" class="flex justify-center">
+                                        <span class="text-[10px] bg-amber-100/70 text-amber-600 px-2 py-0.5 rounded-full">工具调用</span>
+                                    </div>
+
+                                    <!-- user消息 -->
+                                    <div v-else-if="msg.role === 'user'" class="flex flex-col items-end">
+                                        <div class="max-w-[85%]">
+                                            <div class="bg-[#4199a0] text-white rounded-2xl rounded-br-md px-3 py-2 text-sm whitespace-pre-wrap break-words">
+                                                {{ getUserText(msg.content) }}
+                                            </div>
+                                            <div v-if="hasAttachment(msg.content)" class="mt-1 text-right">
+                                                <button @click="msg._showDetail = !msg._showDetail" class="text-[10px] text-[#5a8a8d] hover:text-[#4d7a7d]">
+                                                    附加信息 {{ msg._showDetail ? '(收起)' : '(展开)' }}
+                                                </button>
+                                                <div v-if="msg._showDetail" class="mt-1 bg-[#edf5f5]/70 border border-[#c5dfe0]/50 rounded-lg p-2 text-[10px] text-[#5a8a8d] font-mono whitespace-pre-wrap break-all max-h-[150px] overflow-y-auto text-left">
+                                                    {{ getAttachmentText(msg.content) }}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- assistant消息 -->
+                                    <div v-else-if="msg.role === 'assistant'" class="flex flex-col items-start">
+                                        <div class="max-w-[85%]">
+                                            <div v-if="hasThinking(msg.content)" class="mb-1">
+                                                <button @click="msg._showThinking = !msg._showThinking" class="text-[10px] bg-[#c8e4e5]/60 text-[#4d7a7d] px-2 py-0.5 rounded-full hover:bg-[#c8e4e5]">
+                                                    思考过程 {{ msg._showThinking ? '(收起)' : '(展开)' }}
+                                                </button>
+                                                <div v-if="msg._showThinking" class="mt-1 bg-[#e8f2f2]/70 border border-[#b8d8d9]/50 rounded-lg p-2 text-[10px] text-[#4d7a7d] whitespace-pre-wrap break-words max-h-[200px] overflow-y-auto">
+                                                    {{ getThinking(msg.content) }}
+                                                </div>
+                                            </div>
+                                            <div v-if="getAssistantText(msg.content)" class="bg-white border border-[#aecfd1] rounded-2xl rounded-bl-md px-3 py-2 text-sm text-[#2c3e50] whitespace-pre-wrap break-words">
+                                                {{ getAssistantText(msg.content).slice(0, 800) }}{{ getAssistantText(msg.content).length > 800 ? ' ...(已截断)' : '' }}
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                </template>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 记忆总览 -->
+            <section v-show="currentTab === 'memory'">
+                <!-- 统计卡片 -->
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4 text-center">
+                        <div class="text-2xl font-bold text-[#4199a0]">{{ summaryStats.total || 0 }}</div>
+                        <div class="text-xs text-[#5a7a7d] mt-1">总记忆数</div>
+                    </div>
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4 text-center">
+                        <div class="text-2xl font-bold text-emerald-600">{{ summaryStats.tag_stats?.round?.active || 0 }}</div>
+                        <div class="text-xs text-[#5a7a7d] mt-1">活跃轮总</div>
+                    </div>
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4 text-center">
+                        <div class="text-2xl font-bold text-blue-600">{{ (summaryStats.tag_stats?.daily?.total || 0) + (summaryStats.tag_stats?.weekly?.total || 0) + (summaryStats.tag_stats?.monthly?.total || 0) }}</div>
+                        <div class="text-xs text-[#5a7a7d] mt-1">日/周/月总</div>
+                    </div>
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4 text-center">
+                        <div class="text-sm font-mono text-[#4199a0] leading-tight">{{ summaryStats.next_cron || 'N/A' }}</div>
+                        <div class="text-xs text-[#5a7a7d] mt-1">下次压缩</div>
+                    </div>
+                </div>
+
+                <!-- 筛选 -->
+                <div class="flex gap-2 mb-4 flex-wrap">
+                    <button v-for="t in ['all','round','daily','weekly','monthly']" :key="t"
+                        @click="summaryFilter = t; fetchSummaries()"
+                        :class="summaryFilter === t ? 'bg-[#4199a0] text-white' : 'bg-white text-[#5a7a7d] border border-[#aecfd1]'"
+                        class="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors">
+                        {{ {all:'全部',round:'轮总',daily:'日总',weekly:'周总',monthly:'月总'}[t] }}
+                    </button>
+                    <button @click="summaryActiveOnly = !summaryActiveOnly; fetchSummaries()"
+                        :class="summaryActiveOnly ? 'bg-emerald-600 text-white' : 'bg-white text-[#5a7a7d] border border-[#aecfd1]'"
+                        class="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ml-auto">
+                        {{ summaryActiveOnly ? '仅活跃' : '全部状态' }}
+                    </button>
+                </div>
+
+                <!-- 时间轴列表 -->
+                <div v-if="loading.summaries" class="text-center py-8 text-[#5a7a7d]">加载中...</div>
+                <div v-else-if="summaries.length === 0" class="text-center py-8 text-[#5a7a7d]">暂无记忆数据</div>
+                <div v-else class="space-y-3">
+                    <div v-for="s in summaries" :key="s.id" class="bg-white rounded-xl border border-[#aecfd1] overflow-hidden">
+                        <div class="flex items-center gap-2 px-4 py-3 cursor-pointer" @click="s._expanded = !s._expanded">
+                            <span :class="{
+                                'bg-emerald-100 text-emerald-700': s.tag === 'round',
+                                'bg-blue-100 text-blue-700': s.tag === 'daily',
+                                'bg-purple-100 text-purple-700': s.tag === 'weekly',
+                                'bg-amber-100 text-amber-700': s.tag === 'monthly'
+                            }" class="px-2 py-0.5 rounded-full text-xs font-medium">
+                                {{ {round:'轮总',daily:'日总',weekly:'周总',monthly:'月总'}[s.tag] || s.tag }}
+                            </span>
+                            <span v-if="s.category" :class="{
+                                'bg-rose-50 text-rose-600': s.category === '技术',
+                                'bg-sky-50 text-sky-600': s.category === '学习',
+                                'bg-orange-50 text-orange-600': s.category === '日常'
+                            }" class="px-1.5 py-0.5 rounded text-[10px] font-medium border" :style="{
+                                borderColor: s.category === '技术' ? '#fda4af' : s.category === '学习' ? '#7dd3fc' : '#fdba74'
+                            }">{{ s.category }}</span>
+                            <span v-if="s.is_active" class="w-2 h-2 rounded-full bg-emerald-500" title="活跃"></span>
+                            <span v-else class="w-2 h-2 rounded-full bg-gray-300" title="归档"></span>
+                            <span class="text-xs text-[#5a7a7d] ml-auto">{{ formatTime(s.created_at) }}</span>
+                            <span class="text-xs text-gray-400">ID:{{ s.id }}</span>
+                            <svg :class="{'rotate-180': s._expanded}" class="w-4 h-4 text-[#5a7a7d] transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                        </div>
+                        <div v-show="s._expanded" class="px-4 pb-3 border-t border-[#aecfd1]">
+                            <pre class="text-xs text-[#333] whitespace-pre-wrap leading-relaxed mt-2 max-h-80 overflow-auto">{{ s.content }}</pre>
+                            <div class="flex items-center justify-between mt-3 pt-2 border-t border-gray-100">
+                                <span class="text-xs text-gray-400">conv: {{ s.conversation_id ? s.conversation_id.slice(0,8) + '...' : 'global' }}</span>
+                                <button @click.stop="deleteSummary(s.id)" class="text-xs text-red-500 hover:text-red-700 transition-colors">删除</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
         </main>
+
+        <!-- 窗口创建/编辑弹窗 -->
+        <div v-if="showWindowModal" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-white/90 backdrop-blur-sm p-4">
+            <div class="bg-white w-full max-w-sm rounded-t-2xl sm:rounded-2xl shadow-2xl border border-[#aecfd1] flex flex-col max-h-[90vh]">
+                <div class="p-4 border-b border-[#aecfd1] flex justify-between items-center shrink-0">
+                    <h3 class="text-lg font-semibold">{{ editingWindow ? '编辑窗口' : '创建窗口' }}</h3>
+                    <button @click="showWindowModal = false" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                <div class="p-4 space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">窗口名称</label>
+                        <input v-model="windowForm.name" type="text" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0] focus:ring-1 focus:ring-[#4199a0]" placeholder="例如: 网关开发">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">描述 (可选)</label>
+                        <input v-model="windowForm.description" type="text" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0] focus:ring-1 focus:ring-[#4199a0]" placeholder="关于这个窗口的简要说明">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">颜色</label>
+                        <div class="flex items-center gap-2">
+                            <input v-model="windowForm.color" type="color" class="w-8 h-8 rounded border border-[#aecfd1] cursor-pointer">
+                            <span class="text-xs text-[#77b5b4]">{{ windowForm.color }}</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="p-4 border-t border-[#aecfd1] flex gap-2">
+                    <button @click="showWindowModal = false" class="flex-1 py-2 text-sm text-[#5a7a7d] bg-[#f0f5f5] hover:bg-[#e0ebeb] rounded-lg transition-colors">取消</button>
+                    <button @click="saveWindow()" class="flex-1 py-2 text-sm text-white bg-[#4199a0] hover:bg-[#357e84] rounded-lg transition-colors">{{ editingWindow ? '保存' : '创建' }}</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 分配对话到窗口弹窗 -->
+        <div v-if="showAssignModal" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-white/90 backdrop-blur-sm p-4">
+            <div class="bg-white w-full max-w-sm rounded-t-2xl sm:rounded-2xl shadow-2xl border border-[#aecfd1] flex flex-col max-h-[90vh]">
+                <div class="p-4 border-b border-[#aecfd1] flex justify-between items-center shrink-0">
+                    <h3 class="text-lg font-semibold">分配到窗口</h3>
+                    <button @click="showAssignModal = false" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                <div class="p-4 space-y-2 overflow-y-auto">
+                    <div v-if="manualWindows.length === 0" class="text-center py-4 text-sm text-[#77b5b4]">暂无可用窗口，请先创建窗口</div>
+                    <button v-for="w in manualWindows" :key="w.window_id" @click="assignToWindow(w.window_id)" class="w-full flex items-center gap-2 p-3 rounded-lg border border-[#aecfd1] hover:bg-[#deebec]/30 transition-colors text-left">
+                        <span class="w-3 h-3 rounded-full shrink-0" :style="{ backgroundColor: w.color || '#4a90d9' }"></span>
+                        <div class="flex-1 min-w-0">
+                            <p class="text-sm text-[#2c3e50] font-medium truncate">{{ w.title }}</p>
+                            <p v-if="w.description" class="text-[10px] text-[#77b5b4] truncate">{{ w.description }}</p>
+                        </div>
+                        <span class="text-[10px] text-[#77b5b4] shrink-0">{{ w.conversations.length }} 段对话</span>
+                    </button>
+                </div>
+            </div>
+        </div>
 
         <!-- 供应商表单弹窗 -->
         <div v-if="showProviderModal" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-white/90 backdrop-blur-sm p-4">
@@ -224,7 +688,7 @@
                             <label class="block text-sm font-medium text-[#5a7a7d]">支持的模型 (逗号分隔)</label>
                             <button type="button" @click="fetchUpstreamModels" :disabled="loading.fetchModels" class="text-xs bg-[#4199a0] hover:bg-[#77b5b4] text-white px-2 py-1 rounded transition-colors flex items-center">
                                 <svg v-if="loading.fetchModels" class="animate-spin -ml-1 mr-1 h-3 w-3 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                                拉取模型列表
+                                拉取模��列表
                             </button>
                         </div>
                         <textarea v-model="providerForm.supported_models" rows="2" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] font-mono text-sm focus:outline-none focus:border-[#4199a0]" placeholder="gpt-4o, claude-3-opus-20240229&#10;留空则匹配所有模型"></textarea>
@@ -257,7 +721,7 @@
                     
                     <div class="flex gap-2">
                         <button @click="showProviderModal = false" class="text-[#5a7a7d] hover:bg-[#aecfd1] px-4 py-2 rounded-lg text-sm font-medium transition-colors">
-                            取消
+                            ��消
                         </button>
                         <button @click="saveProvider" :disabled="loading.save" class="bg-[#4199a0] hover:bg-[#77b5b4] disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center">
                             <svg v-if="loading.save" class="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
@@ -303,7 +767,7 @@
         <div v-if="showRuleModal" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-white/90 backdrop-blur-sm p-4">
             <div class="bg-white w-full max-w-md rounded-t-2xl sm:rounded-2xl shadow-2xl border border-[#aecfd1] flex flex-col max-h-[90vh]">
                 <div class="p-4 border-b border-[#aecfd1] flex justify-between items-center shrink-0">
-                    <h3 class="text-lg font-semibold">{{ editingRule ? '编辑规则' : '添加规则' }}</h3>
+                    <h3 class="text-lg font-semibold">{{ editingRule ? '编辑规则' : '���加���则' }}</h3>
                     <button @click="showRuleModal = false" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                     </button>
@@ -324,15 +788,15 @@
                         <div>
                             <label class="block text-sm font-medium text-[#5a7a7d] mb-1">注入位置</label>
                             <select v-model="ruleForm.position" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
-                                <option value="system_prepend">系统消息前置</option>
+                                <option value="system_prepend">系统消息��置</option>
                                 <option value="system_append">系统消息追加</option>
                                 <option value="dialog_start">对话开头</option>
-                                <option value="before_latest">最新消息之前</option>
+                                <option value="before_latest">最��消息之前</option>
                                 <option value="at_depth_N">指定深度插入</option>
                             </select>
                         </div>
                         <div>
-                            <label class="block text-sm font-medium text-[#5a7a7d] mb-1">角色模拟</label>
+                            <label class="block text-sm font-medium text-[#5a7a7d] mb-1">角色�����拟</label>
                             <select v-model="ruleForm.role" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
                                 <option value="system">系统消息</option>
                                 <option value="user_wrapped_system">用户包装的系统消息</option>
@@ -373,9 +837,9 @@
                     </div>
 
                     <div>
-                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">匹配条件</label>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">匹��条件</label>
                         <textarea v-model="ruleForm.match_condition" rows="2" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] font-mono text-[10px] focus:outline-none focus:border-[#4199a0]" placeholder='{"match_model": "gpt-4", "match_length_min": 5}'></textarea>
-                        <p class="text-[10px] text-[#77b5b4] mt-1">留空则对所有请求生效。多模型用逗号分隔，如：{"match_model": "gpt-4o,claude-opus-4-6,model-alias"}</p>
+                        <p class="text-[10px] text-[#77b5b4] mt-1">留空则对所有请求生效���多模���用逗号分隔，如：{"match_model": "gpt-4o,claude-opus-4-6,model-alias"}</p>
                     </div>
                 </div>
 
@@ -411,9 +875,14 @@
     </div>
 
     <script>
-        const { createApp, ref, onMounted, reactive } = Vue;
+        if (typeof Vue === 'undefined') {
+            document.body.innerHTML = '<div style="padding:20px;background:red;color:white;font-size:16px">Vue.js failed to load. Check CDN/VPN.</div>';
+            throw new Error('Vue not loaded');
+        }
+        const { createApp, ref, onMounted, reactive, computed } = Vue;
 
-        createApp({
+        try {
+        const app = createApp({
             setup() {
                 // 状态
                 const currentTab = ref('providers');
@@ -422,11 +891,20 @@
                 const loading = reactive({
                     providers: false,
                     rules: false,
+                    conversations: false,
+                    search: false,
                     save: false,
                     saveRule: false,
                     fetchModels: false,
-                    test: null
+                    test: null,
+                    summaries: false
                 });
+
+                // 记忆总览状态
+                const summaries = ref([]);
+                const summaryStats = ref({});
+                const summaryFilter = ref('all');
+                const summaryActiveOnly = ref(false);
                 
                 // 模型选择弹窗状态
                 const showModelModal = ref(false);
@@ -435,6 +913,22 @@
                 const selectedModels = ref([]);
 
                 
+                // 对话记录��态
+                const conversations = ref([]);
+                const windows = ref([]);
+                const viewMode = ref('windows'); // 'windows' or 'flat'
+                const searchQuery = ref('');
+                const searchResults = ref([]);
+                const dateStart = ref('');
+                const dateEnd = ref('');
+                // 窗口管理状态
+                const showWindowModal = ref(false);
+                const showAssignModal = ref(false);
+                const editingWindow = ref(null);
+                const windowForm = reactive({ name: '', description: '', color: '#4a90d9' });
+                const assigningConversationId = ref(null);
+                let searchTimer = null;
+
                 // 弹窗表单状态
                 const showProviderModal = ref(false);
                 const showRuleModal = ref(false);
@@ -593,11 +1087,11 @@
                 };
 
                 const deleteProvider = async () => {
-                    if (!confirm(`确定要删除供应商 "${providerForm.name}" 吗？此操作不可撤销。`)) return;
+                    if (!confirm(`确定要删除供应商 "${providerForm.name}" 吗？此操作不可撤销���`)) return;
                     
                     try {
                         const res = await fetch(`/admin/api/providers/${editingProvider.value.id}`, { method: 'DELETE' });
-                        if (!res.ok) throw new Error('删除失败');
+                        if (!res.ok) throw new Error('删除���败');
                         
                         showToast('已删除', 'success');
                         showProviderModal.value = false;
@@ -698,6 +1192,265 @@
                     }
                 };
 
+                // ===== 消息解析辅助函数 =====
+                const isSummary = (msg) => {
+                    return msg.role === 'user' && msg.content && msg.content.startsWith('==========对话摘要');
+                };
+                const getUserText = (content) => {
+                    if (!content) return '';
+                    return content.replace(/<attachment[^>]*>[\s\S]*?<\/attachment>/g, '').trim();
+                };
+                const hasAttachment = (content) => {
+                    return content && /<attachment[^>]*>/.test(content);
+                };
+                const getAttachmentText = (content) => {
+                    if (!content) return '';
+                    const matches = content.match(/<attachment[^>]*>([\s\S]*?)<\/attachment>/g);
+                    if (!matches) return '';
+                    return matches.map(m => m.replace(/<\/?attachment[^>]*>/g, '').trim()).join('\n---\n');
+                };
+                const hasThinking = (content) => {
+                    return content && /<thinking>/.test(content);
+                };
+                const getThinking = (content) => {
+                    if (!content) return '';
+                    const m = content.match(/<thinking>([\s\S]*?)<\/thinking>/);
+                    return m ? m[1].trim() : '';
+                };
+                const getAssistantText = (content) => {
+                    if (!content) return '';
+                    let text = content.replace(/<thinking>[\s\S]*?<\/thinking>/g, '').trim();
+                    text = text.replace(/<attachment[^>]*>[\s\S]*?<\/attachment>/g, '').trim();
+                    return text;
+                };
+                const isEmptyOrToolCall = (msg) => {
+                    if (!msg.content) return true;
+                    const text = getAssistantText(msg.content);
+                    return !text || text.length === 0;
+                };
+                const highlightSearch = (snippet) => {
+                    if (!snippet || !searchQuery.value) return snippet || '';
+                    const q = searchQuery.value.trim();
+                    if (!q) return snippet;
+                    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    return snippet.replace(new RegExp(escaped, 'gi'), match => `<mark class="bg-yellow-200 text-yellow-900 px-0.5 rounded">${match}</mark>`);
+                };
+
+                // ===== 搜索功能 =====
+                const debounceSearch = () => {
+                    if (searchTimer) clearTimeout(searchTimer);
+                    searchTimer = setTimeout(() => {
+                        searchMessages();
+                    }, 400);
+                };
+                const searchMessages = async () => {
+                    const q = searchQuery.value.trim();
+                    if (!q) { searchResults.value = []; return; }
+                    loading.search = true;
+                    try {
+                        const res = await fetch(`/admin/api/conversations/search?q=${encodeURIComponent(q)}&limit=50`);
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        searchResults.value = await res.json();
+                    } catch (error) {
+                        showToast(`搜索失败: ${error.message}`, 'error');
+                    } finally {
+                        loading.search = false;
+                    }
+                };
+
+                // ===== 对话记录相关方法 =====
+                const fetchConversations = async () => {
+                    loading.conversations = true;
+                    try {
+                        let url = '/admin/api/conversations';
+                        const params = [];
+                        if (dateStart.value) params.push(`start=${dateStart.value}`);
+                        if (dateEnd.value) params.push(`end=${dateEnd.value}`);
+                        if (params.length) url += '?' + params.join('&');
+                        const res = await fetch(url);
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        const data = await res.json();
+                        conversations.value = data.map(c => {
+                            const existing = conversations.value.find(e => e.conversation_id === c.conversation_id);
+                            return { ...c, _expanded: existing?._expanded || false, _messages: existing?._messages || [], _loadingMessages: false };
+                        });
+                    } catch (error) {
+                        showToast(`加载对话失败: ${error.message}`, 'error');
+                    } finally {
+                        loading.conversations = false;
+                    }
+                };
+
+                const fetchWindows = async () => {
+                    loading.conversations = true;
+                    try {
+                        let url = '/admin/api/windows';
+                        const params = [];
+                        if (dateStart.value) params.push(`start=${dateStart.value}`);
+                        if (dateEnd.value) params.push(`end=${dateEnd.value}`);
+                        if (params.length) url += '?' + params.join('&');
+                        const res = await fetch(url);
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        const data = await res.json();
+                        windows.value = data.map(w => {
+                            const existing = windows.value.find(e => e.window_id === w.window_id);
+                            return {
+                                ...w,
+                                _expanded: existing?._expanded || false,
+                                conversations: w.conversations.map(c => {
+                                    const existConv = existing?.conversations?.find(e => e.conversation_id === c.conversation_id);
+                                    return { ...c, _expanded: existConv?._expanded || false, _messages: existConv?._messages || [], _loadingMessages: false };
+                                })
+                            };
+                        });
+                    } catch (error) {
+                        showToast(`加载窗口分组失败: ${error.message}`, 'error');
+                    } finally {
+                        loading.conversations = false;
+                    }
+                };
+
+                const toggleWindow = (win) => {
+                    win._expanded = !win._expanded;
+                };
+
+                // 窗口管理方法
+                const manualWindows = computed(() => windows.value.filter(w => w.is_manual));
+
+                const openCreateWindowModal = () => {
+                    editingWindow.value = null;
+                    Object.assign(windowForm, { name: '', description: '', color: '#4a90d9' });
+                    showWindowModal.value = true;
+                };
+
+                const openEditWindowModal = (win) => {
+                    editingWindow.value = win;
+                    Object.assign(windowForm, { name: win.title, description: win.description || '', color: win.color || '#4a90d9' });
+                    showWindowModal.value = true;
+                };
+
+                const saveWindow = async () => {
+                    if (!windowForm.name.trim()) { showToast('窗口名称不能为空', 'error'); return; }
+                    try {
+                        if (editingWindow.value) {
+                            const res = await fetch(`/admin/api/windows/${editingWindow.value.window_id}`, {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ name: windowForm.name, description: windowForm.description, color: windowForm.color })
+                            });
+                            if (!res.ok) throw new Error('更新失败');
+                            showToast('窗口已更新', 'success');
+                        } else {
+                            const res = await fetch('/admin/api/windows', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ name: windowForm.name, description: windowForm.description, color: windowForm.color })
+                            });
+                            if (!res.ok) throw new Error('创建失败');
+                            showToast('窗口已创建', 'success');
+                        }
+                        showWindowModal.value = false;
+                        await fetchWindows();
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    }
+                };
+
+                const deleteWindow = async (windowId) => {
+                    if (!confirm('删除窗口后，其中的对话将变为未归类状态。确定删除？')) return;
+                    try {
+                        const res = await fetch(`/admin/api/windows/${windowId}`, { method: 'DELETE' });
+                        if (!res.ok) throw new Error('删除失败');
+                        showToast('窗口已删除', 'success');
+                        await fetchWindows();
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    }
+                };
+
+                const openAssignModal = (conversationId) => {
+                    assigningConversationId.value = conversationId;
+                    showAssignModal.value = true;
+                };
+
+                const assignToWindow = async (windowId) => {
+                    try {
+                        const res = await fetch(`/admin/api/windows/${windowId}/assign`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ conversation_ids: [assigningConversationId.value] })
+                        });
+                        if (!res.ok) throw new Error('分配失败');
+                        showToast('对话已分配到窗口', 'success');
+                        showAssignModal.value = false;
+                        await fetchWindows();
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    }
+                };
+
+                const unassignConversation = async (conversationId) => {
+                    try {
+                        const res = await fetch('/admin/api/windows/unassign', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ conversation_ids: [conversationId] })
+                        });
+                        if (!res.ok) throw new Error('移除失败');
+                        showToast('对话已��出窗口', 'success');
+                        await fetchWindows();
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    }
+                };
+
+                const toggleConversation = async (conv) => {
+                    conv._expanded = !conv._expanded;
+                    if (conv._expanded && conv._messages.length === 0) {
+                        conv._loadingMessages = true;
+                        try {
+                            const res = await fetch(`/admin/api/conversations/${conv.conversation_id}/messages`);
+                            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                            conv._messages = await res.json();
+                        } catch (error) {
+                            showToast(`加载消息失败: ${error.message}`, 'error');
+                        } finally {
+                            conv._loadingMessages = false;
+                        }
+                    }
+                };
+
+                const deleteConversation = async (conversationId) => {
+                    if (!confirm('确定要删除这个对话及其所有消息吗？此操作不可撤销。')) return;
+                    try {
+                        const res = await fetch(`/admin/api/conversations/${conversationId}`, { method: 'DELETE' });
+                        if (!res.ok) throw new Error('删除失败');
+                        showToast('对话已删除', 'success');
+                        viewMode.value === 'windows' ? await fetchWindows() : await fetchConversations();
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    }
+                };
+
+                const formatTime = (timeStr) => {
+                    if (!timeStr) return '';
+                    try {
+                        const d = new Date(timeStr.replace(' ', 'T') + 'Z');
+                        const now = new Date();
+                        const diffMs = now - d;
+                        const diffMin = Math.floor(diffMs / 60000);
+                        if (diffMin < 1) return '刚刚';
+                        if (diffMin < 60) return `${diffMin}分钟前`;
+                        const diffHr = Math.floor(diffMin / 60);
+                        if (diffHr < 24) return `${diffHr}小时前`;
+                        const diffDay = Math.floor(diffHr / 24);
+                        if (diffDay < 7) return `${diffDay}天前`;
+                        return d.toLocaleDateString('zh-CN');
+                    } catch {
+                        return timeStr;
+                    }
+                };
+
                 // UI 交互
                 const openAddProviderModal = () => {
                     editingProvider.value = null;
@@ -744,6 +1497,33 @@
                     showRuleModal.value = true;
                 };
 
+                // 记忆总览函数
+                const fetchSummaries = async () => {
+                    loading.summaries = true;
+                    try {
+                        let url = '/admin/api/summaries?limit=200';
+                        if (summaryFilter.value !== 'all') url += '&tag=' + summaryFilter.value;
+                        if (summaryActiveOnly.value) url += '&is_active=1';
+                        const res = await fetch(url);
+                        const data = await res.json();
+                        summaries.value = data.map(s => ({...s, _expanded: false}));
+                    } catch(e) { console.error(e); } finally { loading.summaries = false; }
+                };
+                const fetchSummaryStats = async () => {
+                    try {
+                        const res = await fetch('/admin/api/summaries/stats');
+                        summaryStats.value = await res.json();
+                    } catch(e) { console.error(e); }
+                };
+                const deleteSummary = async (id) => {
+                    if (!confirm('确认删除该条记忆？')) return;
+                    try {
+                        await fetch('/admin/api/summaries/' + id, {method:'DELETE'});
+                        summaries.value = summaries.value.filter(s => s.id !== id);
+                        fetchSummaryStats();
+                    } catch(e) { console.error(e); }
+                };
+
                 // 初始化
                 onMounted(() => {
                     fetchProviders();
@@ -758,10 +1538,39 @@
                     parseModels, openAddProviderModal, editProvider,
                     saveProvider, deleteProvider, testProvider,
                     openAddRuleModal, editRule, saveRule, deleteRule,
-                    showModelModal, availableModels, modelSearchText, selectedModels, filteredModels, isAllModelsSelected, toggleAllModels, fetchUpstreamModels, confirmModelSelection
+                    showModelModal, availableModels, modelSearchText, selectedModels, filteredModels, isAllModelsSelected, toggleAllModels, fetchUpstreamModels, confirmModelSelection,
+                    conversations, windows, viewMode, fetchConversations, fetchWindows, toggleWindow, toggleConversation, deleteConversation, formatTime,
+                    showWindowModal, showAssignModal, editingWindow, windowForm, manualWindows,
+                    openCreateWindowModal, openEditWindowModal, saveWindow, deleteWindow,
+                    openAssignModal, assignToWindow, unassignConversation,
+                    searchQuery, searchResults, dateStart, dateEnd,
+                    debounceSearch, searchMessages, highlightSearch,
+                    isSummary, getUserText, hasAttachment, getAttachmentText,
+                    hasThinking, getThinking, getAssistantText, isEmptyOrToolCall,
+                    summaries, summaryStats, summaryFilter, summaryActiveOnly,
+                    fetchSummaries, fetchSummaryStats, deleteSummary
                 };
             }
-        }).mount('#app');
+        });
+        app.config.errorHandler = (err, vm, info) => {
+            var d = document.createElement('div');
+            d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#ff4444;color:white;padding:16px;font-size:14px;font-family:monospace;white-space:pre-wrap;word-break:break-all;max-height:60vh;overflow:auto';
+            d.textContent = 'VUE ERROR: ' + err.message + '\nInfo: ' + info + '\nStack: ' + (err.stack || '');
+            document.body.prepend(d);
+        };
+        app.config.warnHandler = (msg, vm, trace) => {
+            var d = document.createElement('div');
+            d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99998;background:#ff8800;color:white;padding:16px;font-size:12px;font-family:monospace;white-space:pre-wrap;word-break:break-all;max-height:30vh;overflow:auto';
+            d.textContent = 'VUE WARN: ' + msg;
+            document.body.prepend(d);
+        };
+        app.mount('#app');
+        } catch(e) {
+            var d = document.createElement('div');
+            d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#cc0000;color:white;padding:20px;font-size:16px;font-family:monospace;white-space:pre-wrap;word-break:break-all';
+            d.textContent = 'INIT ERROR: ' + e.message + '\n' + (e.stack || '');
+            document.body.prepend(d);
+        }
     </script>
 </body>
 </html>

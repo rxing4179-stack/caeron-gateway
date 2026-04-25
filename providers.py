@@ -6,9 +6,17 @@ Caeron Gateway - 供应商管理模块
 import json
 import logging
 import httpx
+import asyncio
+from datetime import datetime, timedelta
 from database import get_db
 
 logger = logging.getLogger(__name__)
+
+# 健康恢复配置
+BASE_COOLDOWN_SECONDS = 30       # 基础冷却时间
+MAX_COOLDOWN_SECONDS = 300       # 最大冷却时间（5分钟）
+HEALTH_PROBE_INTERVAL = 60       # 后台健康探针间隔（秒）
+MAX_FAIL_COUNT_BEFORE_PROBE = 10 # fail_count 超过此值时探针间隔翻倍
 
 
 class ProviderManager:
@@ -80,27 +88,53 @@ class ProviderManager:
             await db.close()
 
     async def mark_unhealthy(self, provider_id: int, error: str) -> None:
-        """标记供应商为不健康"""
+        """标记供应商为不健康，记录时间和累计失败次数"""
         db = await get_db()
         try:
-            await db.execute(
-                'UPDATE providers SET is_healthy = 0, last_error = ? WHERE id = ?',
-                (error, provider_id)
+            # 先获取当前fail_count
+            cursor = await db.execute(
+                'SELECT fail_count, is_healthy FROM providers WHERE id = ?',
+                (provider_id,)
             )
+            row = await cursor.fetchone()
+            current_fail_count = (row['fail_count'] or 0) if row else 0
+            was_healthy = row['is_healthy'] if row else 1
+
+            new_fail_count = current_fail_count + 1
+
+            # 只有从健康变不健康时才更新unhealthy_since
+            if was_healthy:
+                await db.execute(
+                    '''UPDATE providers SET is_healthy = 0, last_error = ?, 
+                       unhealthy_since = datetime('now'), fail_count = ? WHERE id = ?''',
+                    (error, new_fail_count, provider_id)
+                )
+            else:
+                await db.execute(
+                    'UPDATE providers SET last_error = ?, fail_count = ? WHERE id = ?',
+                    (error, new_fail_count, provider_id)
+                )
             await db.commit()
-            logger.warning(f"供应商 {provider_id} 标记为不健康: {error}")
+
+            cooldown = self._get_cooldown_seconds(new_fail_count)
+            logger.warning(
+                f"供应商 {provider_id} 标记为不健康 (fail_count={new_fail_count}, "
+                f"冷却期={cooldown}s): {error}"
+            )
         finally:
             await db.close()
 
     async def mark_healthy(self, provider_id: int) -> None:
-        """标记供应商为健康"""
+        """标记供应商为健康，重置失败计数"""
         db = await get_db()
         try:
             await db.execute(
-                'UPDATE providers SET is_healthy = 1, last_error = NULL WHERE id = ?',
+                '''UPDATE providers SET is_healthy = 1, last_error = NULL, 
+                   unhealthy_since = NULL, fail_count = 0 WHERE id = ?''',
                 (provider_id,)
             )
             await db.commit()
+            logger.info(f"供应商 {provider_id} 恢复健康")
         finally:
             await db.close()
 
@@ -194,6 +228,114 @@ class ProviderManager:
             logger.info(f"删除供应商 ID: {id}")
         finally:
             await db.close()
+
+    def _get_cooldown_seconds(self, fail_count: int) -> int:
+        """计算冷却时间：指数退避，封顶MAX_COOLDOWN_SECONDS"""
+        if fail_count <= 0:
+            return BASE_COOLDOWN_SECONDS
+        return min(BASE_COOLDOWN_SECONDS * (2 ** (fail_count - 1)), MAX_COOLDOWN_SECONDS)
+
+    async def get_cooled_down_providers(self, exclude_ids: set = None) -> list:
+        """
+        获取冷却期已过的不健康供应商
+        用于所有健康供应商都失败后的最后一搏
+        """
+        db = await get_db()
+        try:
+            cursor = await db.execute('''
+                SELECT * FROM providers 
+                WHERE is_enabled = 1 AND is_healthy = 0 AND unhealthy_since IS NOT NULL
+                ORDER BY priority ASC
+            ''')
+            candidates = [dict(row) for row in await cursor.fetchall()]
+
+            result = []
+            now = datetime.utcnow()
+            for p in candidates:
+                if exclude_ids and p['id'] in exclude_ids:
+                    continue
+                # 解析 unhealthy_since 计算冷却是否到期
+                try:
+                    unhealthy_time = datetime.fromisoformat(p['unhealthy_since'])
+                except (ValueError, TypeError):
+                    # 解析失败说明数据异常，直接认为冷却到期
+                    result.append(p)
+                    continue
+
+                cooldown = self._get_cooldown_seconds(p.get('fail_count', 1))
+                if (now - unhealthy_time).total_seconds() >= cooldown:
+                    result.append(p)
+                    logger.info(
+                        f"供应商 {p['name']} 冷却期已过 "
+                        f"({cooldown}s, fail_count={p.get('fail_count', 0)})，可重新尝试"
+                    )
+            return result
+        finally:
+            await db.close()
+
+    async def run_health_probe(self) -> None:
+        """
+        后台健康探针：主动探测不健康的供应商
+        通过发送 /v1/models 请求检查连通性
+        """
+        db = await get_db()
+        try:
+            cursor = await db.execute('''
+                SELECT * FROM providers 
+                WHERE is_enabled = 1 AND is_healthy = 0
+            ''')
+            unhealthy = [dict(row) for row in await cursor.fetchall()]
+        finally:
+            await db.close()
+
+        if not unhealthy:
+            return
+
+        logger.info(f"健康探针: 检测 {len(unhealthy)} 个不健康供应商")
+
+        for provider in unhealthy:
+            base_url = provider['api_base_url'].rstrip('/')
+            if base_url.endswith('/v1'):
+                test_url = f"{base_url}/models"
+            elif base_url.endswith('/chat/completions'):
+                test_url = base_url.rsplit('/chat/completions', 1)[0] + '/models'
+            else:
+                test_url = f"{base_url}/v1/models"
+
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(
+                        test_url,
+                        headers={'Authorization': f'Bearer {provider["api_key"]}'}
+                    )
+                    if response.status_code == 200:
+                        await self.mark_healthy(provider['id'])
+                        logger.info(
+                            f"健康探针: 供应商 {provider['name']} 已恢复！"
+                        )
+                    else:
+                        logger.debug(
+                            f"健康探针: 供应商 {provider['name']} 仍不可用 "
+                            f"(HTTP {response.status_code})"
+                        )
+            except Exception as e:
+                logger.debug(
+                    f"健康探针: 供应商 {provider['name']} 探测失败: {e}"
+                )
+
+    async def start_health_probe_loop(self) -> None:
+        """启动后台健康探针循环"""
+        logger.info(f"后台健康探针已启动 (间隔: {HEALTH_PROBE_INTERVAL}s)")
+        while True:
+            try:
+                await asyncio.sleep(HEALTH_PROBE_INTERVAL)
+                await self.run_health_probe()
+            except asyncio.CancelledError:
+                logger.info("后台健康探针已停止")
+                break
+            except Exception as e:
+                logger.error(f"健康探针异常: {e}")
+                await asyncio.sleep(HEALTH_PROBE_INTERVAL)
 
     async def test_provider(self, id: int) -> dict:
         """测试供应商连通性（发一个 models 列表请求）"""
