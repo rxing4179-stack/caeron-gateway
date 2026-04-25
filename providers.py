@@ -46,6 +46,26 @@ class ProviderManager:
         finally:
             await db.close()
 
+    async def get_provider_by_api_key(self, api_key: str) -> dict:
+        """
+        根据 API Key 精确匹配供应商
+        用于 /v1/models 等需要根据客户端认证信息选择供应商的场景
+        """
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                'SELECT * FROM providers WHERE api_key = ? AND is_enabled = 1',
+                (api_key,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                provider = dict(row)
+                logger.info(f"API Key 匹配供应商: {provider['name']}")
+                return provider
+            return None
+        finally:
+            await db.close()
+
     async def get_fallback_providers(self, model: str, exclude_id: int) -> list:
         """获取 fallback 供应商列表（排除已尝试的供应商 ID）"""
         db = await get_db()

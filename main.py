@@ -67,10 +67,26 @@ async def health_check():
 
 
 @app.get("/v1/models")
-async def list_models():
-    """转发模型列表请求到最高优先级供应商"""
+async def list_models(request: Request):
+    """转发模型列表请求，根据 Authorization 头中的 API Key 选择对应供应商"""
     try:
-        provider = await provider_manager.get_provider("")
+        # 从请求头提取 API Key
+        auth_header = request.headers.get('authorization', '')
+        api_key = ''
+        if auth_header.startswith('Bearer '):
+            api_key = auth_header[7:].strip()
+
+        # 优先按 API Key 精确匹配供应商
+        provider = None
+        if api_key:
+            provider = await provider_manager.get_provider_by_api_key(api_key)
+
+        # 匹配不到则回退到默认（优先级最高的供应商）
+        if not provider:
+            logger.info(f"API Key 未匹配到供应商，回退到默认")
+            provider = await provider_manager.get_provider("")
+
+        logger.info(f"模型列表请求 -> 供应商: {provider['name']}")
         return await proxy_models(provider)
     except Exception as e:
         logger.error(f"获取模型列表失败: {e}")
