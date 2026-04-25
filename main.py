@@ -224,15 +224,22 @@ async def chat_completions(request: Request):
             if is_summary_request:
                 break
     
-    # 额外检测：消息数很少（<=3）且包含大量历史内容的请求很可能是总结请求
+    # 额外检测：仅当消息数<=3 且 最后一条user消息很短（Operit自动总结的特征）
+    # 且assistant消息里包含旧摘要标记时才判定
     messages = body.get('messages', [])
-    if not is_summary_request and len(messages) <= 4:
-        for msg in messages:
-            content = str(msg.get('content', ''))
-            if '==========对话摘要==========' in content or 'Conversation Summary' in content:
-                is_summary_request = True
-                logger.info(f"[SUMMARY_INTERCEPT] 检测到包含已有摘要标记的短消息请求，判定为总结请求")
+    if not is_summary_request and len(messages) <= 3:
+        last_user_msg = ''
+        for msg in reversed(messages):
+            if msg.get('role') == 'user':
+                last_user_msg = str(msg.get('content', ''))
                 break
+        if len(last_user_msg) <= 50:
+            for msg in messages:
+                content = str(msg.get('content', ''))
+                if msg.get('role') == 'assistant' and ('==========对话摘要==========' in content or 'Conversation Summary' in content):
+                    is_summary_request = True
+                    logger.info(f"[SUMMARY_INTERCEPT] 摘要标记+短user消息({len(last_user_msg)}字), 判定为总结请求")
+                    break
     
     if not is_summary_request:
         # 调试日志：打印所有system消息的前200字符，帮助排查漏网的总结请求
