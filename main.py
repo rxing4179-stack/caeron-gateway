@@ -265,7 +265,7 @@ async def admin_add_rule(request: Request):
         ''', (
             data.get('name'), data.get('content'), data.get('position', 'system_append'),
             data.get('role', 'system'), data.get('priority', 0), data.get('depth', 0),
-            data.get('match_condition', '{}'), data.get('is_enabled', 1)
+            data.get('match_condition', '') or '', data.get('is_enabled', 1)
         ))
         await db.commit()
         return {"id": cursor.lastrowid, "message": "规则添加成功"}

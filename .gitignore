@@ -5,3 +5,6 @@ __pycache__/
 app.log
 .env
 venv/
+gateway.db-shm
+gateway.db-wal
+test_*.py

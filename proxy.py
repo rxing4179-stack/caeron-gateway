@@ -6,6 +6,7 @@ Caeron Gateway - 请求转发模块
 import json
 import logging
 import httpx
+from urllib.parse import quote
 from fastapi.responses import StreamingResponse, JSONResponse
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,8 @@ async def _proxy_stream(url: str, headers: dict, body: dict, timeout, provider: 
                 await response.aclose()
                 await client.aclose()
 
+        # 供应商名可能包含中文，HTTP头只允许ASCII，用URL编码
+        safe_name = quote(provider['name'], safe='')
         return StreamingResponse(
             stream_generator(),
             media_type='text/event-stream',
@@ -113,7 +116,7 @@ async def _proxy_stream(url: str, headers: dict, body: dict, timeout, provider: 
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive',
                 'X-Accel-Buffering': 'no',
-                'X-Provider': provider['name'],
+                'X-Provider': safe_name,
             }
         )
     except Exception as e:
@@ -131,9 +134,10 @@ async def _proxy_json(url: str, headers: dict, body: dict, timeout, provider: di
                 f"上游返回 {response.status_code}: {response.text[:500]}"
             )
 
+        safe_name = quote(provider['name'], safe='')
         return JSONResponse(
             content=response.json(),
-            headers={'X-Provider': provider['name']}
+            headers={'X-Provider': safe_name}
         )
 
 

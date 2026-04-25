@@ -375,7 +375,7 @@
                     <div>
                         <label class="block text-sm font-medium text-[#5a7a7d] mb-1">匹配条件</label>
                         <textarea v-model="ruleForm.match_condition" rows="2" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] font-mono text-[10px] focus:outline-none focus:border-[#4199a0]" placeholder='{"match_model": "gpt-4", "match_length_min": 5}'></textarea>
-                        <p class="text-[10px] text-[#77b5b4] mt-1">设定规则的生效条件，留空则对所有请求生效。示例：{"match_model": "gpt-4o", "match_length_min": 5}</p>
+                        <p class="text-[10px] text-[#77b5b4] mt-1">留空则对所有请求生效。多模型用逗号分隔，如：{"match_model": "gpt-4o,claude-opus-4-6,model-alias"}</p>
                     </div>
                 </div>
 
@@ -455,7 +455,7 @@
                     role: 'system',
                     priority: 0,
                     depth: 0,
-                    match_condition: '{}',
+                    match_condition: '',
                     is_enabled: true
                 });
 
@@ -729,7 +729,7 @@
                     editingRule.value = null;
                     Object.assign(ruleForm, {
                         name: '', content: '', position: 'system_append', role: 'system',
-                        priority: 0, depth: 0, match_condition: '{}', is_enabled: true
+                        priority: 0, depth: 0, match_condition: '', is_enabled: true
                     });
                     showRuleModal.value = true;
                 };
@@ -739,7 +739,7 @@
                     Object.assign(ruleForm, {
                         name: rule.name, content: rule.content, position: rule.position,
                         role: rule.role, priority: rule.priority, depth: rule.depth,
-                        match_condition: rule.match_condition || '{}', is_enabled: Boolean(rule.is_enabled)
+                        match_condition: rule.match_condition || '', is_enabled: Boolean(rule.is_enabled)
                     });
                     showRuleModal.value = true;
                 };
