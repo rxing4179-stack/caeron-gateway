@@ -75,7 +75,7 @@ class ProviderManager:
             await db.close()
 
     async def get_fallback_providers(self, model: str, exclude_id: int) -> list:
-        """获取 fallback 供应商列表（排除已尝试的供应商 ID）"""
+        """获取 fallback 供应商列表（排除已尝试的供应商 ID，且必须支持该模型）"""
         db = await get_db()
         try:
             cursor = await db.execute('''
@@ -83,7 +83,18 @@ class ProviderManager:
                 WHERE is_enabled = 1 AND is_healthy = 1 AND id != ?
                 ORDER BY priority ASC
             ''', (exclude_id,))
-            return [dict(row) for row in await cursor.fetchall()]
+            all_providers = [dict(row) for row in await cursor.fetchall()]
+            # 只返回 supported_models 包含该模型的供应商
+            if model:
+                filtered = []
+                for p in all_providers:
+                    supported = json.loads(p.get('supported_models', '[]'))
+                    if model in supported:
+                        filtered.append(p)
+                if filtered:
+                    return filtered
+            # 没有精确匹配的 fallback 时返回空列表，不再通配
+            return []
         finally:
             await db.close()
 
@@ -235,7 +246,7 @@ class ProviderManager:
             return BASE_COOLDOWN_SECONDS
         return min(BASE_COOLDOWN_SECONDS * (2 ** (fail_count - 1)), MAX_COOLDOWN_SECONDS)
 
-    async def get_cooled_down_providers(self, exclude_ids: set = None) -> list:
+    async def get_cooled_down_providers(self, model: str = None, exclude_ids: set = None) -> list:
         """
         获取冷却期已过的不健康供应商
         用于所有健康供应商都失败后的最后一搏
@@ -254,6 +265,11 @@ class ProviderManager:
             for p in candidates:
                 if exclude_ids and p['id'] in exclude_ids:
                     continue
+                # 模型过滤：cooled_down 供应商也必须支持该模型
+                if model:
+                    supported = json.loads(p.get('supported_models', '[]'))
+                    if model not in supported:
+                        continue
                 # 解析 unhealthy_since 计算冷却是否到期
                 try:
                     unhealthy_time = datetime.fromisoformat(p['unhealthy_since'])

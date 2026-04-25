@@ -370,7 +370,7 @@ async def chat_completions(request: Request):
         provider = await provider_manager.get_provider(model)
     except Exception as e:
         # 没有健康供应商时，尝试冷却期到期的供应商
-        cooled = await provider_manager.get_cooled_down_providers()
+        cooled = await provider_manager.get_cooled_down_providers(model=model)
         if cooled:
             provider = cooled[0]
             logger.warning(f"无健康供应商，使用冷却期到期的供应商: {provider['name']}")
@@ -391,7 +391,7 @@ async def chat_completions(request: Request):
 
             if not fallbacks and not used_cooled_down:
                 # 健康供应商全部耗尽，尝试冷却期到期的不健康供应商
-                cooled = await provider_manager.get_cooled_down_providers(exclude_ids=tried_ids)
+                cooled = await provider_manager.get_cooled_down_providers(model=model, exclude_ids=tried_ids)
                 if cooled:
                     fallbacks = cooled
                     used_cooled_down = True
@@ -412,7 +412,7 @@ async def chat_completions(request: Request):
             # 转发请求（传入conversation_id用于存储AI回复）
             response = await proxy_chat_completion(body, provider, conversation_id=conversation_id)
 
-            # 成功，确保标记为健康
+            # 成功，确保��记为健康
             await provider_manager.mark_healthy(provider['id'])
             logger.info(f"请求成功: 供应商={provider['name']}, 尝试次数={attempt + 1}")
 
@@ -431,7 +431,7 @@ async def chat_completions(request: Request):
 
             if not fallbacks and not used_cooled_down:
                 # 健康供应商全部耗尽，尝试冷却期到期的不健康供应商
-                cooled = await provider_manager.get_cooled_down_providers(exclude_ids=tried_ids)
+                cooled = await provider_manager.get_cooled_down_providers(model=model, exclude_ids=tried_ids)
                 if cooled:
                     fallbacks = cooled
                     used_cooled_down = True
