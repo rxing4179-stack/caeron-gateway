@@ -147,64 +147,19 @@ class InjectionEngine:
         logger.info(f"注入完成: 原始消息数={len(messages)}, 注入后消息数={len(injected_messages)}")
         return injected_messages
 
-    # 窗口名前缀 -> 轮总分类 的反向映射
-    WINDOW_PREFIX_TO_CATEGORY = {
-        '技术窗': '技术',
-        '学习窗': '学习',
-        '主窗口': '日常',
-    }
-
     async def _inject_round_summaries(self, messages: list[dict], request_info: dict):
-        """注入当天活跃轮总到对话消息中"""
-        conversation_id = request_info.get('conversation_id', '')
-        if not conversation_id:
-            return
-
+        """跨窗口注入当天所有活跃轮总到对话消息中"""
         db = await get_db()
         try:
-            # 1. 查当前对话的 window_id
-            cursor = await db.execute(
-                'SELECT window_id FROM conversations WHERE conversation_id = ?',
-                (conversation_id,)
-            )
-            row = await cursor.fetchone()
-            target_category = None
-
-            if row and row[0]:
-                window_id = row[0]
-                # 2. 查窗口名，推断分类
-                cursor = await db.execute(
-                    'SELECT name FROM windows WHERE id = ?',
-                    (window_id,)
-                )
-                win_row = await cursor.fetchone()
-                if win_row:
-                    window_name = win_row[0]
-                    for prefix, cat in self.WINDOW_PREFIX_TO_CATEGORY.items():
-                        if window_name.startswith(prefix):
-                            target_category = cat
-                            break
-
-            # 3. 查当天活跃轮总（created_at是UTC，转换为UTC+8比对本地日期）
+            # 查当天所有活跃轮总（created_at是UTC，+8转本地日期）
             today = datetime.now().strftime('%Y-%m-%d')
-            if target_category:
-                cursor = await db.execute(
-                    """SELECT content, created_at FROM summaries
-                       WHERE tag = 'round' AND is_active = 1
-                       AND category = ? AND date(created_at, '+8 hours') = ?
-                       ORDER BY created_at ASC""",
-                    (target_category, today)
-                )
-            else:
-                # 未分配窗口，注入所有分类的当天轮总
-                cursor = await db.execute(
-                    """SELECT content, created_at, category FROM summaries
-                       WHERE tag = 'round' AND is_active = 1
-                       AND date(created_at, '+8 hours') = ?
-                       ORDER BY created_at ASC""",
-                    (today,)
-                )
-
+            cursor = await db.execute(
+                """SELECT content, created_at FROM summaries
+                   WHERE tag = 'round' AND is_active = 1
+                   AND date(created_at, '+8 hours') = ?
+                   ORDER BY created_at ASC""",
+                (today,)
+            )
             rows = await cursor.fetchall()
         finally:
             await db.close()
@@ -213,25 +168,25 @@ class InjectionEngine:
             logger.info(f"[轮总注入] 当天无活跃轮总，跳过")
             return
 
-        # 4. 组装轮总内容
+        # 组装轮总内容，每条标注编号
+        total = len(rows)
         lines = ["<context_summaries>"]
         lines.append(f"以下是今天（{datetime.now().strftime('%Y-%m-%d')}）的对话记忆摘要，供你参考当前上下文：")
-        for r in rows:
+        for idx, r in enumerate(rows, 1):
             r = dict(r)
-            cat_tag = f"[{r.get('category', '')}] " if r.get('category') else ''
-            lines.append(f"- {cat_tag}[{r['created_at']}] {r['content']}")
+            lines.append(f"- [轮总 #{idx}/{total}] [{r['created_at']}] {r['content']}")
         lines.append("</context_summaries>")
 
         summary_text = "\n".join(lines)
 
-        # 5. 注入位置：在最后一个system消息之后（dialog_start位置）
+        # 注入位置：在最后一个system消息之后（dialog_start位置）
         insert_idx = 0
         for i, m in enumerate(messages):
             if m.get('role') == 'system':
                 insert_idx = i + 1
         messages.insert(insert_idx, {'role': 'system', 'content': summary_text})
 
-        logger.info(f"[轮总注入] 注入 {len(rows)} 条轮总 (分类={target_category or '全部'}, 对话={conversation_id[:8]})")
+        logger.info(f"[轮总注入] 注入 {total} 条轮总 (跨窗口全局)")
 
     def _replace_variables(self, text: str) -> str:
         """替换文本中的预设变量"""
