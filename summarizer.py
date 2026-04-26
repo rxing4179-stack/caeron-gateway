@@ -203,7 +203,7 @@ class MultiLevelSummarizer:
             await db.close()
     
     async def generate_global_summary(self) -> str:
-        """生成轮总�������兼容旧接口名）"""
+        """生成轮总���������兼容旧接口名）"""
         return await self.generate_round_summary()
     
     async def generate_round_summary(self) -> str:
@@ -587,48 +587,43 @@ class MultiLevelSummarizer:
         '日常': '主窗口',
     }
     
-    async def _auto_assign_window(self, category: str):
-        """根据分类标签，自动把最近的conversation分配到对应窗口组里数字最大的窗口"""
-        prefix = self.CATEGORY_WINDOW_MAP.get(category)
-        if not prefix:
-            logger.warning(f"[SUMMARIZER] 未知分类 '{category}'，跳过窗口分配")
-            return
-        
+    async def _auto_assign_window(self, category: str, conversation_id: str = None):
+        """根据分类标签，把对话迁移到正确窗口（从默认主窗口迁到技术/学习窗）
+        同时批量清理所有 window_id=NULL 的对话到默认主窗口"""
         db = await get_db()
         try:
-            # 找该前缀下数字最大的窗口
+            # Step 1: 批量清理所有 window_id=NULL 的对话 -> 分配到最新主窗口
             cursor = await db.execute(
-                "SELECT id, name FROM windows WHERE name LIKE ? ORDER BY id DESC LIMIT 1",
-                (f"{prefix}%",)
+                "SELECT id FROM windows WHERE name LIKE '主窗口%' ORDER BY id DESC LIMIT 1"
             )
-            window = await cursor.fetchone()
-            if not window:
-                logger.warning(f"[SUMMARIZER] 未找到'{prefix}'前缀的窗口，跳过分配")
-                return
+            default_window = await cursor.fetchone()
+            if default_window:
+                default_wid = default_window[0]
+                result = await db.execute(
+                    "UPDATE conversations SET window_id = ? WHERE window_id IS NULL",
+                    (default_wid,)
+                )
+                if result.rowcount > 0:
+                    logger.info(f"[SUMMARIZER] 批量分配 {result.rowcount} 个未归类对话到主窗口 (id={default_wid})")
             
-            window_id = window[0]
-            window_name = window[1]
+            # Step 2: 如果分类不是日常，把当前对话迁移到对应窗口
+            prefix = self.CATEGORY_WINDOW_MAP.get(category)
+            if prefix and prefix != '主窗口' and conversation_id:
+                cursor = await db.execute(
+                    "SELECT id, name FROM windows WHERE name LIKE ? ORDER BY id DESC LIMIT 1",
+                    (f"{prefix}%",)
+                )
+                target_window = await cursor.fetchone()
+                if target_window:
+                    target_wid = target_window[0]
+                    target_name = target_window[1]
+                    await db.execute(
+                        "UPDATE conversations SET window_id = ? WHERE conversation_id = ?",
+                        (target_wid, conversation_id)
+                    )
+                    logger.info(f"[SUMMARIZER] 对话 {conversation_id} 迁移到窗口 '{target_name}' (id={target_wid})")
             
-            # 找最近一个未分配窗口的conversation
-            cursor = await db.execute(
-                """SELECT id, conversation_id FROM conversations 
-                   WHERE window_id IS NULL 
-                   ORDER BY last_message_at DESC LIMIT 1"""
-            )
-            conv = await cursor.fetchone()
-            if not conv:
-                logger.info("[SUMMARIZER] 没有未分配窗口的对话，跳过")
-                return
-            
-            conv_id = conv[0]
-            conv_ext_id = conv[1]
-            
-            await db.execute(
-                "UPDATE conversations SET window_id = ? WHERE id = ?",
-                (window_id, conv_id)
-            )
             await db.commit()
-            logger.info(f"[SUMMARIZER] 对话 {conv_ext_id} 自动分配到窗口 '{window_name}' (id={window_id})")
         except Exception as e:
             logger.error(f"[SUMMARIZER] 自动窗口分配失败: {e}")
         finally:

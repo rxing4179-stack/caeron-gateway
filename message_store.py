@@ -39,31 +39,57 @@ def generate_conversation_id(messages: list) -> str:
     return hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:16]
 
 
-async def ensure_conversation(conversation_id: str, model: str = None, provider_id: int = None):
-    """确保对话记录存在，不存在则创建，已存在则跳过"""
+async def _get_default_window_id():
+    """获取默认窗口ID（最新的'主窗口'系列）"""
     db = await get_db()
     try:
         cursor = await db.execute(
-            'SELECT id FROM conversations WHERE conversation_id = ?',
+            "SELECT id FROM windows WHERE name LIKE '主窗口%' ORDER BY id DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        await db.close()
+
+
+async def ensure_conversation(conversation_id: str, model: str = None, provider_id: int = None):
+    """确保对话记录存在，不存在则创建并分配默认窗口，已存在则跳过"""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            'SELECT id, window_id FROM conversations WHERE conversation_id = ?',
             (conversation_id,)
         )
         row = await cursor.fetchone()
         if not row:
+            # 新对话：创建并立即分配到默认窗口
+            default_window = await _get_default_window_id()
             await db.execute(
-                '''INSERT INTO conversations (conversation_id, model, provider_id)
-                   VALUES (?, ?, ?)''',
-                (conversation_id, model, provider_id)
+                '''INSERT INTO conversations (conversation_id, model, provider_id, window_id)
+                   VALUES (?, ?, ?, ?)''',
+                (conversation_id, model, provider_id, default_window)
             )
             await db.commit()
-            logger.info(f"新建对话记录: {conversation_id}")
+            logger.info(f"新建对话记录: {conversation_id}, 分配窗口: {default_window}")
         else:
-            # 对话已存在，更新model（可能切换了模型）
+            # 对话已存在
+            conv_id, window_id = row
+            # 如果还没分配窗口，补分配
+            if window_id is None:
+                default_window = await _get_default_window_id()
+                if default_window:
+                    await db.execute(
+                        'UPDATE conversations SET window_id = ? WHERE id = ?',
+                        (default_window, conv_id)
+                    )
+                    logger.info(f"补分配对话 {conversation_id} 到窗口 {default_window}")
+            # 更新model（可能切换了模型）
             if model:
                 await db.execute(
                     'UPDATE conversations SET model = ? WHERE conversation_id = ?',
                     (model, conversation_id)
                 )
-                await db.commit()
+            await db.commit()
     finally:
         await db.close()
 
