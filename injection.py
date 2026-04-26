@@ -148,10 +148,42 @@ class InjectionEngine:
         return injected_messages
 
     async def _inject_round_summaries(self, messages: list[dict], request_info: dict):
-        """跨窗口注入当天所有活跃轮总到对话消息中"""
+        """多级记忆注入：月总+周总+日总+轮总，按活跃状态自动切换"""
         db = await get_db()
         try:
-            # 查当天所有活跃轮总（created_at是UTC，+8转本地日期）
+            parts = []
+
+            # 月总：所有活跃的（长期记忆）
+            cursor = await db.execute(
+                "SELECT content, created_at FROM summaries WHERE tag = 'monthly' AND is_active = 1 ORDER BY created_at ASC"
+            )
+            rows = await cursor.fetchall()
+            if rows:
+                for r in rows:
+                    r = dict(r)
+                    parts.append(f"- [月总] [{r['created_at']}] {r['content']}")
+
+            # 周总：所有活跃的（月末归档后由月总替代）
+            cursor = await db.execute(
+                "SELECT content, created_at FROM summaries WHERE tag = 'weekly' AND is_active = 1 ORDER BY created_at ASC"
+            )
+            rows = await cursor.fetchall()
+            if rows:
+                for r in rows:
+                    r = dict(r)
+                    parts.append(f"- [周总] [{r['created_at']}] {r['content']}")
+
+            # 日总：所有活跃的（周末归档后由周总替代）
+            cursor = await db.execute(
+                "SELECT content, created_at FROM summaries WHERE tag = 'daily' AND is_active = 1 ORDER BY created_at ASC"
+            )
+            rows = await cursor.fetchall()
+            if rows:
+                for r in rows:
+                    r = dict(r)
+                    parts.append(f"- [日总] [{r['created_at']}] {r['content']}")
+
+            # 轮总：当天所有活跃的（日末归档后由日总替代）
             today = datetime.now().strftime('%Y-%m-%d')
             cursor = await db.execute(
                 """SELECT content, created_at FROM summaries
@@ -161,20 +193,22 @@ class InjectionEngine:
                 (today,)
             )
             rows = await cursor.fetchall()
+            if rows:
+                total = len(rows)
+                for idx, r in enumerate(rows, 1):
+                    r = dict(r)
+                    parts.append(f"- [轮总 #{idx}/{total}] [{r['created_at']}] {r['content']}")
+
         finally:
             await db.close()
 
-        if not rows:
-            logger.info(f"[轮总注入] 当天无活跃轮总，跳过")
+        if not parts:
+            logger.info(f"[记忆注入] 无任何活跃总结，跳过")
             return
 
-        # 组装轮总内容，每条标注编号
-        total = len(rows)
         lines = ["<context_summaries>"]
         lines.append(f"以下是今天（{datetime.now().strftime('%Y-%m-%d')}）的对话记忆摘要，供你参考当前上下文：")
-        for idx, r in enumerate(rows, 1):
-            r = dict(r)
-            lines.append(f"- [轮总 #{idx}/{total}] [{r['created_at']}] {r['content']}")
+        lines.extend(parts)
         lines.append("</context_summaries>")
 
         summary_text = "\n".join(lines)
@@ -186,7 +220,7 @@ class InjectionEngine:
                 insert_idx = i + 1
         messages.insert(insert_idx, {'role': 'system', 'content': summary_text})
 
-        logger.info(f"[轮总注入] 注入 {total} 条轮总 (跨窗口全局)")
+        logger.info(f"[记忆注入] 注入 {len(parts)} 条多级总结")
 
     def _replace_variables(self, text: str) -> str:
         """替换文本中的预设变量"""

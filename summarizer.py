@@ -203,7 +203,7 @@ class MultiLevelSummarizer:
             await db.close()
     
     async def generate_global_summary(self) -> str:
-        """生成轮总���������兼容旧接口名）"""
+        """生成轮总���������������������������兼容旧接口名）"""
         return await self.generate_round_summary()
     
     async def generate_round_summary(self) -> str:
@@ -283,9 +283,9 @@ class MultiLevelSummarizer:
     # ==================== 日总 ====================
     
     async def generate_daily_summary(self, target_date: str = None) -> str:
-        """生成日总。target_date格式: 'YYYY-MM-DD'，默认今天"""
+        """生成日总。target_date格式: 'YYYY-MM-DD'（北京时间日期）"""
         if not target_date:
-            target_date = datetime.utcnow().strftime('%Y-%m-%d')
+            target_date = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
         
         logger.info(f"[SUMMARIZER] 开始生成日总: {target_date}")
         
@@ -295,7 +295,7 @@ class MultiLevelSummarizer:
             cursor = await db.execute(
                 """SELECT id, content, created_at FROM summaries
                    WHERE tag = 'round' AND is_active = 1
-                   AND date(created_at) = ?
+                   AND date(created_at, '+8 hours') = ?
                    ORDER BY created_at ASC""",
                 (target_date,)
             )
@@ -354,7 +354,7 @@ class MultiLevelSummarizer:
     async def generate_weekly_summary(self, week_end_date: str = None) -> str:
         """生成周总。week_end_date为周日日期，默认本周日"""
         if not week_end_date:
-            today = datetime.utcnow()
+            today = datetime.utcnow() + timedelta(hours=8)
             # 找到本周日
             days_until_sunday = 6 - today.weekday()  # weekday: 0=Mon, 6=Sun
             if days_until_sunday == 0 and today.hour >= 23:
@@ -372,7 +372,7 @@ class MultiLevelSummarizer:
             cursor = await db.execute(
                 """SELECT id, content, created_at FROM summaries
                    WHERE tag = 'daily' AND is_active = 1
-                   AND date(created_at) BETWEEN ? AND ?
+                   AND date(created_at, '+8 hours') BETWEEN ? AND ?
                    ORDER BY created_at ASC""",
                 (week_start_date, week_end_date)
             )
@@ -429,7 +429,7 @@ class MultiLevelSummarizer:
     async def generate_monthly_summary(self, year_month: str = None) -> str:
         """生成月总。year_month格式: 'YYYY-MM'，默认本月"""
         if not year_month:
-            year_month = datetime.utcnow().strftime('%Y-%m')
+            year_month = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m')
         
         month_start = f"{year_month}-01"
         # 计算月末
@@ -447,7 +447,7 @@ class MultiLevelSummarizer:
             cursor = await db.execute(
                 """SELECT id, content, created_at FROM summaries
                    WHERE tag = 'weekly' AND is_active = 1
-                   AND date(created_at) BETWEEN ? AND ?
+                   AND date(created_at, '+8 hours') BETWEEN ? AND ?
                    ORDER BY created_at ASC""",
                 (month_start, month_end)
             )
@@ -507,7 +507,7 @@ class MultiLevelSummarizer:
         注入策略（时间窗口全量注入 + 窗口关闭后压缩替代）：
         - 月总：所有活跃的月总（覆盖历史月份）
         - 周总：当月所有活跃的周总（月末压缩为月总后归档）
-        - 日总：当周所有活跃的日总（周末压缩为周总后归档）
+        - 日总：当周所有活跃的��总（周末压缩为周��后归档）
         - 轮总：当天所有活跃的轮总（日末压缩为日总后归档）
         """
         db = await get_db()
@@ -639,7 +639,7 @@ class MultiLevelSummarizer:
 async def run_daily_cron():
     """每天23:59触发的定时任务：生成日总"""
     summarizer = get_summarizer()
-    today = datetime.utcnow().strftime('%Y-%m-%d')
+    today = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
     logger.info(f"[CRON] 触发日总生成: {today}")
     result = await summarizer.generate_daily_summary(today)
     if result:
@@ -651,7 +651,7 @@ async def run_daily_cron():
 async def run_weekly_cron():
     """每周日23:59触发的定时任务：生成周总"""
     summarizer = get_summarizer()
-    today = datetime.utcnow().strftime('%Y-%m-%d')
+    today = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
     logger.info(f"[CRON] 触发周总生成")
     result = await summarizer.generate_weekly_summary(today)
     if result:
@@ -661,7 +661,7 @@ async def run_weekly_cron():
 async def run_monthly_cron():
     """每月最后一天23:59触发的定时任务：生成月总"""
     summarizer = get_summarizer()
-    year_month = datetime.utcnow().strftime('%Y-%m')
+    year_month = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m')
     logger.info(f"[CRON] 触发月总生成: {year_month}")
     result = await summarizer.generate_monthly_summary(year_month)
     if result:
