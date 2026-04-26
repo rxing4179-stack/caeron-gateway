@@ -363,7 +363,7 @@ async def chat_completions(request: Request):
 
     # 提示词�������入处�����
     injection_engine = InjectionEngine()
-    body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model})
+    body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
 
     # 获取主供应商
     try:
@@ -412,7 +412,7 @@ async def chat_completions(request: Request):
             # 转发请求（传入conversation_id用于存储AI回复）
             response = await proxy_chat_completion(body, provider, conversation_id=conversation_id)
 
-            # 成功，确保��记为健康
+            # 成功，确保���记为健康
             await provider_manager.mark_healthy(provider['id'])
             logger.info(f"请求成功: 供应商={provider['name']}, 尝试次数={attempt + 1}")
 
@@ -520,7 +520,7 @@ async def admin_fetch_models(req: FetchModelsRequest):
             models = [m.get('id') for m in data.get('data', []) if m.get('id')]
             return {"models": models}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"获取模型���表失败: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"获取模型����表失败: {str(e)}")
 
 
 # ==================== 提示词注入规则 API ====================
