@@ -93,6 +93,7 @@ Line: ' + line + ', Col: ' + col + '
             <button @click="currentTab = 'rules'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'rules', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'rules'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">提示词注入</button>
             <button @click="currentTab = 'conversations'; viewMode === 'windows' ? fetchWindows() : fetchConversations()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'conversations', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'conversations'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">对话记录</button>
             <button @click="currentTab = 'memory'; fetchSummaries(); fetchSummaryStats()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'memory', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'memory'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">记忆总览</button>
+            <a href="/games/snake" target="_blank" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors text-[#5a7a7d] hover:text-[#4199a0] inline-flex items-center">小游戏</a>
         </nav>
 
         <!-- 主要内容区域 -->

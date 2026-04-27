@@ -1005,6 +1005,15 @@ async def admin_panel():
     return HTMLResponse("<h1>管理面板文件未找到</h1>", status_code=404)
 
 
+# ==================== 小游戏 ====================
+@app.get("/games/snake")
+async def snake_game():
+    """贪吃蛇小游戏"""
+    html_path = os.path.join(os.path.dirname(__file__), "static", "snake.html")
+    if os.path.exists(html_path):
+        return FileResponse(html_path, media_type="text/html")
+    return HTMLResponse("<h1>游戏文件未找到</h1>", status_code=404)
+
 # ==================== 启动入口 ====================
 
 if __name__ == "__main__":
