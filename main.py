@@ -934,7 +934,7 @@ async def get_summaries(tag: str = None, is_active: int = None, limit: int = 100
     """获取总结列表，支持按tag和is_active筛选"""
     db = await get_db()
     try:
-        query = "SELECT id, conversation_id, tag, content, is_active, created_at, category FROM summaries WHERE 1=1"
+        query = "SELECT id, conversation_id, tag, content, is_active, created_at, category, valence, arousal, anchor FROM summaries WHERE 1=1"
         params = []
         if tag:
             query += " AND tag = ?"
@@ -945,7 +945,7 @@ async def get_summaries(tag: str = None, is_active: int = None, limit: int = 100
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
         rows = await db.execute_fetchall(query, params)
-        cols = ["id", "conversation_id", "tag", "content", "is_active", "created_at", "category"]
+        cols = ["id", "conversation_id", "tag", "content", "is_active", "created_at", "category", "valence", "arousal", "anchor"]
         return [{c: r[i] for i, c in enumerate(cols)} for r in rows]
     finally:
         await db.close()

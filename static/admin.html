@@ -316,7 +316,7 @@ Line: ' + line + ', Col: ' + col + '
                                 </div>
                                 <div class="flex items-center gap-1 shrink-0 mt-1">
                                     <template v-if="win.is_manual">
-                                        <button @click.stop="openEditWindowModal(win)" class="text-[#77b5b4] hover:text-[#4199a0] p-1" title="编辑窗口">
+                                        <button @click.stop="openEditWindowModal(win)" class="text-[#77b5b4] hover:text-[#4199a0] p-1" title="���辑窗口">
                                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
                                         </button>
                                         <button @click.stop="deleteWindow(win.window_id)" class="text-[#77b5b4] hover:text-red-400 p-1" title="删除窗口">
@@ -591,6 +591,11 @@ Line: ' + line + ', Col: ' + col + '
                         </div>
                         <div v-show="s._expanded" class="px-4 pb-3 border-t border-[#aecfd1]">
                             <pre class="text-xs text-[#333] whitespace-pre-wrap leading-relaxed mt-2 max-h-80 overflow-auto">{{ s.content }}</pre>
+                            <div v-if="s.valence !== null || s.arousal !== null || s.anchor" class="flex flex-wrap gap-2 mt-2 text-xs">
+                                <span v-if="s.valence !== null" class="px-2 py-0.5 rounded-full" :class="s.valence >= 0 ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'">情绪效价: {{ s.valence }}</span>
+                                <span v-if="s.arousal !== null" class="px-2 py-0.5 rounded-full bg-yellow-50 text-yellow-700">情绪强度: {{ s.arousal }}</span>
+                                <span v-if="s.anchor" class="px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700">🔗 {{ s.anchor }}</span>
+                            </div>
                             <div class="flex items-center justify-between mt-3 pt-2 border-t border-gray-100">
                                 <span class="text-xs text-gray-400">conv: {{ s.conversation_id ? s.conversation_id.slice(0,8) + '...' : 'global' }}</span>
                                 <button @click.stop="deleteSummary(s.id)" class="text-xs text-red-500 hover:text-red-700 transition-colors">删除</button>
