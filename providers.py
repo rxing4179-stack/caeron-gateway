@@ -118,7 +118,7 @@ class ProviderManager:
             if was_healthy:
                 await db.execute(
                     '''UPDATE providers SET is_healthy = 0, last_error = ?, 
-                       unhealthy_since = datetime('now', '+8 hours')), fail_count = ? WHERE id = ?''',
+                       unhealthy_since = datetime('now', '+8 hours'), fail_count = ? WHERE id = ?''',
                     (error, new_fail_count, provider_id)
                 )
             else:
@@ -155,7 +155,7 @@ class ProviderManager:
         db = await get_db()
         try:
             await db.execute(
-                "UPDATE providers SET last_used_at = datetime('now', '+8 hours')) WHERE id = ?",
+                "UPDATE providers SET last_used_at = datetime('now', '+8 hours') WHERE id = ?",
                 (provider_id,)
             )
             await db.commit()
