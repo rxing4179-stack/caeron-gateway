@@ -7,7 +7,8 @@ import json
 import logging
 import httpx
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
+from utils import now_cst, today_cst_str, timedelta
 from database import get_db
 
 logger = logging.getLogger(__name__)
@@ -117,7 +118,7 @@ class ProviderManager:
             if was_healthy:
                 await db.execute(
                     '''UPDATE providers SET is_healthy = 0, last_error = ?, 
-                       unhealthy_since = datetime('now'), fail_count = ? WHERE id = ?''',
+                       unhealthy_since = datetime('now', '+8 hours')), fail_count = ? WHERE id = ?''',
                     (error, new_fail_count, provider_id)
                 )
             else:
@@ -154,7 +155,7 @@ class ProviderManager:
         db = await get_db()
         try:
             await db.execute(
-                "UPDATE providers SET last_used_at = datetime('now') WHERE id = ?",
+                "UPDATE providers SET last_used_at = datetime('now', '+8 hours')) WHERE id = ?",
                 (provider_id,)
             )
             await db.commit()
@@ -261,7 +262,7 @@ class ProviderManager:
             candidates = [dict(row) for row in await cursor.fetchall()]
 
             result = []
-            now = datetime.utcnow()
+            now = now_cst()
             for p in candidates:
                 if exclude_ids and p['id'] in exclude_ids:
                     continue

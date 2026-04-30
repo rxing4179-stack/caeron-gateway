@@ -1,3 +1,4 @@
+from utils import now_cst, today_cst_str
 #!/usr/bin/env python3
 """Patch script for A(round rollup) + B(tech anchors) + C(task status)"""
 import re, sys, os
@@ -183,7 +184,7 @@ ROLLUP_METHODS = '''    # ==================== 轮总总（round_rollup） =====
         """检查活跃轮总数量，超过阈值时压缩最老的一批"""
         db = await get_db()
         try:
-            today = datetime.now().strftime('%Y-%m-%d')
+            today = today_cst_str()
             cursor = await db.execute(
                 """SELECT COUNT(*) FROM summaries
                    WHERE tag = 'round' AND is_active = 1
@@ -203,7 +204,7 @@ ROLLUP_METHODS = '''    # ==================== 轮总总（round_rollup） =====
         """把最老的 ROLLUP_BATCH 条活跃轮总压缩为1条轮总总"""
         db = await get_db()
         try:
-            today = datetime.now().strftime('%Y-%m-%d')
+            today = today_cst_str()
             cursor = await db.execute(
                 """SELECT id, content, created_at FROM summaries
                    WHERE tag = 'round' AND is_active = 1
@@ -322,7 +323,7 @@ inj = read('injection.py')
 
 # --- A: 在轮总注入之前插入轮总总 ---
 OLD_ROUND_INJECT = '''            # 轮总：当天所有活跃的
-            today = datetime.now().strftime('%Y-%m-%d')
+            today = today_cst_str()
             cursor = await db.execute(
                 """SELECT content, created_at FROM summaries
                    WHERE tag = 'round' AND is_active = 1
@@ -339,7 +340,7 @@ OLD_ROUND_INJECT = '''            # 轮总：当天所有活跃的
                     parts.append(f"- [轮总 #{idx}/{total}] [{r['created_at']}] {r['content']}")'''
 
 NEW_ROUND_INJECT = '''            # 轮总总：当天所有活跃的（被压缩的旧轮总的摘要）
-            today = datetime.now().strftime('%Y-%m-%d')
+            today = today_cst_str()
             cursor = await db.execute(
                 """SELECT content, created_at FROM summaries
                    WHERE tag = 'round_rollup' AND is_active = 1

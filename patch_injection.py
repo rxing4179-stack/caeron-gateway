@@ -1,3 +1,4 @@
+from utils import now_cst, today_cst_str
 #!/usr/bin/env python3
 """Patch injection.py to add message trimming logic"""
 
@@ -45,7 +46,7 @@ new_function = '''    async def _inject_round_summaries(self, messages: list[dic
                     parts.append(f"- [日总] [{r['created_at']}] {r['content']}")
 
             # 轮总：当天所有活跃的
-            today = datetime.now().strftime('%Y-%m-%d')
+            today = today_cst_str()
             cursor = await db.execute(
                 """SELECT content, created_at FROM summaries
                    WHERE tag = 'round' AND is_active = 1
@@ -104,7 +105,7 @@ new_function = '''    async def _inject_round_summaries(self, messages: list[dic
 
         # 组装总结文本
         summary_lines = ["<context_summaries>"]
-        summary_lines.append(f"以下是今天（{datetime.now().strftime('%Y-%m-%d')}）的对话记忆摘要，供你参考当前上下文：")
+        summary_lines.append(f"以下是今天（{today_cst_str()}）的对话记忆摘要，供你参考当前上下文：")
         summary_lines.extend(parts)
         summary_lines.append("</context_summaries>")
 

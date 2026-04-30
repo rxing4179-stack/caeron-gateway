@@ -5,7 +5,8 @@ Caeron Gateway - 提示词注入引擎
 
 import json
 import copy
-from datetime import datetime, timedelta
+from datetime import datetime
+from utils import now_cst, today_cst_str, timedelta
 import logging
 from database import get_db
 
@@ -213,7 +214,7 @@ class InjectionEngine:
                     parts.append(f"- [日总] [{r['created_at']}] {r['content']}")
 
             # 轮总总：当天所有活跃的（被压缩的旧轮总的摘要）
-            today = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')
+            today = today_cst_str()
             cursor = await db.execute(
                 """SELECT content, created_at FROM summaries
                    WHERE tag = 'round_rollup' AND is_active = 1
@@ -289,7 +290,7 @@ class InjectionEngine:
 
         # 组装总结文本
         summary_lines = ["<context_summaries>"]
-        summary_lines.append(f"以下是今天（{(datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d')}）的对话记忆摘要，供你参考当前上下文：")
+        summary_lines.append(f"以下是今天（{today_cst_str()}）的对话记忆摘要，供你参考当前上下文：")
         summary_lines.extend(parts)
         summary_lines.append("</context_summaries>")
 
@@ -306,7 +307,7 @@ class InjectionEngine:
 
     def _replace_variables(self, text: str) -> str:
         """替换文本中的预设变量"""
-        now = datetime.utcnow() + timedelta(hours=8)
+        now = now_cst()
         replacements = {
             '{cur_datetime}': now.strftime('%Y-%m-%d %H:%M:%S'),
             '{cur_date}': now.strftime('%Y-%m-%d'),

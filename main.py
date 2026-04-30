@@ -44,14 +44,15 @@ provider_manager = ProviderManager()
 async def _summary_cron_loop():
     """后台定时任务：每天UTC 15:59（北京时间23:59）触发日总，周日额外触发周总，月末额外触发月总"""
     from summarizer import run_daily_cron, run_weekly_cron, run_monthly_cron
-    from datetime import datetime as _dt, timedelta as _td
+    from datetime import datetime
+from utils import now_cst, today_cst_str as _dt, timedelta as _td
     import calendar
     
     while True:
         try:
             # 计算距离下一个UTC 15:59的秒数
             now = _dt.utcnow()
-            target = now.replace(hour=15, minute=59, second=0, microsecond=0)
+            target = now.replace(hour=23, minute=59, second=0, microsecond=0)
             if now >= target:
                 target += _td(days=1)
             wait_seconds = (target - now).total_seconds()
@@ -638,7 +639,7 @@ async def admin_update_rule(rule_id: int, request: Request):
                 values.append(data[k])
         if fields:
             values.append(rule_id)
-            await db.execute(f"UPDATE injection_rules SET {', '.join(fields)}, updated_at = datetime('now') WHERE id = ?", values)
+            await db.execute(f"UPDATE injection_rules SET {', '.join(fields)}, updated_at = datetime('now', '+8 hours')) WHERE id = ?", values)
             await db.commit()
         return {"message": "规则更新成功"}
     finally:
@@ -889,7 +890,7 @@ async def admin_update_window(window_id: int, request: Request):
                 params.append(body[field])
         if not sets:
             return JSONResponse({'error': '无更新字段'}, status_code=400)
-        sets.append("updated_at = datetime('now')")
+        sets.append("updated_at = datetime('now', '+8 hours'))")
         params.append(window_id)
         await db.execute(f"UPDATE windows SET {', '.join(sets)} WHERE id = ?", params)
         await db.commit()
@@ -1031,8 +1032,9 @@ async def admin_delete_conversation(conversation_id: str):
 @app.get("/admin/api/calendar")
 async def admin_calendar(year: int = None, month: int = None):
     """返回每日消息计数，用于日历热力图"""
-    from datetime import datetime, timedelta
-    china_now = datetime.utcnow() + timedelta(hours=8)
+    from datetime import datetime
+from utils import now_cst, today_cst_str, timedelta
+    china_now = now_cst()
     if not year:
         year = china_now.year
     if not month:
@@ -1100,9 +1102,10 @@ async def get_summary_stats():
         total_row = await db.execute_fetchall("SELECT COUNT(*) FROM summaries")
         total = total_row[0][0] if total_row else 0
         # 下次cron时间（计算到下一个UTC 15:59）
-        from datetime import datetime as _dt_s, timedelta as _td_s
+        from datetime import datetime
+from utils import now_cst, today_cst_str as _dt_s, timedelta as _td_s
         _now = _dt_s.utcnow()
-        _target = _now.replace(hour=15, minute=59, second=0, microsecond=0)
+        _target = _now.replace(hour=23, minute=59, second=0, microsecond=0)
         if _now >= _target:
             _target += _td_s(days=1)
         _beijing = _target + _td_s(hours=8)

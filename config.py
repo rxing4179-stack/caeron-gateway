@@ -1,3 +1,4 @@
+from utils import now_cst, today_cst_str
 """
 Caeron Gateway - 配置管理模块
 从 SQLite config 表读写动态配置项
@@ -41,10 +42,10 @@ async def set_config(key: str, value: str, description: str = None) -> None:
     try:
         await db.execute('''
             INSERT INTO config (key, value, description, updated_at) 
-            VALUES (?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, datetime('now', '+8 hours')))
             ON CONFLICT(key) DO UPDATE SET 
                 value = excluded.value, 
-                updated_at = datetime('now')
+                updated_at = datetime('now', '+8 hours'))
         ''', (key, value, description))
         await db.commit()
     finally:

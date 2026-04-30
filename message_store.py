@@ -1,3 +1,4 @@
+from utils import now_cst, today_cst_str
 """
 Caeron Gateway - 消息存储管道
 拦截并存档所有经过网关的对话消息（入站 + 出站）
@@ -250,6 +251,7 @@ async def store_incoming_messages(conversation_id: str, messages: list):
         if not new_messages:
             return 0
         
+        now_bj = now_cst().strftime('%Y-%m-%d %H:%M:%S')
         stored = 0
         for i, msg in enumerate(new_messages):
             content = msg.get('content', '')
@@ -257,9 +259,9 @@ async def store_incoming_messages(conversation_id: str, messages: list):
                 content = json.dumps(content, ensure_ascii=False)
             
             await db.execute(
-                '''INSERT INTO messages (conversation_id, role, content, message_index)
-                   VALUES (?, ?, ?, ?)''',
-                (conversation_id, msg['role'], content, start_index + i)
+                '''INSERT INTO messages (conversation_id, role, content, message_index, created_at)
+                   VALUES (?, ?, ?, ?, ?)''',
+                (conversation_id, msg['role'], content, start_index + i, now_bj)
             )
             stored += 1
         
@@ -295,6 +297,7 @@ async def store_assistant_response(conversation_id: str, content: str):
     if not content or not content.strip():
         return
     
+    now_bj = now_cst().strftime('%Y-%m-%d %H:%M:%S')
     db = await get_db()
     try:
         # 检查最后一条消息是否是assistant（重roll场景）
@@ -309,25 +312,25 @@ async def store_assistant_response(conversation_id: str, content: str):
         if last_msg and last_msg['role'] == 'assistant':
             # 重roll：覆盖最后一条assistant消息
             await db.execute(
-                '''UPDATE messages SET content = ?, created_at = datetime('now', '+8 hours')
+                '''UPDATE messages SET content = ?, created_at = ?
                    WHERE id = ?''',
-                (content, last_msg['id'])
+                (content, now_bj, last_msg['id'])
             )
             logger.info(f"覆盖AI回复(重roll) (对话: {conversation_id[:8]}..., {len(content)} 字符)")
         else:
             # 正常新增
             next_index = (last_msg['message_index'] + 1) if last_msg else 0
             await db.execute(
-                '''INSERT INTO messages (conversation_id, role, content, message_index)
-                   VALUES (?, ?, ?, ?)''',
-                (conversation_id, 'assistant', content, next_index)
+                '''INSERT INTO messages (conversation_id, role, content, message_index, created_at)
+                   VALUES (?, ?, ?, ?, ?)''',
+                (conversation_id, 'assistant', content, next_index, now_bj)
             )
             await db.execute(
                 '''UPDATE conversations 
-                   SET last_message_at = datetime('now', '+8 hours'),
+                   SET last_message_at = ?,
                        message_count = message_count + 1
                    WHERE conversation_id = ?''',
-                (conversation_id,)
+                (now_bj, conversation_id)
             )
             logger.info(f"存储AI回复 (对话: {conversation_id[:8]}..., {len(content)} 字符)")
         

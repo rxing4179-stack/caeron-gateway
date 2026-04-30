@@ -1,3 +1,4 @@
+from utils import now_cst, today_cst_str
 # ==================== 窗口管理 CRUD ====================
 
 @app.get("/admin/api/windows")
@@ -137,7 +138,7 @@ async def admin_update_window(window_id: int, request: Request):
                 params.append(body[field])
         if not sets:
             return JSONResponse({'error': '无更新字段'}, status_code=400)
-        sets.append("updated_at = datetime('now')")
+        sets.append("updated_at = datetime('now', '+8 hours'))")
         params.append(window_id)
         await db.execute(f"UPDATE windows SET {', '.join(sets)} WHERE id = ?", params)
         await db.commit()
