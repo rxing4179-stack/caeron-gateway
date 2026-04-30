@@ -1,6 +1,31 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
+<script>
+(function(){
+  var token = localStorage.getItem('caeron_admin_token');
+  if (!token) {
+    token = prompt('Caeron Admin Token:');
+    if (token) localStorage.setItem('caeron_admin_token', token);
+  }
+  if (token) {
+    var _fetch = window.fetch;
+    window.fetch = function(url, opts) {
+      if (typeof url === 'string' && url.indexOf('/admin/api/') !== -1) {
+        opts = opts || {};
+        opts.headers = opts.headers || {};
+        if (opts.headers instanceof Headers) {
+          opts.headers.set('Authorization', 'Bearer ' + token);
+        } else {
+          opts.headers['Authorization'] = 'Bearer ' + token;
+        }
+      }
+      return _fetch.call(this, url, opts);
+    };
+  }
+  window.__caeronLogout = function(){ localStorage.removeItem('caeron_admin_token'); location.reload(); };
+})();
+</script>
     <script>
     window.onerror = function(msg, url, line, col, error) {
         var d = document.createElement('div');
@@ -91,8 +116,8 @@ Line: ' + line + ', Col: ' + col + '
         <nav class="flex overflow-x-auto hide-scrollbar border-b border-[#aecfd1] bg-white px-2">
             <button @click="currentTab = 'providers'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'providers', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'providers'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">供应商管理</button>
             <button @click="currentTab = 'rules'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'rules', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'rules'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">提示词注入</button>
-            <button @click="currentTab = 'conversations'; viewMode === 'windows' ? fetchWindows() : fetchConversations()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'conversations', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'conversations'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">对话记录</button>
-            <button @click="currentTab = 'memory'; fetchSummaries(); fetchSummaryStats()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'memory', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'memory'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">记忆总览</button>
+            <button @click="currentTab = 'conversations'; fetchCalendar()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'conversations', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'conversations'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">对话记录</button>
+            <button @click="currentTab = 'memory'; fetchSummaries(); fetchSummaryStats(); fetchSummaryConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'memory', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'memory'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">记忆总览</button>
             <a href="/games/snake" target="_blank" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors text-[#5a7a7d] hover:text-[#4199a0] inline-flex items-center">小游戏</a>
         </nav>
 
@@ -228,15 +253,8 @@ Line: ' + line + ', Col: ' + col + '
                         <h2 class="text-lg font-semibold text-[#2c3e50]">对话记录</h2>
                         <div class="flex items-center gap-2">
                             <!-- 视图切换 -->
-                            <div class="flex bg-[#deebec] rounded-lg p-0.5">
-                                <button @click="viewMode = 'windows'; fetchWindows()" :class="viewMode === 'windows' ? 'bg-white text-[#4199a0] shadow-sm' : 'text-[#5a7a7d]'" class="px-2 py-1 text-[10px] rounded-md transition-all" title="按窗口分组">
-                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-                                </button>
-                                <button @click="viewMode = 'flat'; fetchConversations()" :class="viewMode === 'flat' ? 'bg-white text-[#4199a0] shadow-sm' : 'text-[#5a7a7d]'" class="px-2 py-1 text-[10px] rounded-md transition-all" title="平铺列表">
-                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"></path></svg>
-                                </button>
-                            </div>
-                            <button @click="viewMode === 'windows' ? fetchWindows() : fetchConversations()" class="text-[#5a7a7d] hover:text-[#4199a0] p-1" title="刷新">
+                            
+                            <button @click="fetchConversations()" class="text-[#5a7a7d] hover:text-[#4199a0] p-1" title="刷新">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
                             </button>
                         </div>
@@ -252,13 +270,40 @@ Line: ' + line + ', Col: ' + col + '
                         </button>
                     </div>
 
-                    <!-- 时间筛选 -->
-                    <div class="flex gap-2 items-center text-sm flex-wrap">
-                        <span class="text-[#5a7a7d] shrink-0 text-xs">时间:</span>
-                        <input v-model="dateStart" @change="viewMode === 'windows' ? fetchWindows() : fetchConversations()" type="date" class="bg-white border border-[#aecfd1] rounded-lg px-2 py-1 text-xs text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
-                        <span class="text-[#77b5b4] text-xs">至</span>
-                        <input v-model="dateEnd" @change="viewMode === 'windows' ? fetchWindows() : fetchConversations()" type="date" class="bg-white border border-[#aecfd1] rounded-lg px-2 py-1 text-xs text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
-                        <button v-if="dateStart || dateEnd" @click="dateStart = ''; dateEnd = ''; viewMode === 'windows' ? fetchWindows() : fetchConversations()" class="text-[10px] text-[#77b5b4] hover:text-[#4199a0] underline">清除</button>
+
+                                </div>
+
+                <!-- 日历热力图 -->
+                <div v-show="!searchQuery" class="mb-4 bg-white rounded-xl border border-[#aecfd1] p-3">
+                    <div class="flex justify-between items-center mb-2">
+                        <button @click="prevMonth" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg>
+                        </button>
+                        <span class="text-sm font-medium text-[#2c3e50]">{{ calendarYear }}年{{ calendarMonth }}月</span>
+                        <button @click="nextMonth" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                        </button>
+                    </div>
+                    <div class="grid grid-cols-7 gap-1 text-center">
+                        <div v-for="d in ['日','一','二','三','四','五','六']" class="text-[10px] text-[#77b5b4] py-0.5">{{ d }}</div>
+                        <template v-for="(week, wi) in calendarWeeks" :key="wi">
+                            <div v-for="(cell, ci) in week" :key="wi+'-'+ci"
+                                 @click="clickCalendarDay(cell)"
+                                 class="aspect-square rounded-md flex flex-col items-center justify-center text-[10px] transition-all relative"
+                                 :class="cell ? (cell.count > 0 ? 'cursor-pointer hover:ring-2 hover:ring-[#4199a0]/40 hover:scale-110' : 'bg-[#f5f9f9]') : ''"
+                                 :style="cell && cell.count > 0 ? { backgroundColor: `rgba(65,153,160,${Math.min(0.12 + 0.88 * cell.count / maxDayCount, 1)})` } : {}"
+                                 :title="cell ? (cell.count > 0 ? cell.day+'日: '+cell.count+'条 (蕊蕊'+cell.user_count+'/沈栖'+cell.assistant_count+')' : cell.day+'日') : ''">
+                                <span v-if="cell" :class="cell.count > 0 && cell.count / maxDayCount > 0.5 ? 'text-white font-semibold' : 'text-[#5a7a7d]'" class="leading-none">{{ cell.day }}</span>
+                                <span v-if="cell && cell.count > 0" :class="cell.count / maxDayCount > 0.5 ? 'text-white/80' : 'text-[#77b5b4]'" class="text-[8px] leading-none mt-0.5">{{ cell.count }}</span>
+                            </div>
+                        </template>
+                    </div>
+                    <div class="flex items-center justify-center gap-3 mt-2 text-[9px] text-[#77b5b4]">
+                        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm bg-[#f5f9f9] border border-[#e0e0e0]"></span>0</span>
+                        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm" style="background:rgba(65,153,160,0.2)"></span>少</span>
+                        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm" style="background:rgba(65,153,160,0.5)"></span>中</span>
+                        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm" style="background:rgba(65,153,160,0.85)"></span>多</span>
+                        <span class="flex items-center gap-1"><span class="w-2.5 h-2.5 rounded-sm bg-[#4199a0]"></span>最多</span>
                     </div>
                 </div>
 
@@ -283,7 +328,7 @@ Line: ' + line + ', Col: ' + col + '
                 <div v-if="loading.search" class="mb-4 text-center py-4 text-sm text-[#77b5b4]">搜索中...</div>
 
                 <!-- 窗口分组视图 -->
-                <div v-show="!searchQuery && viewMode === 'windows'" class="space-y-3">
+                <div v-show="false" class="space-y-3">
                     <!-- 创建窗口按钮 -->
                     <div class="flex justify-end mb-1">
                         <button @click="openCreateWindowModal()" class="flex items-center gap-1.5 bg-[#4199a0] hover:bg-[#357e84] text-white text-xs px-3 py-1.5 rounded-lg transition-colors shadow-sm">
@@ -354,20 +399,20 @@ Line: ' + line + ', Col: ' + col + '
                                             <button @click.stop="deleteConversation(conv.conversation_id)" class="text-[#77b5b4] hover:text-red-400 p-1" title="删除">
                                                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                                             </button>
-                                            <svg class="w-3.5 h-3.5 text-[#77b5b4] transition-transform" :class="{'rotate-180': conv._expanded}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                            <svg class="w-3.5 h-3.5 text-[#77b5b4] transition-transform" :class="{'rotate-180': expandedConvs.has(conv.conversation_id)}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
                                         </div>
                                     </div>
                                 </div>
 
                                 <!-- 展开的消息列表 (窗口内对话) -->
-                                <div v-if="conv._expanded" class="border-t border-[#aecfd1]/50 bg-[#f7fafa] max-h-[60vh] overflow-y-auto hide-scrollbar">
-                                    <div v-if="conv._loadingMessages" class="text-center py-6 text-[#77b5b4] text-sm">加载消息中...</div>
+                                <div v-if="expandedConvs.has(conv.conversation_id)" class="border-t border-[#aecfd1]/50 bg-[#f7fafa] max-h-[60vh] overflow-y-auto hide-scrollbar">
+                                    <div v-if="loadingConvs.has(conv.conversation_id)" class="text-center py-6 text-[#77b5b4] text-sm">加载消息中...</div>
                                     <div v-else class="p-3 space-y-2">
-                                        <template v-for="msg in conv._messages" :key="msg.id">
+                                        <template v-for="msg in messagesMap.get(conv.conversation_id)" :key="msg.id">
                                             <!-- 复用和平铺视图完全相同的消息渲染 -->
                                             <div v-if="isSummary(msg)" class="flex flex-col items-center">
                                                 <button @click="msg._showDetail = !msg._showDetail" class="text-[10px] bg-[#d4eaeb]/60 text-[#5a8a8d] px-3 py-1 rounded-full hover:bg-[#d4eaeb]">
-                                                    对话摘要 {{ msg._showDetail ? '(收起)' : '(点击展开)' }}
+                                                    {{ getSummaryType(msg) }} {{ msg._showDetail ? '(收起)' : '(点击展开)' }}
                                                 </button>
                                                 <div v-if="msg._showDetail" class="mt-2 w-full bg-[#edf5f5]/70 border border-[#c5dfe0]/50 rounded-lg p-3 text-[10px] text-[#5a8a8d] font-mono whitespace-pre-wrap break-all max-h-[200px] overflow-y-auto">
                                                     {{ msg.content.slice(0, 2000) }}{{ msg.content.length > 2000 ? ' ...(已截断)' : '' }}
@@ -423,13 +468,17 @@ Line: ' + line + ', Col: ' + col + '
                 </div>
 
                 <!-- 平铺对话列表 -->
-                <div v-show="!searchQuery && viewMode === 'flat'" class="space-y-3">
+                <div v-if="selectedCalendarDate && !searchQuery" class="mb-3 flex items-center justify-between">
+                    <span class="text-sm font-medium text-[#2c3e50]">{{ selectedCalendarDate }} 的对话</span>
+                    <button @click="selectedCalendarDate = ''; dateStart = ''; dateEnd = ''" class="text-xs text-[#77b5b4] hover:text-[#4199a0] underline">清除选择</button>
+                </div>
+                <div v-show="!searchQuery && selectedCalendarDate" class="space-y-3">
                     <div v-if="loading.conversations" class="text-center py-8 text-[#77b5b4]">加载中...</div>
                     <div v-else-if="conversations.length === 0" class="text-center py-8 text-[#77b5b4] bg-white/50 rounded-xl border border-[#aecfd1]/50">
                         暂无对话记录
                     </div>
 
-                    <div v-for="conv in conversations" :key="conv.conversation_id" class="bg-white rounded-xl border border-[#aecfd1] overflow-hidden">
+                    <div v-for="conv in groupedConversations" :key="conv.conversation_id" class="bg-white rounded-xl border border-[#aecfd1] overflow-hidden">
                         <!-- 对话卡片头部 -->
                         <div class="p-4 cursor-pointer hover:bg-[#deebec]/50 transition-colors" @click="toggleConversation(conv)">
                             <div class="flex justify-between items-start">
@@ -448,21 +497,21 @@ Line: ' + line + ', Col: ' + col + '
                                     <button @click.stop="deleteConversation(conv.conversation_id)" class="text-[#77b5b4] hover:text-red-400 p-1" title="删除">
                                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                                     </button>
-                                    <svg class="w-4 h-4 text-[#77b5b4] transition-transform" :class="{'rotate-180': conv._expanded}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                    <svg class="w-4 h-4 text-[#77b5b4] transition-transform" :class="{'rotate-180': expandedConvs.has(conv.conversation_id)}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
                                 </div>
                             </div>
                         </div>
 
                         <!-- 展开的消息列表 -->
-                        <div v-if="conv._expanded" class="border-t border-[#aecfd1] bg-[#f7fafa] max-h-[60vh] overflow-y-auto hide-scrollbar">
-                            <div v-if="conv._loadingMessages" class="text-center py-6 text-[#77b5b4] text-sm">加载消息中...</div>
+                        <div v-if="expandedConvs.has(conv.conversation_id)" class="border-t border-[#aecfd1] bg-[#f7fafa] max-h-[60vh] overflow-y-auto hide-scrollbar">
+                            <div v-if="loadingConvs.has(conv.conversation_id)" class="text-center py-6 text-[#77b5b4] text-sm">加载消息中...</div>
                             <div v-else class="p-3 space-y-2">
-                                <template v-for="msg in conv._messages" :key="msg.id">
+                                <template v-for="msg in messagesMap.get(conv.conversation_id)" :key="msg.id">
 
                                     <!-- 对话摘要 -->
                                     <div v-if="isSummary(msg)" class="flex flex-col items-center">
                                         <button @click="msg._showDetail = !msg._showDetail" class="text-[10px] bg-[#d4eaeb]/60 text-[#5a8a8d] px-3 py-1 rounded-full hover:bg-[#d4eaeb]">
-                                            对话摘要 {{ msg._showDetail ? '(收起)' : '(点击展开)' }}
+                                            {{ getSummaryType(msg) }} {{ msg._showDetail ? '(收起)' : '(点击展开)' }}
                                         </button>
                                         <div v-if="msg._showDetail" class="mt-2 w-full bg-[#edf5f5]/70 border border-[#c5dfe0]/50 rounded-lg p-3 text-[10px] text-[#5a8a8d] font-mono whitespace-pre-wrap break-all max-h-[200px] overflow-y-auto">
                                             {{ msg.content.slice(0, 2000) }}{{ msg.content.length > 2000 ? ' ...(已截断)' : '' }}
@@ -487,8 +536,11 @@ Line: ' + line + ', Col: ' + col + '
                                     <!-- user消息 -->
                                     <div v-else-if="msg.role === 'user'" class="flex flex-col items-end">
                                         <div class="max-w-[85%]">
-                                            <div class="bg-[#4199a0] text-white rounded-2xl rounded-br-md px-3 py-2 text-sm whitespace-pre-wrap break-words">
+                                            <div v-if="getUserText(msg.content)" class="bg-[#4199a0] text-white rounded-2xl rounded-br-md px-3 py-2 text-sm whitespace-pre-wrap break-words">
                                                 {{ getUserText(msg.content) }}
+                                            </div>
+                                            <div v-if="getUserImages(msg.content).length > 0" class="mt-2 flex flex-wrap gap-2 justify-end">
+                                                <img v-for="(imgUrl, idx) in getUserImages(msg.content)" :key="idx" :src="imgUrl" class="max-w-[200px] max-h-[200px] rounded-lg border border-[#c5dfe0]/50 object-contain bg-white/10" />
                                             </div>
                                             <div v-if="hasAttachment(msg.content)" class="mt-1 text-right">
                                                 <button @click="msg._showDetail = !msg._showDetail" class="text-[10px] text-[#5a8a8d] hover:text-[#4d7a7d]">
@@ -547,13 +599,44 @@ Line: ' + line + ', Col: ' + col + '
                     </div>
                 </div>
 
+                <!-- 轮总配置 -->
+                <div class="bg-white rounded-xl border border-[#aecfd1] p-4 mb-4">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-sm font-semibold text-[#4199a0]">轮总触发配置</h3>
+                        <button @click="triggerRoundSummary()" 
+                            :disabled="loading.triggerSummary"
+                            class="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-700 disabled:opacity-50 transition-colors">
+                            {{ loading.triggerSummary ? '生成中...' : '手动触发轮总' }}
+                        </button>
+                    </div>
+                    <div class="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                        <div>
+                            <label class="text-xs text-[#5a7a7d] block mb-1">触发条数</label>
+                            <div class="flex items-center gap-2">
+                                <input type="number" v-model.number="summaryConfig.interval" min="1" max="100"
+                                    class="w-20 px-2 py-1.5 border border-[#aecfd1] rounded-lg text-sm focus:outline-none focus:border-[#4199a0]">
+                                <button @click="saveSummaryConfig()" 
+                                    class="px-2 py-1.5 bg-[#4199a0] text-white rounded-lg text-xs hover:bg-[#357a80] transition-colors">保存</button>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="text-xs text-[#5a7a7d] block mb-1">当前计数</label>
+                            <div class="text-lg font-bold text-[#4199a0]">{{ summaryConfig.currentCount }} / {{ summaryConfig.interval }}</div>
+                        </div>
+                        <div>
+                            <label class="text-xs text-[#5a7a7d] block mb-1">状态</label>
+                            <div class="text-sm text-[#5a7a7d]">{{ summaryConfig.currentCount >= summaryConfig.interval ? '即将触发' : '累计中' }}</div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 筛选 -->
                 <div class="flex gap-2 mb-4 flex-wrap">
-                    <button v-for="t in ['all','round','daily','weekly','monthly']" :key="t"
+                    <button v-for="t in ['all','round','round_rollup','daily','weekly','monthly']" :key="t"
                         @click="summaryFilter = t; fetchSummaries()"
                         :class="summaryFilter === t ? 'bg-[#4199a0] text-white' : 'bg-white text-[#5a7a7d] border border-[#aecfd1]'"
                         class="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors">
-                        {{ {all:'全部',round:'轮总',daily:'日总',weekly:'周总',monthly:'月总'}[t] }}
+                        {{ {all:'全部',round:'轮总',round_rollup:'轮总总',daily:'日总',weekly:'周总',monthly:'月总'}[t] }}
                     </button>
                     <button @click="summaryActiveOnly = !summaryActiveOnly; fetchSummaries()"
                         :class="summaryActiveOnly ? 'bg-emerald-600 text-white' : 'bg-white text-[#5a7a7d] border border-[#aecfd1]'"
@@ -570,11 +653,12 @@ Line: ' + line + ', Col: ' + col + '
                         <div class="flex items-center gap-2 px-4 py-3 cursor-pointer" @click="s._expanded = !s._expanded">
                             <span :class="{
                                 'bg-emerald-100 text-emerald-700': s.tag === 'round',
+                                'bg-teal-100 text-teal-700': s.tag === 'round_rollup',
                                 'bg-blue-100 text-blue-700': s.tag === 'daily',
                                 'bg-purple-100 text-purple-700': s.tag === 'weekly',
                                 'bg-amber-100 text-amber-700': s.tag === 'monthly'
                             }" class="px-2 py-0.5 rounded-full text-xs font-medium">
-                                {{ {round:'轮总',daily:'日总',weekly:'周总',monthly:'月总'}[s.tag] || s.tag }}
+                                {{ {round:'轮总',round_rollup:'轮总总',daily:'日总',weekly:'周总',monthly:'月总'}[s.tag] || s.tag }}
                             </span>
                             <span v-if="s.category" :class="{
                                 'bg-rose-50 text-rose-600': s.category === '技术',
@@ -903,7 +987,8 @@ Line: ' + line + ', Col: ' + col + '
                     saveRule: false,
                     fetchModels: false,
                     test: null,
-                    summaries: false
+                    summaries: false,
+                    triggerSummary: false
                 });
 
                 // 记忆总览状态
@@ -911,6 +996,7 @@ Line: ' + line + ', Col: ' + col + '
                 const summaryStats = ref({});
                 const summaryFilter = ref('all');
                 const summaryActiveOnly = ref(false);
+                const summaryConfig = ref({ interval: 16, currentCount: 0 });
                 
                 // 模型选择弹窗状态
                 const showModelModal = ref(false);
@@ -934,6 +1020,12 @@ Line: ' + line + ', Col: ' + col + '
                 const windowForm = reactive({ name: '', description: '', color: '#4a90d9' });
                 const assigningConversationId = ref(null);
                 let searchTimer = null;
+
+                // 日历热力图状态
+                const calendarData = ref({ year: 0, month: 0, days: [] });
+                const selectedCalendarDate = ref('');
+                const calendarYear = ref(new Date().getFullYear());
+                const calendarMonth = ref(new Date().getMonth() + 1);
 
                 // 弹窗表单状态
                 const showProviderModal = ref(false);
@@ -1119,7 +1211,7 @@ Line: ' + line + ', Col: ' + col + '
                             showToast(`测试失败: ${data.error}`, 'error');
                         }
                         
-                        // 刷新列表以更新健康状态
+                        // 刷新列表�������更新健康状态
                         await fetchProviders();
                     } catch (error) {
                         showToast(`请求失败: ${error.message}`, 'error');
@@ -1200,11 +1292,63 @@ Line: ' + line + ', Col: ' + col + '
 
                 // ===== 消息解析辅助函数 =====
                 const isSummary = (msg) => {
-                    return msg.role === 'user' && msg.content && msg.content.startsWith('==========对话摘要');
+                    if (!msg.content) return false;
+                    const c = msg.content.trim();
+                    // Operit原生摘要
+                    if (msg.role === 'user' && c.startsWith('==========对话摘要')) return true;
+                    // 网关注入的轮总/日总/周总/月总 (可能被Operit转为user角色)
+                    if (/^\[(?:轮总总?|日总|周总|月总)/.test(c)) return true;
+                    if (/^(?:- )?\[(?:轮总总?|日总|周总|月总)/.test(c)) return true;
+                    // 以 【日常】【技术】【学习】 开头的轮总内容
+                    if (msg.role === 'user' && /^【(?:日常|技术|学习)】/.test(c)) return true;
+                    return false;
                 };
+                const getSummaryType = (msg) => {
+                    if (!msg.content) return '摘要';
+                    const c = msg.content.trim();
+                    if (c.startsWith('==========对话摘要')) return '对话摘要';
+                    if (/^\[轮总总/.test(c) || /^- \[轮总总/.test(c)) return '轮总总';
+                    if (/^\[轮总/.test(c) || /^- \[轮总/.test(c)) return '轮总';
+                    if (/^\[日总/.test(c) || /^- \[日总/.test(c)) return '日总';
+                    if (/^\[周总/.test(c) || /^- \[周总/.test(c)) return '周总';
+                    if (/^\[月总/.test(c) || /^- \[月总/.test(c)) return '月总';
+                    if (/^【(?:日常|技术|学习)】/.test(c)) return '轮总';
+                    return '摘要';
+                };
+                const getUserImages = (content) => {
+                    if (!content || typeof content !== 'string') return [];
+                    if (!content.trim().startsWith('[')) return [];
+                    try {
+                        const arr = JSON.parse(content);
+                        if (Array.isArray(arr)) {
+                            return arr.filter(item => item.type === 'image_url' && item.image_url).map(item => {
+                                if (typeof item.image_url === 'string') return item.image_url;
+                                if (item.image_url.url) return item.image_url.url;
+                                return '';
+                            }).filter(url => url !== '');
+                        }
+                    } catch(e) {}
+                    return [];
+                };
+
                 const getUserText = (content) => {
                     if (!content) return '';
-                    return content.replace(/<attachment[^>]*>[\s\S]*?<\/attachment>/g, '').trim();
+                    let textContent = content;
+                    if (typeof content === 'string' && content.trim().startsWith('[')) {
+                        try {
+                            const arr = JSON.parse(content);
+                            if (Array.isArray(arr)) {
+                                const textParts = arr.filter(item => item.type === 'text').map(item => item.text);
+                                if (textParts.length > 0) {
+                                    textContent = textParts.join('\n');
+                                } else {
+                                    return ''; // No text, only images
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    if (typeof textContent !== 'string') return '';
+                    return textContent.replace(/<attachment[^>]*>[\s\S]*?<\/attachment>/g, '').trim();
                 };
                 const hasAttachment = (content) => {
                     return content && /<attachment[^>]*>/.test(content);
@@ -1265,6 +1409,9 @@ Line: ' + line + ', Col: ' + col + '
                 };
 
                 // ===== 对话记录相关方法 =====
+                const expandedConvs = ref(new Set());
+                const loadingConvs = ref(new Set());
+                const messagesMap = ref(new Map());
                 const fetchConversations = async () => {
                     loading.conversations = true;
                     try {
@@ -1286,6 +1433,38 @@ Line: ' + line + ', Col: ' + col + '
                         loading.conversations = false;
                     }
                 };
+
+                                const groupedConversations = computed(() => {
+                    if (!conversations.value.length) return [];
+                    const groups = [];
+                    let currentGroup = null;
+                    const getTime = (d) => {
+                        if (!d) return 0;
+                        const parsed = new Date(d.replace(/-/g, '/')).getTime();
+                        if (isNaN(parsed)) return new Date(d).getTime(); // fallback
+                        return parsed;
+                    };
+                    
+                    for (const conv of conversations.value) {
+                        if (!currentGroup) {
+                            currentGroup = { ...conv, sub_conversations: [conv] };
+                            groups.push(currentGroup);
+                        } else {
+                            const t1 = getTime(currentGroup.last_message_at || currentGroup.created_at);
+                            const t2 = getTime(conv.created_at);
+                            const diff = Math.abs(t1 - t2);
+                            if (diff < 12 * 60 * 60 * 1000) {
+                                currentGroup.message_count += conv.message_count;
+                                currentGroup.last_message_at = conv.last_message_at || conv.created_at;
+                                currentGroup.sub_conversations.push(conv);
+                            } else {
+                                currentGroup = { ...conv, sub_conversations: [conv] };
+                                groups.push(currentGroup);
+                            }
+                        }
+                    }
+                    return groups;
+                });
 
                 const fetchWindows = async () => {
                     loading.conversations = true;
@@ -1363,7 +1542,7 @@ Line: ' + line + ', Col: ' + col + '
                 };
 
                 const deleteWindow = async (windowId) => {
-                    if (!confirm('删除窗口后，其中的对话将变为未归类状态。确定删除？')) return;
+                    if (!confirm('删除窗口后，其中的对话将���为未归类状态。确定删除？')) return;
                     try {
                         const res = await fetch(`/admin/api/windows/${windowId}`, { method: 'DELETE' });
                         if (!res.ok) throw new Error('删除失败');
@@ -1411,17 +1590,36 @@ Line: ' + line + ', Col: ' + col + '
                 };
 
                 const toggleConversation = async (conv) => {
-                    conv._expanded = !conv._expanded;
-                    if (conv._expanded && conv._messages.length === 0) {
-                        conv._loadingMessages = true;
+                    const id = conv.conversation_id;
+                    if (expandedConvs.value.has(id)) {
+                        expandedConvs.value.delete(id);
+                        return;
+                    }
+                    expandedConvs.value.add(id);
+                    
+                    if (!messagesMap.value.has(id)) {
+                        loadingConvs.value.add(id);
                         try {
-                            const res = await fetch(`/admin/api/conversations/${conv.conversation_id}/messages`);
-                            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                            conv._messages = await res.json();
+                            if (conv.sub_conversations) {
+                                let allMessages = [];
+                                for (const sub of conv.sub_conversations) {
+                                    const res = await fetch(`/admin/api/conversations/${sub.conversation_id}/messages`);
+                                    if (res.ok) {
+                                        const data = await res.json();
+                                        allMessages = allMessages.concat(data);
+                                    }
+                                }
+                                allMessages.sort((a, b) => b.id - a.id);
+                                messagesMap.value.set(id, allMessages);
+                            } else {
+                                const res = await fetch(`/admin/api/conversations/${conv.conversation_id}/messages`);
+                                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                                messagesMap.value.set(id, (await res.json()).reverse());
+                            }
                         } catch (error) {
                             showToast(`加载消息失败: ${error.message}`, 'error');
                         } finally {
-                            conv._loadingMessages = false;
+                            loadingConvs.value.delete(id);
                         }
                     }
                 };
@@ -1432,7 +1630,7 @@ Line: ' + line + ', Col: ' + col + '
                         const res = await fetch(`/admin/api/conversations/${conversationId}`, { method: 'DELETE' });
                         if (!res.ok) throw new Error('删除失败');
                         showToast('对话已删除', 'success');
-                        viewMode.value === 'windows' ? await fetchWindows() : await fetchConversations();
+                        await fetchConversations();
                     } catch (error) {
                         showToast(error.message, 'error');
                     }
@@ -1441,7 +1639,7 @@ Line: ' + line + ', Col: ' + col + '
                 const formatTime = (timeStr) => {
                     if (!timeStr) return '';
                     try {
-                        const d = new Date(timeStr.replace(' ', 'T') + 'Z');
+                        const d = new Date(timeStr.replace(/-/g, '/'));
                         const now = new Date();
                         const diffMs = now - d;
                         const diffMin = Math.floor(diffMs / 60000);
@@ -1529,6 +1727,102 @@ Line: ' + line + ', Col: ' + col + '
                         fetchSummaryStats();
                     } catch(e) { console.error(e); }
                 };
+                
+                // 轮总配置相关
+                const fetchSummaryConfig = async () => {
+                    try {
+                        const res = await fetch('/admin/api/summary-config');
+                        const data = await res.json();
+                        summaryConfig.value = data;
+                    } catch(e) { console.error(e); }
+                };
+                const saveSummaryConfig = async () => {
+                    try {
+                        await fetch('/admin/api/summary-config', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ interval: summaryConfig.value.interval })
+                        });
+                        toast.value = { show: true, message: '配置已保存', type: 'success' };
+                        setTimeout(() => toast.value.show = false, 2000);
+                    } catch(e) { 
+                        console.error(e);
+                        toast.value = { show: true, message: '保存失败', type: 'error' };
+                        setTimeout(() => toast.value.show = false, 2000);
+                    }
+                };
+
+                // ===== 日历热力图 =====
+                const fetchCalendar = async () => {
+                    try {
+                        const res = await fetch(`/admin/api/calendar?year=${calendarYear.value}&month=${calendarMonth.value}`, { headers: { 'Authorization': 'Bearer ' + localStorage.getItem('admin_token') } });
+                        const data = await res.json();
+                        calendarData.value = data;
+                    } catch(e) { console.error('fetchCalendar:', e); }
+                };
+                const prevMonth = () => {
+                    if (calendarMonth.value === 1) { calendarMonth.value = 12; calendarYear.value--; }
+                    else { calendarMonth.value--; }
+                    fetchCalendar();
+                };
+                const nextMonth = () => {
+                    if (calendarMonth.value === 12) { calendarMonth.value = 1; calendarYear.value++; }
+                    else { calendarMonth.value++; }
+                    fetchCalendar();
+                };
+                const calendarWeeks = computed(() => {
+                    const y = calendarYear.value, m = calendarMonth.value;
+                    const firstDay = new Date(y, m - 1, 1).getDay();
+                    const daysInMonth = new Date(y, m, 0).getDate();
+                    const dayMap = {};
+                    (calendarData.value.days || []).forEach(d => {
+                        const day = parseInt(d.day.split('-')[2]);
+                        dayMap[day] = d;
+                    });
+                    const weeks = [];
+                    let week = new Array(firstDay).fill(null);
+                    for (let d = 1; d <= daysInMonth; d++) {
+                        week.push({ ...(dayMap[d] || { count: 0, user_count: 0, assistant_count: 0 }), day: d });
+                        if (week.length === 7) { weeks.push(week); week = []; }
+                    }
+                    if (week.length > 0) { while (week.length < 7) week.push(null); weeks.push(week); }
+                    return weeks;
+                });
+                const maxDayCount = computed(() => {
+                    return Math.max(1, ...((calendarData.value.days || []).map(d => d.count)));
+                });
+                const clickCalendarDay = (cell) => {
+                    if (!cell || !cell.count) return;
+                    const y = calendarYear.value, m = calendarMonth.value;
+                    const dateStr = `${y}-${String(m).padStart(2,'0')}-${String(cell.day).padStart(2,'0')}`;
+                    dateStart.value = dateStr;
+                    dateEnd.value = dateStr;
+                    selectedCalendarDate.value = dateStr;
+                    fetchConversations();
+                };
+
+                const triggerRoundSummary = async () => {
+                    loading.triggerSummary = true;
+                    try {
+                        const res = await fetch('/admin/api/trigger-round-summary', { method: 'POST' });
+                        const data = await res.json();
+                        if (data.success) {
+                            toast.value = { show: true, message: '轮总生成成功', type: 'success' };
+                            fetchSummaries();
+                            fetchSummaryStats();
+                            fetchSummaryConfig();
+                        } else {
+                            toast.value = { show: true, message: data.error || '生成失败', type: 'error' };
+                        }
+                        setTimeout(() => toast.value.show = false, 3000);
+                    } catch(e) {
+                        console.error(e);
+                        toast.value = { show: true, message: '请求失败', type: 'error' };
+                        setTimeout(() => toast.value.show = false, 2000);
+                    } finally {
+                        loading.triggerSummary = false;
+                    }
+                };
 
                 // 初始化
                 onMounted(() => {
@@ -1551,10 +1845,11 @@ Line: ' + line + ', Col: ' + col + '
                     openAssignModal, assignToWindow, unassignConversation,
                     searchQuery, searchResults, dateStart, dateEnd,
                     debounceSearch, searchMessages, highlightSearch,
-                    isSummary, getUserText, hasAttachment, getAttachmentText,
+                    calendarData, calendarYear, calendarMonth, calendarWeeks, maxDayCount, fetchCalendar, prevMonth, nextMonth, clickCalendarDay, selectedCalendarDate,
+                    isSummary, getSummaryType, getUserText, getUserImages, hasAttachment, getAttachmentText,
                     hasThinking, getThinking, getAssistantText, isEmptyOrToolCall,
-                    summaries, summaryStats, summaryFilter, summaryActiveOnly,
-                    fetchSummaries, fetchSummaryStats, deleteSummary
+                    summaries, summaryStats, summaryFilter, summaryActiveOnly, summaryConfig,
+                    fetchSummaries, fetchSummaryStats, deleteSummary, fetchSummaryConfig, saveSummaryConfig, triggerRoundSummary, groupedConversations, expandedConvs, loadingConvs, messagesMap
                 };
             }
         });

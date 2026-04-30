@@ -10,7 +10,8 @@ import re
 import asyncio
 import uvicorn
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from dotenv import load_dotenv
 
@@ -24,6 +25,9 @@ from summarizer import get_summarizer
 
 # 加载环境变量
 load_dotenv()
+
+# Admin Token
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 # 配置日志格式：[时间] [级别] [模块] 消息
 logging.basicConfig(
@@ -131,6 +135,22 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+
+# ==================== Admin 认证中间件 ====================
+class AdminAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path.startswith("/admin/api/"):
+            auth = request.headers.get("authorization", "")
+            if auth.startswith("Bearer "):
+                token = auth[7:].strip()
+            else:
+                token = request.query_params.get("token", "")
+            if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+                from starlette.responses import JSONResponse as SJR
+                return SJR(status_code=401, content={"detail": "Unauthorized"})
+        return await call_next(request)
+
+app.add_middleware(AdminAuthMiddleware)
 
 # ==================== 核心路由 ====================
 
@@ -354,14 +374,68 @@ async def chat_completions(request: Request):
     conversation_id = generate_conversation_id(raw_messages)
     
     # 异步存储，不阻塞主流程（存储失败不影响请求转发）
+    stored_count = 0
     try:
         await ensure_conversation(conversation_id, model=model)
-        await store_incoming_messages(conversation_id, raw_messages)
+        stored_count = await store_incoming_messages(conversation_id, raw_messages)
     except Exception as e:
         logger.error(f"消息存储管道异常（不影响转发）: {e}")
+    
+    # === Step 2.5: 主动轮总触发 ===
+    # 每存入N条消息（跨对话累计），后台触发一次轮总
+    if stored_count > 0:
+        try:
+            trigger_threshold = int(await get_config('summary_interval', '16'))
+            # 从数据库读取当前累计计数
+            db = await get_db()
+            try:
+                cursor = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")
+                row = await cursor.fetchone()
+                current_count = int(row['value']) if row else 0
+                new_count = current_count + stored_count
+                
+                if new_count >= trigger_threshold:
+                    # 达到阈值，后台触发轮总
+                    logger.info(f"[AUTO_SUMMARY] 累计 {new_count} 条消息，触发轮总生成")
+                    
+                    async def _bg_round_summary():
+                        try:
+                            summarizer = get_summarizer()
+                            result = await summarizer.generate_round_summary()
+                            logger.info(f"[AUTO_SUMMARY] 轮总生成完成 ({len(result) if result else 0} 字符)")
+                        except Exception as e:
+                            logger.error(f"[AUTO_SUMMARY] 轮总生成失败: {e}")
+                    
+                    asyncio.create_task(_bg_round_summary())
+                    new_count = 0  # 重置计数
+                
+                # 更新计数器
+                await db.execute(
+                    "INSERT INTO config (key, value, description) VALUES ('_msg_counter', ?, '轮总触发计数器') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(new_count),)
+                )
+                await db.commit()
+            finally:
+                await db.close()
+        except Exception as e:
+            logger.error(f"[AUTO_SUMMARY] 计数器异常（不影响转发）: {e}")
+    # === End Step 2.5 ===
     # === End Step 2 ===
 
     # 提示词�������入处�����
+        # === Bug 1 修复：清理幽灵省略号 ===
+    # 客户端在仅发送图片/空消息时可能使用 "..." 或 "…" 占位，导致 AI 误解
+    for msg in body.get('messages', []):
+        if msg.get('role') == 'user' and isinstance(msg.get('content'), str):
+            c = msg['content']
+            if c.startswith('...') or c.startswith('…'):
+                import re
+                text_only = re.sub(r'<attachment[^>]*>[\\s\\S]*?</attachment>', '', c).strip()
+                if text_only in ('...', '…', ''):
+                    c = c.replace('...', '').replace('…', '').strip()
+                    msg['content'] = c if c else ' '
+
     injection_engine = InjectionEngine()
     body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
 
@@ -390,7 +464,7 @@ async def chat_completions(request: Request):
             fallbacks = [p for p in fallbacks if p['id'] not in tried_ids]
 
             if not fallbacks and not used_cooled_down:
-                # 健康供应商全部耗尽，尝试冷却期到期的不健康供应商
+                # 健康供应商���部耗尽，尝试冷却期到期的不健康供应商
                 cooled = await provider_manager.get_cooled_down_providers(model=model, exclude_ids=tried_ids)
                 if cooled:
                     fallbacks = cooled
@@ -436,7 +510,7 @@ async def chat_completions(request: Request):
                     fallbacks = cooled
                     used_cooled_down = True
                     logger.warning(
-                        f"健康供应商已耗尽，启用 {len(cooled)} 个冷却期到期的供应商"
+                        f"健康���应商已耗尽，启用 {len(cooled)} 个冷却期到期的供应商"
                     )
 
             if fallbacks:
@@ -642,6 +716,19 @@ async def admin_list_conversations(start: str = None, end: str = None):
         rows = [dict(row) for row in await cursor.fetchall()]
         for row in rows:
             msg = row.get('first_user_message', '') or ''
+            # 处理多模态 JSON 数组
+            if msg.startswith('['):
+                try:
+                    import json
+                    arr = json.loads(msg)
+                    if isinstance(arr, list):
+                        text_parts = [item.get('text', '') for item in arr if item.get('type') == 'text']
+                        img_count = sum(1 for item in arr if item.get('type') == 'image_url')
+                        msg = '\n'.join(text_parts)
+                        if img_count > 0 and not msg.strip():
+                            msg = '[图片消息]'
+                except:
+                    pass
             # 剥离 attachment 标签
             msg = re.sub(r'<attachment[^>]*>[\s\S]*?</attachment>', '', msg).strip()
             row['preview'] = msg[:100] + ('...' if len(msg) > 100 else '')
@@ -678,6 +765,18 @@ async def admin_list_windows():
             for row in await cur2.fetchall():
                 row = dict(row)
                 preview_raw = row.get('first_real_msg') or ''
+                if preview_raw.startswith('['):
+                    try:
+                        import json
+                        arr = json.loads(preview_raw)
+                        if isinstance(arr, list):
+                            text_parts = [item.get('text', '') for item in arr if item.get('type') == 'text']
+                            img_count = sum(1 for item in arr if item.get('type') == 'image_url')
+                            preview_raw = '\n'.join(text_parts)
+                            if img_count > 0 and not preview_raw.strip():
+                                preview_raw = '[图片消息]'
+                    except:
+                        pass
                 preview_raw = re.sub(r'<attachment[^>]*>[\s\S]*?</attachment>', '', preview_raw).strip()
                 convs.append({
                     'conversation_id': row['conversation_id'],
@@ -927,6 +1026,38 @@ async def admin_delete_conversation(conversation_id: str):
         await db.close()
 
 
+# ==================== 日历热力图 API ====================
+
+@app.get("/admin/api/calendar")
+async def admin_calendar(year: int = None, month: int = None):
+    """返回每日消息计数，用于日历热力图"""
+    from datetime import datetime, timedelta
+    china_now = datetime.utcnow() + timedelta(hours=8)
+    if not year:
+        year = china_now.year
+    if not month:
+        month = china_now.month
+    start_date = f"{year}-{month:02d}-01"
+    if month == 12:
+        end_date = f"{year+1}-01-01"
+    else:
+        end_date = f"{year}-{month+1:02d}-01"
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT date(created_at) as day, count(*) as count, "
+            "SUM(CASE WHEN role='user' THEN 1 ELSE 0 END) as user_count, "
+            "SUM(CASE WHEN role='assistant' THEN 1 ELSE 0 END) as assistant_count "
+            "FROM messages WHERE created_at >= ? AND created_at < ? "
+            "GROUP BY date(created_at) ORDER BY day",
+            (start_date, end_date)
+        )
+        days = [dict(row) for row in await cursor.fetchall()]
+        return {"year": year, "month": month, "days": days}
+    finally:
+        await db.close()
+
+
 # ==================== 记忆总览 API ====================
 
 @app.get("/admin/api/summaries")
@@ -993,6 +1124,66 @@ async def delete_summary(summary_id: int):
         return {"ok": True}
     finally:
         await db.close()
+
+@app.get("/admin/api/summary-config")
+async def get_summary_config():
+    """获取轮总触发配置"""
+    db = await get_db()
+    try:
+        # 获取触发间隔
+        cursor = await db.execute("SELECT value FROM config WHERE key = 'summary_interval'")
+        row = await cursor.fetchone()
+        interval = int(row['value']) if row else 16
+        
+        # 获取当前计数
+        cursor = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")
+        row = await cursor.fetchone()
+        current_count = int(row['value']) if row else 0
+        
+        return {"interval": interval, "currentCount": current_count}
+    finally:
+        await db.close()
+
+@app.post("/admin/api/summary-config")
+async def save_summary_config(request: Request):
+    """保存轮总触发配置"""
+    data = await request.json()
+    interval = data.get('interval', 16)
+    
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO config (key, value, description) VALUES ('summary_interval', ?, '轮总触发消息数') "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(interval),)
+        )
+        await db.commit()
+        return {"ok": True}
+    finally:
+        await db.close()
+
+@app.post("/admin/api/trigger-round-summary")
+async def trigger_round_summary():
+    """手动触发轮总生成"""
+    try:
+        summarizer = get_summarizer()
+        result = await summarizer.generate_round_summary()
+        
+        # 重置计数器
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO config (key, value, description) VALUES ('_msg_counter', '0', '轮总触发计数器') "
+                "ON CONFLICT(key) DO UPDATE SET value = '0'"
+            )
+            await db.commit()
+        finally:
+            await db.close()
+        
+        return {"success": True, "length": len(result) if result else 0}
+    except Exception as e:
+        logger.error(f"手动触发轮总失败: {e}")
+        return {"success": False, "error": str(e)}
 
 # ==================== 管理面板 ====================
 

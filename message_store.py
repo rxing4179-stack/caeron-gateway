@@ -10,33 +10,100 @@ import json
 import logging
 from database import get_db
 
+import time as _time
+
 logger = logging.getLogger(__name__)
+
+
+# ==================== 会话跟踪器 ====================
+# 解决Operit滑动窗口截断导致messages[:3]变化→conversation_id碎片化的问题
+# 策略：基于消息内容重叠检测 + 30分钟超时
+
+_session_state = {
+    'conversation_id': None,
+    'last_activity': 0,
+    'known_msg_hashes': set(),  # 已知的用户消息内容哈希
+}
+
+SESSION_TIMEOUT = 30 * 60  # 30分钟无活动才视为session结束
+
+
+def _hash_content(content) -> str:
+    """对消息内容生成简短哈希"""
+    if isinstance(content, list):
+        content = json.dumps(content, ensure_ascii=False, sort_keys=True)
+    if not content:
+        content = ''
+    return hashlib.md5(content.encode('utf-8')).hexdigest()[:12]
+
+
+def _generate_fresh_id(messages: list) -> str:
+    """生成全新的conversation_id（仅在确认是新session时调用）"""
+    fingerprint_parts = []
+    for msg in messages[:3]:
+        role = msg.get('role', '')
+        content = msg.get('content', '')
+        if isinstance(content, list):
+            content = json.dumps(content, ensure_ascii=False, sort_keys=True)
+        fingerprint_parts.append(f"{role}:{content[:200]}")
+    if not fingerprint_parts:
+        fingerprint_parts.append('empty')
+    fingerprint = '|'.join(fingerprint_parts)
+    return hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:16]
 
 
 def generate_conversation_id(messages: list) -> str:
     """
-    根据消息列表生成稳定的对话ID
+    基于会话连续性检测生成稳定的对话ID
     
-    策略：取前两条消息（通常是system + 第一条user）的角色+内容做SHA256截断
-    同一个对话的开头不会变，所以ID在对话生命周期内稳定
+    策略：
+    1. 提取本次请求中所有user消息的内容哈希
+    2. 与内存中记录的"当前session已知消息"做交集
+    3. 如果有交集 → 同一个session，复用conversation_id
+    4. 如果无交集但未超时(30分钟) → 仍视为同一session（用户可能只是在思考）
+    5. 无交集且超时 → 新session，生成新conversation_id
     
-    已知局限：如果Operit截断了历史消息导致数组开头变化，ID会变
-    后续Phase可升级为基于消息内容模糊匹配的策略
+    这解决了Operit滑动窗口截断导致的碎片化问题：
+    即使窗口滑动导致messages[:3]变化，只要有任何一条user消息
+    在之前的请求中出现过，就能识别为同一个session。
     """
-    fingerprint_parts = []
-    for msg in messages[:3]:  # 取前3条消息做指纹
-        role = msg.get('role', '')
-        content = msg.get('content', '')
-        if isinstance(content, list):  # 多模态消息（图片等）
-            content = json.dumps(content, ensure_ascii=False, sort_keys=True)
-        fingerprint_parts.append(f"{role}:{content[:200]}")
+    global _session_state
     
-    if not fingerprint_parts:
-        # fallback：不应该走到这里，但防御性编程
-        fingerprint_parts.append('empty')
+    now = _time.time()
     
-    fingerprint = '|'.join(fingerprint_parts)
-    return hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:16]
+    # 提取本次请求中所有user消息的哈希
+    incoming_hashes = set()
+    for msg in messages:
+        if msg.get('role') == 'user':
+            incoming_hashes.add(_hash_content(msg.get('content', '')))
+    
+    # 检测与已知消息的重叠
+    has_overlap = bool(incoming_hashes & _session_state['known_msg_hashes'])
+    is_timed_out = (now - _session_state['last_activity']) > SESSION_TIMEOUT
+    
+    if _session_state['conversation_id'] and (has_overlap or not is_timed_out):
+        # 继续当前session
+        _session_state['last_activity'] = now
+        _session_state['known_msg_hashes'].update(incoming_hashes)
+        # 防止集合无限增长（保留最近500个哈希）
+        if len(_session_state['known_msg_hashes']) > 500:
+            _session_state['known_msg_hashes'] = incoming_hashes
+        logger.debug(f"[SESSION] 复用session {_session_state['conversation_id'][:8]}... "
+                     f"(overlap={has_overlap}, timeout={is_timed_out}, known={len(_session_state['known_msg_hashes'])})")
+        return _session_state['conversation_id']
+    
+    # 新session
+    new_id = _generate_fresh_id(messages)
+    logger.info(f"[SESSION] 新session {new_id[:8]}... "
+                f"(overlap={has_overlap}, timed_out={is_timed_out}, "
+                f"gap={now - _session_state['last_activity']:.0f}s)")
+    
+    _session_state = {
+        'conversation_id': new_id,
+        'last_activity': now,
+        'known_msg_hashes': incoming_hashes,
+    }
+    return new_id
 
 
 async def _get_default_window_id():
@@ -96,15 +163,15 @@ async def ensure_conversation(conversation_id: str, model: str = None, provider_
 
 async def store_incoming_messages(conversation_id: str, messages: list):
     """
-    增量存储入站消息
+    增量存储入站消息（兼容Operit滑动窗口）
     
-    逻辑：
-    1. 过滤出对话消息（user + assistant），跳过system（那是提示词不是对话）
-    2. 对比数据库中已有消息数量
-    3. 只存增量部分（新消息 = 数组尾部多出来的）
+    策略：
+    1. 取数据库中该对话最后一条消息的内容哈希
+    2. 在入站消息数组中找到这条消息的位置
+    3. 存储该位置之后的所有新消息
     
-    这依赖一个假设：Operit每次请求发来的messages数组是追加式增长的
-    即 [旧消息..., 新user消息]，旧消息部分不变
+    这比旧的"按计数"方案更健壮：即使Operit截断了开头的旧消息，
+    只要最后一条已存消息还在上下文里，就能正确找到增量边界。
     """
     chat_messages = [m for m in messages if m.get('role') in ('user', 'assistant')]
     
@@ -113,16 +180,73 @@ async def store_incoming_messages(conversation_id: str, messages: list):
     
     db = await get_db()
     try:
-        # 查已存消息数量
+        # 取数据库中最后一条消息的内容哈希和index
         cursor = await db.execute(
-            'SELECT COUNT(*) FROM messages WHERE conversation_id = ?',
+            '''SELECT content, message_index FROM messages 
+               WHERE conversation_id = ? 
+               ORDER BY message_index DESC LIMIT 1''',
             (conversation_id,)
         )
-        row = await cursor.fetchone()
-        existing_count = row[0] if row else 0
+        last_stored = await cursor.fetchone()
         
-        # 增量计算：只存数组中超出已有数量的部分
-        new_messages = chat_messages[existing_count:]
+        if not last_stored:
+            # 全新对话，全部存入
+            new_messages = chat_messages
+            start_index = 0
+        else:
+            last_index = last_stored['message_index']
+            
+            # 取最近几条已存的USER消息作为锚点候选
+            # （不用assistant消息，因为Operit会修改assistant内容：去掉thinking标签等）
+            cursor2 = await db.execute(
+                '''SELECT content, message_index FROM messages 
+                   WHERE conversation_id = ? AND role = 'user'
+                   ORDER BY message_index DESC LIMIT 5''',
+                (conversation_id,)
+            )
+            anchor_candidates = await cursor2.fetchall()
+            
+            # 预计算入站user消息的哈希 → 位置映射
+            incoming_user_hashes = {}
+            for i, msg in enumerate(chat_messages):
+                if msg.get('role') == 'user':
+                    c = msg.get('content', '')
+                    if isinstance(c, list):
+                        c = json.dumps(c, ensure_ascii=False)
+                    h = hashlib.md5(c.encode('utf-8')).hexdigest()[:16]
+                    incoming_user_hashes[h] = i  # 同哈希保留最后出现的位置
+            
+            # 从最新的锚点开始尝试匹配
+            match_pos = -1
+            matched_db_index = -1
+            for anchor in anchor_candidates:
+                anchor_content = anchor['content'] or ''
+                anchor_hash = hashlib.md5(anchor_content.encode('utf-8')).hexdigest()[:16]
+                if anchor_hash in incoming_user_hashes:
+                    match_pos = incoming_user_hashes[anchor_hash]
+                    matched_db_index = anchor['message_index']
+                    break
+            
+            if match_pos >= 0:
+                # 找到锚点：存储锚点之后的所有消息（跳过锚点本身和它之前已存的）
+                new_messages = chat_messages[match_pos + 1:]
+                # 新消息的起始index = 锚点的db_index + 1 + 锚点后已存的assistant消息数
+                # 简化：直接从last_index+1开始，确保不重叠
+                start_index = last_index + 1
+                logger.info(f"[STORE] 锚点匹配成功 pos={match_pos}, db_idx={matched_db_index}, "
+                           f"新增{len(new_messages)}条 (对话: {conversation_id[:8]}...)")
+            else:
+                # 没找到匹配 — 所有锚点都被Operit滑掉了
+                # 存储最后一条user消息（确保不丢失）
+                last_user = None
+                for msg in reversed(chat_messages):
+                    if msg.get('role') == 'user':
+                        last_user = msg
+                        break
+                new_messages = [last_user] if last_user else chat_messages[-1:]
+                start_index = last_index + 1
+                logger.warning(f"[STORE] 未找到锚点，存储最新user消息 (对话: {conversation_id[:8]}...)")
+        
         if not new_messages:
             return 0
         
@@ -135,14 +259,14 @@ async def store_incoming_messages(conversation_id: str, messages: list):
             await db.execute(
                 '''INSERT INTO messages (conversation_id, role, content, message_index)
                    VALUES (?, ?, ?, ?)''',
-                (conversation_id, msg['role'], content, existing_count + i)
+                (conversation_id, msg['role'], content, start_index + i)
             )
             stored += 1
         
         # 更新对话元信息
         await db.execute(
             '''UPDATE conversations 
-               SET last_message_at = datetime('now'), 
+               SET last_message_at = datetime('now', '+8 hours'), 
                    message_count = message_count + ?
                WHERE conversation_id = ?''',
             (stored, conversation_id)
@@ -165,36 +289,49 @@ async def store_assistant_response(conversation_id: str, content: str):
     由proxy层在收到完整回复后调用：
     - 非流式：直接从JSON响应中提取
     - 流式：从收集的delta chunks拼接后调用
+    
+    重roll处理：如果最后一条消息是assistant，覆盖而不是新增
     """
     if not content or not content.strip():
         return
     
     db = await get_db()
     try:
-        # 获取当前最大index
+        # 检查最后一条消息是否是assistant（重roll场景）
         cursor = await db.execute(
-            'SELECT MAX(message_index) FROM messages WHERE conversation_id = ?',
+            '''SELECT id, role, message_index FROM messages 
+               WHERE conversation_id = ? 
+               ORDER BY message_index DESC LIMIT 1''',
             (conversation_id,)
         )
-        row = await cursor.fetchone()
-        next_index = (row[0] + 1) if row and row[0] is not None else 0
+        last_msg = await cursor.fetchone()
         
-        await db.execute(
-            '''INSERT INTO messages (conversation_id, role, content, message_index)
-               VALUES (?, ?, ?, ?)''',
-            (conversation_id, 'assistant', content, next_index)
-        )
-        
-        await db.execute(
-            '''UPDATE conversations 
-               SET last_message_at = datetime('now'),
-                   message_count = message_count + 1
-               WHERE conversation_id = ?''',
-            (conversation_id,)
-        )
+        if last_msg and last_msg['role'] == 'assistant':
+            # 重roll：覆盖最后一条assistant消息
+            await db.execute(
+                '''UPDATE messages SET content = ?, created_at = datetime('now', '+8 hours')
+                   WHERE id = ?''',
+                (content, last_msg['id'])
+            )
+            logger.info(f"覆盖AI回复(重roll) (对话: {conversation_id[:8]}..., {len(content)} 字符)")
+        else:
+            # 正常新增
+            next_index = (last_msg['message_index'] + 1) if last_msg else 0
+            await db.execute(
+                '''INSERT INTO messages (conversation_id, role, content, message_index)
+                   VALUES (?, ?, ?, ?)''',
+                (conversation_id, 'assistant', content, next_index)
+            )
+            await db.execute(
+                '''UPDATE conversations 
+                   SET last_message_at = datetime('now', '+8 hours'),
+                       message_count = message_count + 1
+                   WHERE conversation_id = ?''',
+                (conversation_id,)
+            )
+            logger.info(f"存储AI回复 (对话: {conversation_id[:8]}..., {len(content)} 字符)")
         
         await db.commit()
-        logger.info(f"存储AI回复 (对话: {conversation_id[:8]}..., {len(content)} 字符)")
     except Exception as e:
         logger.error(f"存储AI回复失败: {e}")
     finally:

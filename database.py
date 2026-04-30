@@ -42,7 +42,7 @@ async def init_db():
                 last_used_at TEXT,
                 unhealthy_since TEXT,
                 fail_count INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now'))
+                created_at TEXT DEFAULT (datetime('now', '+8 hours'))
             )
         ''')
 
@@ -59,7 +59,7 @@ async def init_db():
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 description TEXT,
-                updated_at TEXT DEFAULT (datetime('now'))
+                updated_at TEXT DEFAULT (datetime('now', '+8 hours'))
             )
         ''')
 
@@ -75,8 +75,8 @@ async def init_db():
                 depth INTEGER DEFAULT 0,
                 match_condition TEXT DEFAULT '{}',
                 is_enabled INTEGER DEFAULT 1,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
+                created_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                updated_at TEXT DEFAULT (datetime('now', '+8 hours'))
             )
         ''')
 
@@ -87,11 +87,11 @@ async def init_db():
                 conversation_id TEXT UNIQUE NOT NULL,
                 provider_id INTEGER,
                 model TEXT,
-                started_at TEXT DEFAULT (datetime('now')),
+                started_at TEXT DEFAULT (datetime('now', '+8 hours')),
                 last_message_at TEXT,
                 message_count INTEGER DEFAULT 0,
                 is_active INTEGER DEFAULT 1,
-                created_at TEXT DEFAULT (datetime('now'))
+                created_at TEXT DEFAULT (datetime('now', '+8 hours'))
             )
         ''')
 
@@ -104,7 +104,7 @@ async def init_db():
                 content TEXT NOT NULL,
                 message_index INTEGER,
                 token_count INTEGER,
-                created_at TEXT DEFAULT (datetime('now')),
+                created_at TEXT DEFAULT (datetime('now', '+8 hours')),
                 FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
             )
         ''')
@@ -124,7 +124,7 @@ async def init_db():
                 parent_summary_id INTEGER,
                 is_active INTEGER DEFAULT 1,
                 token_count INTEGER,
-                created_at TEXT DEFAULT (datetime('now')),
+                created_at TEXT DEFAULT (datetime('now', '+8 hours')),
                 FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
                 FOREIGN KEY (parent_summary_id) REFERENCES summaries(id)
             )
@@ -152,8 +152,8 @@ async def init_db():
                 source_message_id INTEGER,
                 source_summary_id INTEGER,
                 last_accessed_at TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now')),
+                created_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                updated_at TEXT DEFAULT (datetime('now', '+8 hours')),
                 FOREIGN KEY (source_message_id) REFERENCES messages(id),
                 FOREIGN KEY (source_summary_id) REFERENCES summaries(id)
             )
@@ -166,8 +166,8 @@ async def init_db():
                 name TEXT NOT NULL,
                 description TEXT DEFAULT '',
                 color TEXT DEFAULT '#4a90d9',
-                created_at TEXT DEFAULT (datetime('now')),
-                updated_at TEXT DEFAULT (datetime('now'))
+                created_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                updated_at TEXT DEFAULT (datetime('now', '+8 hours'))
             )
         ''')
 
