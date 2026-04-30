@@ -1,3 +1,6 @@
+from datetime import datetime, timedelta
+from utils import now_cst, today_cst_str
+import calendar
 """
 Caeron Gateway - FastAPI 应用入口
 核心路由定义：健康检查、模型列表、chat completions 转发、供应商管理 API
@@ -45,23 +48,21 @@ async def _summary_cron_loop():
     """后台定时任务：每天UTC 15:59（北京时间23:59）触发日总，周日额外触发周总，月末额外触发月总"""
     from summarizer import run_daily_cron, run_weekly_cron, run_monthly_cron
     from datetime import datetime
-from utils import now_cst, today_cst_str as _dt, timedelta as _td
-    import calendar
     
     while True:
         try:
             # 计算距离下一个UTC 15:59的秒数
-            now = _dt.utcnow()
+            now = now_cst()
             target = now.replace(hour=23, minute=59, second=0, microsecond=0)
             if now >= target:
-                target += _td(days=1)
+                target += timedelta(days=1)
             wait_seconds = (target - now).total_seconds()
             
             logger.info(f"[CRON] 下次总结触发: {target.isoformat()}Z (等待 {wait_seconds:.0f}s)")
             await asyncio.sleep(wait_seconds)
             
             # 到点了，执行日总
-            trigger_time = _dt.utcnow()
+            trigger_time = now_cst()
             logger.info(f"[CRON] 定时触发: {trigger_time.isoformat()}Z")
             
             await run_daily_cron()
@@ -73,7 +74,7 @@ from utils import now_cst, today_cst_str as _dt, timedelta as _td
                 await run_weekly_cron()
             
             # 判断是否月末
-            beijing_date = (trigger_time + _td(hours=8)).date()
+            beijing_date = (trigger_time + timedelta(hours=8)).date()
             _, last_day = calendar.monthrange(beijing_date.year, beijing_date.month)
             if beijing_date.day == last_day:
                 logger.info("[CRON] 今天是月末，触发月总")
@@ -1033,7 +1034,6 @@ async def admin_delete_conversation(conversation_id: str):
 async def admin_calendar(year: int = None, month: int = None):
     """返回每日消息计数，用于日历热力图"""
     from datetime import datetime
-from utils import now_cst, today_cst_str, timedelta
     china_now = now_cst()
     if not year:
         year = china_now.year
@@ -1103,12 +1103,11 @@ async def get_summary_stats():
         total = total_row[0][0] if total_row else 0
         # 下次cron时间（计算到下一个UTC 15:59）
         from datetime import datetime
-from utils import now_cst, today_cst_str as _dt_s, timedelta as _td_s
-        _now = _dt_s.utcnow()
+        _now = now_cst()
         _target = _now.replace(hour=23, minute=59, second=0, microsecond=0)
         if _now >= _target:
-            _target += _td_s(days=1)
-        _beijing = _target + _td_s(hours=8)
+            _target += timedelta(days=1)
+        _beijing = _target + timedelta(hours=8)
         next_cron = _beijing.strftime('%Y-%m-%d %H:%M CST')
         _wait = int((_target - _now).total_seconds())
         _hours = _wait // 3600
