@@ -150,44 +150,48 @@ class InjectionEngine:
 
     async def _inject_round_summaries(self, messages: list[dict], request_info: dict):
         """多级记忆注入：月总+周总+日总+轮总，按活跃状态自动切换，并裁剪已被总结覆盖的原始消息"""
+        # 1. 检查是否已经注入过总结，防止重复
+        for m in messages:
+            if m.get('role') == 'system' and '<context_summaries>' in m.get('content', ''):
+                logger.warning("[记忆注入] 检测到已存在注入的总结，跳过本次注入以防重复")
+                return
+
         db = await get_db()
         try:
             parts = []
-            has_round_summaries = False
+            tag_counts = {}
+            has_any_summaries = False
+            today = today_cst_str()
 
-            # 月总：所有活跃的（长期记忆）
+            # 2. 月总：只取最新 2 条
             cursor = await db.execute(
-                "SELECT content, created_at FROM summaries WHERE tag = 'monthly' AND is_active = 1 ORDER BY created_at ASC"
+                "SELECT content, created_at FROM summaries WHERE tag = 'monthly' AND is_active = 1 ORDER BY created_at DESC LIMIT 2"
+            )
+            rows = list(reversed(await cursor.fetchall()))
+            tag_counts['monthly'] = len(rows)
+            if rows:
+                has_any_summaries = True
+            for r in rows:
+                r = dict(r)
+                parts.append(f"- [月总] [{r['created_at']}] {r['content']}")
+
+            # 3. 周总：只取最新 1 条
+            cursor = await db.execute(
+                "SELECT content, created_at FROM summaries WHERE tag = 'weekly' AND is_active = 1 ORDER BY created_at DESC LIMIT 1"
             )
             rows = await cursor.fetchall()
+            tag_counts['weekly'] = len(rows)
+            latest_weekly_time = None
             if rows:
-                for r in rows:
-                    r = dict(r)
-                    parts.append(f"- [月总] [{r['created_at']}] {r['content']}")
-
-            # 周总
-            cursor = await db.execute(
-                "SELECT content, created_at FROM summaries WHERE tag = 'weekly' AND is_active = 1 ORDER BY created_at ASC"
-            )
-            rows = await cursor.fetchall()
-            if rows:
+                has_any_summaries = True
+                latest_weekly_time = dict(rows[0])['created_at']
                 for r in rows:
                     r = dict(r)
                     parts.append(f"- [周总] [{r['created_at']}] {r['content']}")
 
-            # 日总：注入所有比最近周总更新的日总（填补周总到今天的gap）
-            # 如果没有周总，fallback到最近3天
-            MAX_DAILY_INJECT = 7  # 一周最多7天
-            latest_weekly_time = None
-            cursor = await db.execute(
-                "SELECT created_at FROM summaries WHERE tag = 'weekly' AND is_active = 1 ORDER BY created_at DESC LIMIT 1"
-            )
-            weekly_row = await cursor.fetchone()
-            if weekly_row:
-                latest_weekly_time = dict(weekly_row)['created_at']
-
+            # 4. 日总：取最新周总之后的日总，上限 7 条；无周总取最近 3 天
+            MAX_DAILY_INJECT = 7
             if latest_weekly_time:
-                # 注入周总之后产生的所有日总
                 cursor = await db.execute(
                     """SELECT content, created_at FROM summaries
                        WHERE tag = 'daily' AND is_active = 1
@@ -197,7 +201,6 @@ class InjectionEngine:
                     (latest_weekly_time, MAX_DAILY_INJECT)
                 )
             else:
-                # 无周总，fallback最近3天
                 cursor = await db.execute(
                     """SELECT content, created_at FROM summaries
                        WHERE tag = 'daily' AND is_active = 1
@@ -205,54 +208,59 @@ class InjectionEngine:
                        LIMIT 3"""
                 )
             rows = await cursor.fetchall()
-            # 如果是DESC查询（fallback），需要反转为时间正序
             if not latest_weekly_time:
                 rows = list(reversed(rows))
+            tag_counts['daily'] = len(rows)
             if rows:
-                for r in rows:
-                    r = dict(r)
-                    parts.append(f"- [日总] [{r['created_at']}] {r['content']}")
+                has_any_summaries = True
+            for r in rows:
+                r = dict(r)
+                parts.append(f"- [日总] [{r['created_at']}] {r['content']}")
 
-            # 轮总总：当天所有活跃的（被压缩的旧轮总的摘要）
-            today = today_cst_str()
+            # 5. 轮总总：查当天 + 昨天的（防止跨零点遗漏）
+            from datetime import timedelta as td
+            yesterday = (now_cst() - td(days=1)).strftime('%Y-%m-%d')
             cursor = await db.execute(
                 """SELECT content, created_at FROM summaries
                    WHERE tag = 'round_rollup' AND is_active = 1
-                   AND date(created_at) = ?
-                   ORDER BY created_at ASC""",
-                (today,)
+                   AND date(created_at) IN (?, ?)
+                   ORDER BY created_at DESC LIMIT 8""",
+                (today, yesterday)
             )
-            rollup_rows = await cursor.fetchall()
+            rollup_rows = list(reversed(await cursor.fetchall()))
+            tag_counts['round_rollup'] = len(rollup_rows)
             if rollup_rows:
-                has_round_summaries = True
+                has_any_summaries = True
                 for idx, r in enumerate(rollup_rows, 1):
                     r = dict(r)
                     parts.append(f"- [轮总总 #{idx}/{len(rollup_rows)}] [{r['created_at']}] {r['content']}")
             
-            # 轮总：当天活跃的，最多注入最近8条（防止上下文膨胀）
+            # 6. 轮总：查当天 + 昨天的（防止跨零点遗漏），最多 8 条
             MAX_ROUND_INJECT = 8
             cursor = await db.execute(
                 """SELECT content, created_at FROM summaries
                    WHERE tag = 'round' AND is_active = 1
-                   AND date(created_at) = ?
+                   AND date(created_at) IN (?, ?)
                    ORDER BY created_at DESC
                    LIMIT ?""",
-                (today, MAX_ROUND_INJECT)
+                (today, yesterday, MAX_ROUND_INJECT)
             )
-            rows = list(reversed(await cursor.fetchall()))  # 恢复时间正序
+            rows = list(reversed(await cursor.fetchall()))
+            tag_counts['round'] = len(rows)
             if rows:
-                has_round_summaries = True
+                has_any_summaries = True
                 total = len(rows)
                 for idx, r in enumerate(rows, 1):
                     r = dict(r)
                     parts.append(f"- [轮总 #{idx}/{total}] [{r['created_at']}] {r['content']}")
 
-            # 读取当前消息计数器（未被总结的新消息条数）
+            # 读取当前消息计数器
             unsummarized_count = 0
-            if has_round_summaries:
-                cursor = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")
-                row = await cursor.fetchone()
-                unsummarized_count = int(row['value']) if row else 0
+            cursor = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")
+            row = await cursor.fetchone()
+            unsummarized_count = int(row['value']) if row else 0
+
+            logger.info(f"[记忆注入] 注入汇总统计: {tag_counts}, 待总结消息数: {unsummarized_count}")
 
         finally:
             await db.close()
@@ -262,7 +270,8 @@ class InjectionEngine:
             return
 
         # === 裁剪已被总结覆盖的原始消息 ===
-        if has_round_summaries:
+        # 关键修复：只要有任何活跃总结，就执行裁剪（不再依赖 has_round_summaries）
+        if has_any_summaries:
             # 分离system消息和对话消息
             system_indices = []
             dialog_indices = []
@@ -274,9 +283,11 @@ class InjectionEngine:
             
             # 保留最后 unsummarized_count + buffer 条对话消息
             buffer = 8
-            keep_count = unsummarized_count + buffer
+            keep_count = max(unsummarized_count + buffer, 10)  # 至少保留10条对话
             
-            if len(dialog_indices) > keep_count and keep_count > 0:
+            logger.info(f"[记忆裁剪-入口] 当前对话总数:{len(dialog_indices)}, 待总结数:{unsummarized_count}, 保留阈值:{keep_count}")
+            
+            if len(dialog_indices) > keep_count:
                 trimmed_count = len(dialog_indices) - keep_count
                 keep_indices = set(system_indices + dialog_indices[-keep_count:])
                 
@@ -284,9 +295,9 @@ class InjectionEngine:
                 messages.clear()
                 messages.extend(new_messages)
                 
-                logger.info(f"[记忆裁剪] 裁掉 {trimmed_count} 条已总结旧消息，保留 {len(dialog_indices[-keep_count:])} 条对话 + {len(system_indices)} 条system (计数器={unsummarized_count}, buffer={buffer})")
+                logger.info(f"[记忆裁剪-出口] 裁掉 {trimmed_count} 条已总结旧消息，保留 {len(dialog_indices[-keep_count:])} 条对话 + {len(system_indices)} 条system")
             else:
-                logger.info(f"[记忆裁剪] 对话 {len(dialog_indices)} 条 <= 保留阈值 {keep_count}，不裁剪")
+                logger.info(f"[记忆裁剪-出口] 对话 {len(dialog_indices)} 条 <= 保留阈值 {keep_count}，不裁剪")
 
         # 组装总结文本
         summary_lines = ["<context_summaries>"]

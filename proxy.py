@@ -62,6 +62,22 @@ async def proxy_chat_completion(request_body: dict, provider: dict, conversation
 
     logger.info(f"转发请求到 {provider['name']}: {upstream_url} (stream={is_stream})")
 
+    # [DEBUG-TOKEN] 转发调试日志
+    body_str = json.dumps(request_body)
+    logger.info(f"[DEBUG-TOKEN] 转发请求体总字符数: {len(body_str)}")
+    msgs = request_body.get('messages', [])
+    logger.info(f"[DEBUG-TOKEN] messages条数: {len(msgs)}")
+    role_totals = {}
+    for i, msg in enumerate(msgs):
+        content = msg.get('content', '')
+        content_str = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+        clen = len(content_str)
+        role = msg.get('role', '?')
+        role_totals[role] = role_totals.get(role, 0) + clen
+        preview = content_str[:80]
+        logger.info(f"[DEBUG-TOKEN] msg[{i}] role={role} chars={clen} content={preview}")
+    logger.info(f"[DEBUG-TOKEN] 各角色字符数合计: {role_totals}")
+
     if is_stream:
         return await _proxy_stream(upstream_url, headers, request_body, timeout, provider, conversation_id)
     else:

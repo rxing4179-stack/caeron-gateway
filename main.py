@@ -296,6 +296,18 @@ async def chat_completions(request: Request):
                 try:
                     new_summary = await summarizer.generate_global_summary()
                     logger.info(f"[SUMMARY_INTERCEPT] 后台总结更新完成 ({len(new_summary)} 字符)")
+                    
+                    from database import get_db as _get_db
+                    db = await _get_db()
+                    try:
+                        await db.execute(
+                            "INSERT INTO config (key, value, description) VALUES ('_msg_counter', '0', '轮总触发计数器') "
+                            "ON CONFLICT(key) DO UPDATE SET value = '0'"
+                        )
+                        await db.commit()
+                        logger.info("[SUMMARY_INTERCEPT] 已重置 _msg_counter 为 0，确保后续请求能正确裁剪历史消息")
+                    finally:
+                        await db.close()
                 except Exception as e:
                     logger.error(f"[SUMMARY_INTERCEPT] 后台总结更新失败: {e}")
             
@@ -306,6 +318,18 @@ async def chat_completions(request: Request):
             try:
                 global_summary = await summarizer.generate_global_summary()
                 logger.info(f"[SUMMARY_INTERCEPT] 首次总结生成完成 ({len(global_summary)} 字符)")
+                
+                from database import get_db as _get_db
+                db = await _get_db()
+                try:
+                    await db.execute(
+                        "INSERT INTO config (key, value, description) VALUES ('_msg_counter', '0', '轮总触发计数器') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '0'"
+                    )
+                    await db.commit()
+                    logger.info("[SUMMARY_INTERCEPT] 已重置 _msg_counter 为 0")
+                finally:
+                    await db.close()
             except Exception as e:
                 logger.error(f"[SUMMARY_INTERCEPT] 总结引擎异常: {e}，fallback到空摘要")
                 global_summary = summarizer._empty_summary()
@@ -400,6 +424,12 @@ async def chat_completions(request: Request):
                     # 达到阈值，后台触发轮总
                     logger.info(f"[AUTO_SUMMARY] 累计 {new_count} 条消息，触发轮总生成")
                     
+                    # --- Bug 修复：防止异步并发导致的重复生成 ---
+                    # 先将计数器扣除阈值（原子化概念），而不是简单置0，这样能承接并发请求的消息
+                    new_count = max(0, new_count - trigger_threshold)
+                    
+                    logger.info(f"[AUTO_SUMMARY] 准备触发轮总。当前触发阈值:{trigger_threshold}, 剩余未总结数:{new_count}")
+
                     async def _bg_round_summary():
                         try:
                             summarizer = get_summarizer()
@@ -409,7 +439,6 @@ async def chat_completions(request: Request):
                             logger.error(f"[AUTO_SUMMARY] 轮总生成失败: {e}")
                     
                     asyncio.create_task(_bg_round_summary())
-                    new_count = 0  # 重置计数
                 
                 # 更新计数器
                 await db.execute(
@@ -423,10 +452,73 @@ async def chat_completions(request: Request):
         except Exception as e:
             logger.error(f"[AUTO_SUMMARY] 计数器异常（不影响转发）: {e}")
     # === End Step 2.5 ===
-    # === End Step 2 ===
+    # === Step 3: 预处理 — 清理上下文膨胀源 ===
+    # Operit会保留上一轮网关注入的内容，如果不清理，每轮都会翻倍。
+    # 需要清理三类残留：
+    #   A. user_wrapped_system 消息 (role=user, <system>...</system>)
+    #   B. context_summaries 系统消息 (role=system, <context_summaries>)  
+    #   C. Operit手动总结产生的巨型user消息 (role=user, 以摘要格式开头, >5000字符)
+    raw_msgs = body.get('messages', [])
+    pre_dedup_count = len(raw_msgs)
+    def _msg_chars(m):
+        c = m.get('content', '')
+        return len(c) if isinstance(c, str) else len(json.dumps(c, ensure_ascii=False))
+    pre_dedup_chars = sum(_msg_chars(m) for m in raw_msgs)
+    
+    cleaned_msgs = []
+    strip_a = 0  # user_wrapped_system
+    strip_b = 0  # context_summaries
+    strip_c = 0  # Operit手动总结巨块
+    
+    # Operit手动总结的特征：role=user, 内容以轮总格式开头（如"【日常】""【技术】"等），
+    # 且长度超过阈值（正常用户消息不会这么长）
+    SUMMARY_BLOB_THRESHOLD = 5000  # 超过5000字符的"摘要式"user消息视为总结残留
+    SUMMARY_BLOB_PATTERNS = ['【日常】', '【技术】', '【学习】', '==========对话摘要==========', 
+                              'Conversation Summary', '对话摘要', '<context_summaries>']
+    
+    for msg in raw_msgs:
+        role = msg.get('role', '')
+        content = msg.get('content', '')
+        if not isinstance(content, str):
+            cleaned_msgs.append(msg)
+            continue
+        
+        stripped = content.strip()
+        
+        # A: 网关注入的 user_wrapped_system
+        if role == 'user' and stripped.startswith('<system>') and stripped.endswith('</system>'):
+            strip_a += 1
+            continue
+        
+        # B: 网关注入的 context_summaries
+        if role == 'system' and '<context_summaries>' in stripped:
+            strip_b += 1
+            continue
+        
+        # C: Operit手动总结产生的总结块消息 (可能是user或assistant)
+        if role in ('user', 'assistant') and len(content) > 100:
+            first_100 = content[:100]
+            if any(pat in first_100 for pat in SUMMARY_BLOB_PATTERNS):
+                strip_c += 1
+                logger.info(f"[DEDUP] 检测到Operit总结残留 (role={role}): {len(content)} 字符, 前50字={content[:50]}")
+                continue
+        
+        cleaned_msgs.append(msg)
+    
+    total_stripped = strip_a + strip_b + strip_c
+    if total_stripped > 0:
+        body['messages'] = cleaned_msgs
+        logger.info(f"[DEDUP] 清理 {total_stripped} 条残留 "
+                    f"(A.规则={strip_a}, B.记忆摘要={strip_b}, C.Operit总结={strip_c}, "
+                    f"消息: {pre_dedup_count} → {len(cleaned_msgs)}, "
+                    f"字符: {pre_dedup_chars} → {sum(_msg_chars(m) for m in cleaned_msgs)})")
+    
+    # 日志：注入前的原始大小
+    post_dedup_chars = sum(_msg_chars(m) for m in body.get('messages', []))
+    logger.info(f"[SIZE] 注入前: {len(body.get('messages', []))} 条消息, {post_dedup_chars} 字符 "
+                f"(去重前 {pre_dedup_count} 条, {pre_dedup_chars} 字符)")
 
-    # 提示词�������入处�����
-        # === Bug 1 修复：清理幽灵省略号 ===
+    # === Bug 1 修复：清理幽灵省略号 ===
     # 客户端在仅发送图片/空消息时可能使用 "..." 或 "…" 占位，导致 AI 误解
     for msg in body.get('messages', []):
         if msg.get('role') == 'user' and isinstance(msg.get('content'), str):
@@ -440,6 +532,11 @@ async def chat_completions(request: Request):
 
     injection_engine = InjectionEngine()
     body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
+
+    # 打印最终发送给 API 的 context
+    final_msg_count = len(body['messages'])
+    final_msg_chars = sum(_msg_chars(m) for m in body['messages'])
+    logger.info(f"[API_REQUEST] 最终发送至上游 API: 包含 {final_msg_count} 条消息, 约 {final_msg_chars} 字符")
 
     # 获取主供应商
     try:
@@ -630,7 +727,10 @@ async def admin_add_rule(request: Request):
 
 @app.put("/admin/api/rules/{rule_id}")
 async def admin_update_rule(rule_id: int, request: Request):
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"JSON解析失败: {str(e)}")
     db = await get_db()
     try:
         fields, values = [], []
@@ -640,9 +740,12 @@ async def admin_update_rule(rule_id: int, request: Request):
                 values.append(data[k])
         if fields:
             values.append(rule_id)
-            await db.execute(f"UPDATE injection_rules SET {', '.join(fields)}, updated_at = datetime('now', '+8 hours')) WHERE id = ?", values)
+            await db.execute(f"UPDATE injection_rules SET {', '.join(fields)}, updated_at = datetime('now', '+8 hours') WHERE id = ?", values)
             await db.commit()
         return {"message": "规则更新成功"}
+    except Exception as e:
+        logger.error(f"规则更新失败 (rule_id={rule_id}): {e}")
+        raise HTTPException(status_code=500, detail=f"规则更新失败: {str(e)}")
     finally:
         await db.close()
 
