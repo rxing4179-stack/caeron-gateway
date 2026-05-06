@@ -496,7 +496,12 @@ async def chat_completions(request: Request):
             continue
         
         # C: Operit手动总结产生的总结块消息 (可能是user或assistant)
-        if role in ('user', 'assistant') and len(content) > 100:
+        # 如果是 assistant 角色，只要大于 100 字符且符合特征就剔除（因为一定没有用户输入）
+        # 如果是 user 角色，必须大于 5000 字符（巨块）才整体剔除，防止误吞"附带摘要的正常用户输入"
+        is_assistant_summary = (role == 'assistant' and len(content) > 100)
+        is_user_summary_blob = (role == 'user' and len(content) > SUMMARY_BLOB_THRESHOLD)
+        
+        if is_assistant_summary or is_user_summary_blob:
             first_100 = content[:100]
             if any(pat in first_100 for pat in SUMMARY_BLOB_PATTERNS):
                 strip_c += 1
