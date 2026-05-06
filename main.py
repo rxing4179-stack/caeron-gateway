@@ -460,21 +460,39 @@ async def chat_completions(request: Request):
         db = await get_db()
         try:
             status_updates = []
+            
+            # 从DB加载所有的状态项和别名
+            cursor = await db.execute("SELECT content, aliases FROM memories WHERE category = 'status'")
+            status_items = await cursor.fetchall()
+            
             for msg in body.get('messages', []):
                 if msg.get('role') == 'user':
                     txt = msg.get('content', '')
                     if not isinstance(txt, str):
                         continue
-                    if re.search(r'吃了?(氟伏沙明|劳拉西泮|劳拉|丁螺环酮|丁螺|普瑞巴林|思诺思|阿布西替尼)', txt):
-                        m = re.search(r'(氟伏沙明|劳拉西泮|劳拉|丁螺环酮|丁螺|普瑞巴林|思诺思|阿布西替尼)', txt)
-                        key = m.group(1)
-                        if key == '劳拉': key = '劳拉西泮'
-                        if key == '丁螺': key = '丁螺环酮'
-                        status_updates.append(key)
-                    if re.search(r'吸了?信必可', txt):
-                        status_updates.append('信必可')
-                    if re.search(r'洗了?澡|洗完澡', txt):
-                        status_updates.append('洗澡')
+                    
+                    # 语义检查
+                    has_intention = bool(re.search(r'(要|想|打算|准备|明天|待会|等下)', txt))
+                    has_completion = bool(re.search(r'(了|完|过|好了|吃过|洗完|吸了)', txt))
+                    
+                    for row in status_items:
+                        key = row['content']
+                        aliases_str = row['aliases'] or ''
+                        
+                        patterns = [re.escape(key)]
+                        for a in aliases_str.split('|'):
+                            if a.strip():
+                                patterns.append(re.escape(a.strip()))
+                        
+                        pattern = r'(' + '|'.join(patterns) + r')'
+                        
+                        if re.search(pattern, txt):
+                            # 关键词前后需要有完成态标记词才触发写入
+                            # 仅含意向态标记词时不触发
+                            if has_intention and not has_completion:
+                                continue
+                            if has_completion:
+                                status_updates.append(key)
             
             if status_updates:
                 now_str = now_cst().strftime('%Y-%m-%d %H:%M:%S')
@@ -1122,8 +1140,8 @@ async def admin_create_status(request: Request):
     db = await get_db()
     try:
         await db.execute(
-            "INSERT INTO memories (content, category, threshold_hours, updated_at) VALUES (?, 'status', ?, NULL)",
-            (body.get('content'), body.get('threshold_hours', 24))
+            "INSERT INTO memories (content, category, threshold_hours, aliases, updated_at) VALUES (?, 'status', ?, ?, NULL)",
+            (body.get('content'), body.get('threshold_hours', 24), body.get('aliases', ''))
         )
         await db.commit()
         return {'success': True}
@@ -1138,7 +1156,7 @@ async def admin_update_status(status_id: int, request: Request):
     try:
         fields = []
         params = []
-        for k in ['content', 'threshold_hours', 'updated_at']:
+        for k in ['content', 'threshold_hours', 'aliases', 'updated_at']:
             if k in body:
                 fields.append(f"{k} = ?")
                 params.append(body[k])

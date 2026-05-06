@@ -1005,6 +1005,10 @@ Line: ' + line + ', Col: ' + col + '
                         <label class="block text-sm font-medium text-[#5a7a7d] mb-1">阈值时间 (小时)</label>
                         <input v-model.number="statusForm.threshold_hours" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]" placeholder="26">
                     </div>
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">别名 (用 | 分隔，如：氟伏|沙明)</label>
+                        <input v-model="statusForm.aliases" type="text" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]" placeholder="支持正则的口语别名">
+                    </div>
                     <div v-if="editingStatus">
                         <label class="block text-sm font-medium text-[#5a7a7d] mb-1">手动设置上次完成时间 (YYYY-MM-DD HH:MM:SS)</label>
                         <input v-model="statusForm.updated_at" type="text" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
@@ -1069,7 +1073,7 @@ Line: ' + line + ', Col: ' + col + '
                 const statusList = ref([]);
                 const showStatusModal = ref(false);
                 const editingStatus = ref(false);
-                const statusForm = reactive({ content: '', threshold_hours: 24, updated_at: '' });
+                const statusForm = reactive({ content: '', threshold_hours: 24, aliases: '', updated_at: '' });
                 
                 // 模型选择弹窗状态
                 const showModelModal = ref(false);
@@ -1610,6 +1614,7 @@ Line: ' + line + ', Col: ' + col + '
                     editingStatus.value = false;
                     statusForm.content = '';
                     statusForm.threshold_hours = 24;
+                    statusForm.aliases = '';
                     statusForm.updated_at = '';
                     showStatusModal.value = true;
                 };
@@ -1619,6 +1624,7 @@ Line: ' + line + ', Col: ' + col + '
                     statusForm.id = st.id;
                     statusForm.content = st.content;
                     statusForm.threshold_hours = st.threshold_hours;
+                    statusForm.aliases = st.aliases || '';
                     statusForm.updated_at = st.updated_at || '';
                     showStatusModal.value = true;
                 };
@@ -1628,7 +1634,11 @@ Line: ' + line + ', Col: ' + col + '
                     try {
                         let url = '/admin/api/status';
                         let method = 'POST';
-                        let body = { content: statusForm.content, threshold_hours: statusForm.threshold_hours };
+                        let body = { 
+                            content: statusForm.content, 
+                            threshold_hours: statusForm.threshold_hours,
+                            aliases: statusForm.aliases
+                        };
                         if (editingStatus.value) {
                             url = `/admin/api/status/${statusForm.id}`;
                             method = 'PUT';

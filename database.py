@@ -163,24 +163,36 @@ async def init_db():
             await db.execute('ALTER TABLE memories ADD COLUMN threshold_hours INTEGER DEFAULT 24')
         except Exception:
             pass  # 列已存在则忽略
+            
+        # Migration: memories 表添加 aliases 列（状态便签别名）
+        try:
+            await db.execute("ALTER TABLE memories ADD COLUMN aliases TEXT DEFAULT ''")
+        except Exception:
+            pass  # 列已存在则忽略
 
         # 初始化状态便签种子数据
         status_seeds = [
-            ('氟伏沙明', 26),
-            ('劳拉西泮', 26),
-            ('丁螺环酮', 26),
-            ('普瑞巴林', 26),
-            ('思诺思', 26),
-            ('信必可', 26),
-            ('阿布西替尼', 26),
-            ('洗澡', 60)
+            ('氟伏沙明', 26, '氟伏|沙明'),
+            ('劳拉西泮', 26, '劳拉'),
+            ('丁螺环酮', 26, '丁螺|钉螺'),
+            ('普瑞巴林', 26, '普瑞|巴林'),
+            ('思诺思', 26, '思诺思|思诺'),
+            ('信必可', 26, '信必可'),
+            ('阿布西替尼', 26, '阿布西|阿布'),
+            ('洗澡', 60, '')
         ]
-        for key, hours in status_seeds:
-            cursor = await db.execute("SELECT id FROM memories WHERE category='status' AND content=?", (key,))
-            if not await cursor.fetchone():
+        for key, hours, aliases in status_seeds:
+            cursor = await db.execute("SELECT id, aliases FROM memories WHERE category='status' AND content=?", (key,))
+            row = await cursor.fetchone()
+            if not row:
                 await db.execute(
-                    "INSERT INTO memories (content, category, threshold_hours, updated_at) VALUES (?, 'status', ?, NULL)",
-                    (key, hours)
+                    "INSERT INTO memories (content, category, threshold_hours, aliases, updated_at) VALUES (?, 'status', ?, ?, NULL)",
+                    (key, hours, aliases)
+                )
+            elif not row['aliases']: # 如果已经存在但别名为空，尝试更新预置别名
+                await db.execute(
+                    "UPDATE memories SET aliases=? WHERE id=?",
+                    (aliases, row['id'])
                 )
         # ==================== 窗口表（手动分组） ====================
         await db.execute('''
