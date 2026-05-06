@@ -118,6 +118,7 @@ Line: ' + line + ', Col: ' + col + '
             <button @click="currentTab = 'rules'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'rules', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'rules'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">提示词注入</button>
             <button @click="currentTab = 'conversations'; fetchCalendar()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'conversations', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'conversations'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">对话记录</button>
             <button @click="currentTab = 'memory'; fetchSummaries(); fetchSummaryStats(); fetchSummaryConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'memory', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'memory'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">记忆总览</button>
+            <button @click="currentTab = 'status'; fetchStatus()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'status', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'status'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">状态便签</button>
             <a href="/games/snake" target="_blank" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors text-[#5a7a7d] hover:text-[#4199a0] inline-flex items-center">小游戏</a>
         </nav>
 
@@ -688,6 +689,40 @@ Line: ' + line + ', Col: ' + col + '
                     </div>
                 </div>
             </section>
+
+            <!-- 状态便签 -->
+            <section v-show="currentTab === 'status'">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-lg font-semibold text-[#2c3e50]">状态便签</h2>
+                    <button @click="openAddStatusModal" class="bg-[#4199a0] hover:bg-[#77b5b4] text-white px-3 py-1.5 rounded-lg text-sm font-medium transition-colors">
+                        + 添加状态
+                    </button>
+                </div>
+                <div v-if="loading.status" class="text-center py-8 text-[#5a7a7d]">加载中...</div>
+                <div v-else-if="statusList.length === 0" class="text-center py-8 text-[#5a7a7d]">暂无状态数据</div>
+                <div v-else class="space-y-3">
+                    <div v-for="st in statusList" :key="st.id" class="bg-white rounded-xl border border-[#aecfd1] p-4 flex items-center justify-between">
+                        <div>
+                            <div class="flex items-center gap-2 mb-1">
+                                <h3 class="font-medium text-[#2c3e50]">{{ st.content }}</h3>
+                                <span class="text-[10px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded border">阈值: {{ st.threshold_hours || 24 }}h</span>
+                                <span v-if="st._state === '正常'" class="text-[10px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded">正常</span>
+                                <span v-else-if="st._state === '即将超时'" class="text-[10px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded">即将超时</span>
+                                <span v-else-if="st._state === '超时'" class="text-[10px] bg-red-100 text-red-700 px-1.5 py-0.5 rounded">超时</span>
+                                <span v-else class="text-[10px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded">未记录</span>
+                            </div>
+                            <div class="text-xs text-[#5a7a7d]">
+                                上次完成: {{ st.updated_at ? formatTime(st.updated_at) : '暂无记录' }} 
+                                <span v-if="st._diff_str">({{ st._diff_str }})</span>
+                            </div>
+                        </div>
+                        <div class="flex gap-2">
+                            <button @click="editStatus(st)" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">编辑</button>
+                            <button @click="deleteStatus(st.id)" class="text-red-400 hover:text-red-500 p-1">删除</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
         </main>
 
         <!-- 窗口创建/编辑弹窗 -->
@@ -951,6 +986,38 @@ Line: ' + line + ', Col: ' + col + '
                 </div>
             </div>
         </div>
+
+        <!-- 状态便签弹窗 -->
+        <div v-if="showStatusModal" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-white/90 backdrop-blur-sm p-4">
+            <div class="bg-white w-full max-w-sm rounded-t-2xl sm:rounded-2xl shadow-2xl border border-[#aecfd1] flex flex-col max-h-[90vh]">
+                <div class="p-4 border-b border-[#aecfd1] flex justify-between items-center shrink-0">
+                    <h3 class="text-lg font-semibold">{{ editingStatus ? '编辑状态' : '添加状态' }}</h3>
+                    <button @click="showStatusModal = false" class="text-[#5a7a7d] hover:text-[#4199a0] p-1">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                <div class="p-4 space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">项目名称 (Key)</label>
+                        <input v-model="statusForm.content" type="text" :disabled="editingStatus" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]" placeholder="例如: 氟伏沙明">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">阈值时间 (小时)</label>
+                        <input v-model.number="statusForm.threshold_hours" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]" placeholder="26">
+                    </div>
+                    <div v-if="editingStatus">
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-1">手动设置上次完成时间 (YYYY-MM-DD HH:MM:SS)</label>
+                        <input v-model="statusForm.updated_at" type="text" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                        <p class="text-[10px] text-gray-400 mt-1">若清空则重置为未记录状态</p>
+                    </div>
+                </div>
+                <div class="p-4 border-t border-[#aecfd1] flex gap-2">
+                    <button @click="showStatusModal = false" class="flex-1 py-2 text-sm text-[#5a7a7d] bg-[#f0f5f5] hover:bg-[#e0ebeb] rounded-lg transition-colors">取消</button>
+                    <button @click="saveStatus()" class="flex-1 py-2 text-sm text-white bg-[#4199a0] hover:bg-[#357e84] rounded-lg transition-colors">保存</button>
+                </div>
+            </div>
+        </div>
+
         <Transition name="toast">
             <div v-if="toast.show" class="fixed top-4 left-0 right-0 z-50 flex justify-center px-4 pointer-events-none">
                 <div class="bg-white border shadow-lg rounded-full px-4 py-2 flex items-center gap-2"
@@ -997,6 +1064,12 @@ Line: ' + line + ', Col: ' + col + '
                 const summaryFilter = ref('all');
                 const summaryActiveOnly = ref(false);
                 const summaryConfig = ref({ interval: 16, currentCount: 0 });
+
+                // 状态便签状态
+                const statusList = ref([]);
+                const showStatusModal = ref(false);
+                const editingStatus = ref(false);
+                const statusForm = reactive({ content: '', threshold_hours: 24, updated_at: '' });
                 
                 // 模型选择弹窗状态
                 const showModelModal = ref(false);
@@ -1499,6 +1572,94 @@ Line: ' + line + ', Col: ' + col + '
                     win._expanded = !win._expanded;
                 };
 
+                // 状态便签方法
+                const fetchStatus = async () => {
+                    loading.status = true;
+                    try {
+                        const res = await fetch('/admin/api/status');
+                        if (res.ok) {
+                            let data = await res.json();
+                            const now = new Date();
+                            data.forEach(st => {
+                                if (!st.updated_at) {
+                                    st._state = '未记录';
+                                    return;
+                                }
+                                const updated = new Date(st.updated_at.replace(/-/g, '/'));
+                                const diffHours = (now - updated) / 3600000;
+                                const thresh = st.threshold_hours || 24;
+                                if (diffHours < 1) {
+                                    st._diff_str = Math.floor(diffHours * 60) + 'm前';
+                                } else {
+                                    st._diff_str = diffHours.toFixed(1) + 'h前';
+                                }
+                                if (diffHours < thresh) st._state = '正常';
+                                else if (diffHours < thresh * 1.5) st._state = '即将超时';
+                                else st._state = '超时';
+                            });
+                            statusList.value = data;
+                        }
+                    } catch(e) {
+                        showToast('获取状态失败: ' + e.message, 'error');
+                    } finally {
+                        loading.status = false;
+                    }
+                };
+
+                const openAddStatusModal = () => {
+                    editingStatus.value = false;
+                    statusForm.content = '';
+                    statusForm.threshold_hours = 24;
+                    statusForm.updated_at = '';
+                    showStatusModal.value = true;
+                };
+
+                const editStatus = (st) => {
+                    editingStatus.value = true;
+                    statusForm.id = st.id;
+                    statusForm.content = st.content;
+                    statusForm.threshold_hours = st.threshold_hours;
+                    statusForm.updated_at = st.updated_at || '';
+                    showStatusModal.value = true;
+                };
+
+                const saveStatus = async () => {
+                    if (!statusForm.content) { showToast('项目名称不能为空', 'error'); return; }
+                    try {
+                        let url = '/admin/api/status';
+                        let method = 'POST';
+                        let body = { content: statusForm.content, threshold_hours: statusForm.threshold_hours };
+                        if (editingStatus.value) {
+                            url = `/admin/api/status/${statusForm.id}`;
+                            method = 'PUT';
+                            body.updated_at = statusForm.updated_at || null;
+                        }
+                        const res = await fetch(url, {
+                            method,
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(body)
+                        });
+                        if (!res.ok) throw new Error('保存失败');
+                        showToast('状态便签已保存', 'success');
+                        showStatusModal.value = false;
+                        await fetchStatus();
+                    } catch(e) {
+                        showToast(e.message, 'error');
+                    }
+                };
+
+                const deleteStatus = async (id) => {
+                    if (!confirm('确定要删除该状态便签吗？')) return;
+                    try {
+                        const res = await fetch(`/admin/api/status/${id}`, { method: 'DELETE' });
+                        if (!res.ok) throw new Error('删除失败');
+                        showToast('删除成功', 'success');
+                        await fetchStatus();
+                    } catch(e) {
+                        showToast(e.message, 'error');
+                    }
+                };
+
                 // 窗口管理方法
                 const manualWindows = computed(() => windows.value.filter(w => w.is_manual));
 
@@ -1849,7 +2010,8 @@ Line: ' + line + ', Col: ' + col + '
                     isSummary, getSummaryType, getUserText, getUserImages, hasAttachment, getAttachmentText,
                     hasThinking, getThinking, getAssistantText, isEmptyOrToolCall,
                     summaries, summaryStats, summaryFilter, summaryActiveOnly, summaryConfig,
-                    fetchSummaries, fetchSummaryStats, deleteSummary, fetchSummaryConfig, saveSummaryConfig, triggerRoundSummary, groupedConversations, expandedConvs, loadingConvs, messagesMap
+                    fetchSummaries, fetchSummaryStats, deleteSummary, fetchSummaryConfig, saveSummaryConfig, triggerRoundSummary, groupedConversations, expandedConvs, loadingConvs, messagesMap,
+                    statusList, showStatusModal, editingStatus, statusForm, fetchStatus, openAddStatusModal, editStatus, saveStatus, deleteStatus
                 };
             }
         });

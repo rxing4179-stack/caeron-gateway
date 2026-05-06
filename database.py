@@ -158,7 +158,30 @@ async def init_db():
                 FOREIGN KEY (source_summary_id) REFERENCES summaries(id)
             )
         ''')
+        # Migration: memories 表添加 threshold_hours 列（状态便签用）
+        try:
+            await db.execute('ALTER TABLE memories ADD COLUMN threshold_hours INTEGER DEFAULT 24')
+        except Exception:
+            pass  # 列已存在则忽略
 
+        # 初始化状态便签种子数据
+        status_seeds = [
+            ('氟伏沙明', 26),
+            ('劳拉西泮', 26),
+            ('丁螺环酮', 26),
+            ('普瑞巴林', 26),
+            ('思诺思', 26),
+            ('信必可', 26),
+            ('阿布西替尼', 26),
+            ('洗澡', 60)
+        ]
+        for key, hours in status_seeds:
+            cursor = await db.execute("SELECT id FROM memories WHERE category='status' AND content=?", (key,))
+            if not await cursor.fetchone():
+                await db.execute(
+                    "INSERT INTO memories (content, category, threshold_hours, updated_at) VALUES (?, 'status', ?, NULL)",
+                    (key, hours)
+                )
         # ==================== 窗口表（手动分组） ====================
         await db.execute('''
             CREATE TABLE IF NOT EXISTS windows (

@@ -452,6 +452,45 @@ async def chat_completions(request: Request):
         except Exception as e:
             logger.error(f"[AUTO_SUMMARY] 计数器异常（不影响转发）: {e}")
     # === End Step 2.5 ===
+
+    # === Step 2.8: 状态便签追踪 ===
+    try:
+        import re
+        from utils import now_cst
+        db = await get_db()
+        try:
+            status_updates = []
+            for msg in body.get('messages', []):
+                if msg.get('role') == 'user':
+                    txt = msg.get('content', '')
+                    if not isinstance(txt, str):
+                        continue
+                    if re.search(r'吃了?(氟伏沙明|劳拉西泮|劳拉|丁螺环酮|丁螺|普瑞巴林|思诺思|阿布西替尼)', txt):
+                        m = re.search(r'(氟伏沙明|劳拉西泮|劳拉|丁螺环酮|丁螺|普瑞巴林|思诺思|阿布西替尼)', txt)
+                        key = m.group(1)
+                        if key == '劳拉': key = '劳拉西泮'
+                        if key == '丁螺': key = '丁螺环酮'
+                        status_updates.append(key)
+                    if re.search(r'吸了?信必可', txt):
+                        status_updates.append('信必可')
+                    if re.search(r'洗了?澡|洗完澡', txt):
+                        status_updates.append('洗澡')
+            
+            if status_updates:
+                now_str = now_cst().strftime('%Y-%m-%d %H:%M:%S')
+                for key in set(status_updates):
+                    await db.execute(
+                        "UPDATE memories SET updated_at = ? WHERE category = 'status' AND content = ?",
+                        (now_str, key)
+                    )
+                await db.commit()
+                logger.info(f"[STATUS] 更新状态便签: {set(status_updates)}")
+        finally:
+            await db.close()
+    except Exception as e:
+        logger.error(f"[STATUS] 状态便签更新异常: {e}")
+    # === End Step 2.8 ===
+
     # === Step 3: 预处理 — 清理上下文膨胀源 ===
     # Operit会保留上一轮网关注入的内容，如果不清理，每轮都会翻倍。
     # 需要清理三类残留：
@@ -1063,6 +1102,64 @@ async def admin_unassign_conversations(request: Request):
     finally:
         await db.close()
 
+# ==================== 状态便签 API ====================
+
+@app.get("/admin/api/status")
+async def admin_get_status():
+    """获取所有状态便签"""
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT * FROM memories WHERE category = 'status' ORDER BY id DESC")
+        rows = [dict(r) for r in await cursor.fetchall()]
+        return rows
+    finally:
+        await db.close()
+
+@app.post("/admin/api/status")
+async def admin_create_status(request: Request):
+    """新增状态便签"""
+    body = await request.json()
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO memories (content, category, threshold_hours, updated_at) VALUES (?, 'status', ?, NULL)",
+            (body.get('content'), body.get('threshold_hours', 24))
+        )
+        await db.commit()
+        return {'success': True}
+    finally:
+        await db.close()
+
+@app.put("/admin/api/status/{status_id}")
+async def admin_update_status(status_id: int, request: Request):
+    """修改状态便签（比如手动设置已完成时间）"""
+    body = await request.json()
+    db = await get_db()
+    try:
+        fields = []
+        params = []
+        for k in ['content', 'threshold_hours', 'updated_at']:
+            if k in body:
+                fields.append(f"{k} = ?")
+                params.append(body[k])
+        if fields:
+            params.append(status_id)
+            await db.execute(f"UPDATE memories SET {', '.join(fields)} WHERE id = ?", params)
+            await db.commit()
+        return {'success': True}
+    finally:
+        await db.close()
+
+@app.delete("/admin/api/status/{status_id}")
+async def admin_delete_status(status_id: int):
+    """删除状态便签"""
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM memories WHERE id = ?", (status_id,))
+        await db.commit()
+        return {'success': True}
+    finally:
+        await db.close()
 
 
 @app.get("/admin/api/conversations/search")
