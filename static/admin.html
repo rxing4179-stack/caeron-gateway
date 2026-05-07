@@ -119,6 +119,7 @@ Line: ' + line + ', Col: ' + col + '
             <button @click="currentTab = 'conversations'; fetchCalendar()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'conversations', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'conversations'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">对话记录</button>
             <button @click="currentTab = 'memory'; fetchSummaries(); fetchSummaryStats(); fetchSummaryConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'memory', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'memory'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">记忆总览</button>
             <button @click="currentTab = 'status'; fetchStatus()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'status', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'status'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">状态便签</button>
+            <button @click="currentTab = 'recall'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'recall', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'recall'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">向量召回</button>
             <a href="/games/snake" target="_blank" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors text-[#5a7a7d] hover:text-[#4199a0] inline-flex items-center">小游戏</a>
         </nav>
 
@@ -723,6 +724,42 @@ Line: ' + line + ', Col: ' + col + '
                     </div>
                 </div>
             </section>
+            
+            <!-- 向量召回 -->
+            <section v-show="currentTab === 'recall'">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-lg font-semibold text-[#2c3e50]">向量召回测试</h2>
+                </div>
+                
+                <div class="bg-white rounded-xl border border-[#aecfd1] p-4 mb-4">
+                    <label class="block text-sm font-medium text-[#5a7a7d] mb-2">输入测试文本：</label>
+                    <textarea v-model="recallInputText" rows="3" class="w-full border border-[#aecfd1] rounded-lg p-3 text-[#2c3e50] focus:outline-none focus:ring-1 focus:ring-[#4199a0] focus:border-[#4199a0] bg-white transition-shadow" placeholder="例如：肚子疼..."></textarea>
+                    
+                    <button @click="testRecall" :disabled="loading.recall" class="mt-4 bg-[#4199a0] hover:bg-[#77b5b4] text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 flex items-center">
+                        <span v-if="loading.recall" class="mr-2">
+                            <svg class="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                        </span>
+                        测试召回
+                    </button>
+                </div>
+
+                <div>
+                    <h3 class="text-md font-semibold text-[#2c3e50] mb-3 pb-2 border-b border-[#aecfd1]">召回结果 (Top 5, 相似度 > 0.5)</h3>
+                    
+                    <div v-if="recallResults.length > 0" class="space-y-3">
+                        <div v-for="(item, index) in recallResults" :key="index" class="bg-white rounded-xl border border-[#aecfd1] p-4">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="text-xs font-semibold px-2 py-1 bg-[#deebec] text-[#4199a0] rounded">#{{ index + 1 }}</span>
+                                <span class="text-sm font-mono text-[#5a7a7d]">相似度: <span class="font-bold text-[#2c3e50]">{{ item.sim }}</span></span>
+                            </div>
+                            <p class="text-[#2c3e50] text-sm whitespace-pre-wrap">{{ item.content }}</p>
+                        </div>
+                    </div>
+                    <div v-else-if="hasSearchedRecall && recallResults.length === 0" class="text-center py-8 text-[#5a7a7d] bg-white/50 rounded-xl border border-[#aecfd1]/50">
+                        未找到相关记忆。
+                    </div>
+                </div>
+            </section>
         </main>
 
         <!-- 窗口创建/编辑弹窗 -->
@@ -1059,7 +1096,8 @@ Line: ' + line + ', Col: ' + col + '
                     fetchModels: false,
                     test: null,
                     summaries: false,
-                    triggerSummary: false
+                    triggerSummary: false,
+                    recall: false
                 });
 
                 // 记忆总览状态
@@ -1074,6 +1112,11 @@ Line: ' + line + ', Col: ' + col + '
                 const showStatusModal = ref(false);
                 const editingStatus = ref(false);
                 const statusForm = reactive({ content: '', threshold_hours: 24, aliases: '', updated_at: '' });
+                
+                // 召回状态
+                const recallInputText = ref('');
+                const recallResults = ref([]);
+                const hasSearchedRecall = ref(false);
                 
                 // 模型选择弹窗状态
                 const showModelModal = ref(false);
@@ -1995,6 +2038,31 @@ Line: ' + line + ', Col: ' + col + '
                     }
                 };
 
+                const testRecall = async () => {
+                    if (!recallInputText.value.trim()) return;
+                    
+                    loading.recall = true;
+                    hasSearchedRecall.value = false;
+                    try {
+                        const res = await fetch('/admin/api/test-recall', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ text: recallInputText.value })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            recallResults.value = data.results;
+                        } else {
+                            showToast('错误: ' + data.error, 'error');
+                        }
+                    } catch (e) {
+                        showToast('网络错误: ' + e.message, 'error');
+                    } finally {
+                        loading.recall = false;
+                        hasSearchedRecall.value = true;
+                    }
+                };
+
                 // 初始化
                 onMounted(() => {
                     fetchProviders();
@@ -2021,7 +2089,8 @@ Line: ' + line + ', Col: ' + col + '
                     hasThinking, getThinking, getAssistantText, isEmptyOrToolCall,
                     summaries, summaryStats, summaryFilter, summaryActiveOnly, summaryConfig,
                     fetchSummaries, fetchSummaryStats, deleteSummary, fetchSummaryConfig, saveSummaryConfig, triggerRoundSummary, groupedConversations, expandedConvs, loadingConvs, messagesMap,
-                    statusList, showStatusModal, editingStatus, statusForm, fetchStatus, openAddStatusModal, editStatus, saveStatus, deleteStatus
+                    statusList, showStatusModal, editingStatus, statusForm, fetchStatus, openAddStatusModal, editStatus, saveStatus, deleteStatus,
+                    recallInputText, recallResults, hasSearchedRecall, testRecall
                 };
             }
         });

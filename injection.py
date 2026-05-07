@@ -162,6 +162,59 @@ class InjectionEngine:
             tag_counts = {}
             has_any_summaries = False
             today = today_cst_str()
+            
+            # --- 新增：语义召回逻辑 (Semantic Recall) ---
+            semantic_success = False
+            try:
+                # 1. 获取用户最新一条消息
+                last_user_msg = None
+                for m in reversed(messages):
+                    if m.get('role') == 'user':
+                        c = m.get('content', '')
+                        if isinstance(c, list):
+                            import json
+                            try:
+                                c = '\n'.join([i.get('text', '') for i in c if i.get('type') == 'text'])
+                            except: pass
+                        last_user_msg = c
+                        break
+                
+                if last_user_msg:
+                    from embedding import get_embedding, cosine_similarity
+                    import json
+                    user_emb = await get_embedding(last_user_msg)
+                    if user_emb:
+                        # 从 memories 表读取所有带有 embedding 的记忆
+                        cursor = await db.execute("SELECT id, content, embedding FROM memories WHERE embedding IS NOT NULL")
+                        memories_rows = await cursor.fetchall()
+                        
+                        scored_memories = []
+                        for row in memories_rows:
+                            try:
+                                mem_emb = json.loads(row['embedding'])
+                                sim = cosine_similarity(user_emb, mem_emb)
+                                if sim > 0.5:
+                                    scored_memories.append((sim, row['content']))
+                            except Exception:
+                                pass
+                        
+                        if scored_memories:
+                            scored_memories.sort(key=lambda x: x[0], reverse=True)
+                            top_5 = scored_memories[:5]
+                            
+                            parts.append("【相关历史记忆（按语义相关度召回）】")
+                            for sim, content in top_5:
+                                # 截断一下避免太长
+                                if len(content) > 300:
+                                    content = content[:300] + '...'
+                                parts.append(f"- (相关度: {sim:.2f}) {content}")
+                            
+                            tag_counts['semantic_recall'] = len(top_5)
+                            has_any_summaries = True
+                            semantic_success = True
+                            logger.info(f"[记忆注入] 语义召回成功，找到 {len(top_5)} 条相关记忆")
+            except Exception as e:
+                logger.error(f"[记忆注入] 语义召回失败，将回退到时间排序: {e}")
 
             # 2. 月总：只取最新 2 条
             cursor = await db.execute(
@@ -262,107 +315,103 @@ class InjectionEngine:
 
             logger.info(f"[记忆注入] 注入汇总统计: {tag_counts}, 待总结消息数: {unsummarized_count}")
 
-        finally:
-            await db.close()
+            # === 裁剪已被总结覆盖的原始消息 ===
+            # 关键修复：只要有任何活跃总结，就执行裁剪（不再依赖 has_round_summaries）
+            if has_any_summaries:
+                # 分离system消息和对话消息
+                system_indices = []
+                dialog_indices = []
+                for i, m in enumerate(messages):
+                    if m.get('role') == 'system':
+                        system_indices.append(i)
+                    else:
+                        dialog_indices.append(i)
+                
+                # 保留最后 unsummarized_count + buffer 条对话消息
+                buffer = 8
+                keep_count = max(unsummarized_count + buffer, 10)  # 至少保留10条对话
+                
+                logger.info(f"[记忆裁剪-入口] 当前对话总数:{len(dialog_indices)}, 待总结数:{unsummarized_count}, 保留阈值:{keep_count}")
+                
+                if len(dialog_indices) > keep_count:
+                    trimmed_count = len(dialog_indices) - keep_count
+                    keep_indices = set(system_indices + dialog_indices[-keep_count:])
+                    
+                    new_messages = [messages[i] for i in sorted(keep_indices)]
+                    messages.clear()
+                    messages.extend(new_messages)
+                    
+                    logger.info(f"[记忆裁剪-出口] 裁掉 {trimmed_count} 条已总结旧消息，保留 {len(dialog_indices[-keep_count:])} 条对话 + {len(system_indices)} 条system")
+                else:
+                    logger.info(f"[记忆裁剪-出口] 对话 {len(dialog_indices)} 条 <= 保留阈值 {keep_count}，不裁剪")
 
-        if not parts:
-            logger.info(f"[记忆注入] 无任何活跃总结，跳过")
-            return
+            # === 获取状态便签 ===
+            cursor = await db.execute("SELECT content, updated_at, threshold_hours FROM memories WHERE category = 'status'")
+            status_rows = await cursor.fetchall()
+            status_lines = []
+            if status_rows:
+                status_lines.append("<current_status>")
+                status_lines.append("| 项目 | 上次完成 | 距今 | 状态 |")
+                status_lines.append("|------|---------|------|------|")
+                now = now_cst()
+                from datetime import datetime
+                for r in status_rows:
+                    key = r['content']
+                    updated_at_str = r['updated_at']
+                    threshold = r['threshold_hours'] or 24
+                    
+                    if not updated_at_str:
+                        status_lines.append(f"| {key} | 未记录 | - | 未记录 |")
+                        continue
+                    
+                    try:
+                        updated_at = datetime.strptime(updated_at_str, '%Y-%m-%d %H:%M:%S')
+                        diff_hours = (now - updated_at).total_seconds() / 3600.0
+                        
+                        if diff_hours < 1:
+                            diff_str = f"{diff_hours*60:.0f}m前"
+                        else:
+                            diff_str = f"{diff_hours:.1f}h前"
+                        
+                        time_str = updated_at.strftime('%m-%d %H:%M')
+                        
+                        if diff_hours < threshold:
+                            state_str = "正常"
+                        elif diff_hours < threshold * 1.5:
+                            state_str = "即将超时"
+                        else:
+                            state_str = "超时"
+                            
+                        status_lines.append(f"| {key} | {time_str} | {diff_str} | {state_str} |")
+                    except Exception as e:
+                        logger.error(f"解析状态便签时间失败: {e}")
+                        status_lines.append(f"| {key} | {updated_at_str} | - | 解析异常 |")
+                status_lines.append("</current_status>\n")
 
-        # === 裁剪已被总结覆盖的原始消息 ===
-        # 关键修复：只要有任何活跃总结，就执行裁剪（不再依赖 has_round_summaries）
-        if has_any_summaries:
-            # 分离system消息和对话消息
-            system_indices = []
-            dialog_indices = []
+            # 组装总结文本
+            summary_lines = []
+            if has_any_summaries:
+                summary_lines.append("<context_summaries>")
+                summary_lines.append(f"以下是今天（{today_cst_str()}）的对话记忆摘要，供你参考当前上下文：")
+                summary_lines.extend(parts)
+                summary_lines.append("</context_summaries>")
+
+            summary_text = "\n".join(status_lines + summary_lines)
+            
+            if not summary_text.strip():
+                return
+
+            # 注入位置：在最后一个system消息之后
+            insert_idx = 0
             for i, m in enumerate(messages):
                 if m.get('role') == 'system':
-                    system_indices.append(i)
-                else:
-                    dialog_indices.append(i)
-            
-            # 保留最后 unsummarized_count + buffer 条对话消息
-            buffer = 8
-            keep_count = max(unsummarized_count + buffer, 10)  # 至少保留10条对话
-            
-            logger.info(f"[记忆裁剪-入口] 当前对话总数:{len(dialog_indices)}, 待总结数:{unsummarized_count}, 保留阈值:{keep_count}")
-            
-            if len(dialog_indices) > keep_count:
-                trimmed_count = len(dialog_indices) - keep_count
-                keep_indices = set(system_indices + dialog_indices[-keep_count:])
-                
-                new_messages = [messages[i] for i in sorted(keep_indices)]
-                messages.clear()
-                messages.extend(new_messages)
-                
-                logger.info(f"[记忆裁剪-出口] 裁掉 {trimmed_count} 条已总结旧消息，保留 {len(dialog_indices[-keep_count:])} 条对话 + {len(system_indices)} 条system")
-            else:
-                logger.info(f"[记忆裁剪-出口] 对话 {len(dialog_indices)} 条 <= 保留阈值 {keep_count}，不裁剪")
+                    insert_idx = i + 1
+            messages.insert(insert_idx, {'role': 'system', 'content': summary_text})
 
-        # === 获取状态便签 ===
-        cursor = await db.execute("SELECT content, updated_at, threshold_hours FROM memories WHERE category = 'status'")
-        status_rows = await cursor.fetchall()
-        status_lines = []
-        if status_rows:
-            status_lines.append("<current_status>")
-            status_lines.append("| 项目 | 上次完成 | 距今 | 状态 |")
-            status_lines.append("|------|---------|------|------|")
-            now = now_cst()
-            from datetime import datetime
-            for r in status_rows:
-                key = r['content']
-                updated_at_str = r['updated_at']
-                threshold = r['threshold_hours'] or 24
-                
-                if not updated_at_str:
-                    status_lines.append(f"| {key} | 未记录 | - | 未记录 |")
-                    continue
-                
-                try:
-                    updated_at = datetime.strptime(updated_at_str, '%Y-%m-%d %H:%M:%S')
-                    diff_hours = (now - updated_at).total_seconds() / 3600.0
-                    
-                    if diff_hours < 1:
-                        diff_str = f"{diff_hours*60:.0f}m前"
-                    else:
-                        diff_str = f"{diff_hours:.1f}h前"
-                    
-                    time_str = updated_at.strftime('%m-%d %H:%M')
-                    
-                    if diff_hours < threshold:
-                        state_str = "正常"
-                    elif diff_hours < threshold * 1.5:
-                        state_str = "即将超时"
-                    else:
-                        state_str = "超时"
-                        
-                    status_lines.append(f"| {key} | {time_str} | {diff_str} | {state_str} |")
-                except Exception as e:
-                    logger.error(f"解析状态便签时间失败: {e}")
-                    status_lines.append(f"| {key} | {updated_at_str} | - | 解析异常 |")
-            status_lines.append("</current_status>\n")
+            logger.info(f"[记忆注入] 注入 {len(parts)} 条多级总结")
 
-        # 组装总结文本
-        summary_lines = []
-        if has_any_summaries:
-            summary_lines.append("<context_summaries>")
-            summary_lines.append(f"以下是今天（{today_cst_str()}）的对话记忆摘要，供你参考当前上下文：")
-            summary_lines.extend(parts)
-            summary_lines.append("</context_summaries>")
-
-        summary_text = "\n".join(status_lines + summary_lines)
-        
-        if not summary_text.strip():
-            return
-
-        # 注入位置：在最后一个system消息之后
-        insert_idx = 0
-        for i, m in enumerate(messages):
-            if m.get('role') == 'system':
-                insert_idx = i + 1
-        messages.insert(insert_idx, {'role': 'system', 'content': summary_text})
-
-        logger.info(f"[记忆注入] 注入 {len(parts)} 条多级总结")
+        finally:
+            await db.close()
 
     def _replace_variables(self, text: str) -> str:
         """替换文本中的预设变量"""

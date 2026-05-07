@@ -9,6 +9,7 @@ Step 2 of Phase 4.0
 import hashlib
 import json
 import logging
+import asyncio
 from database import get_db
 
 import time as _time
@@ -335,7 +336,57 @@ async def store_assistant_response(conversation_id: str, content: str):
             logger.info(f"存储AI回复 (对话: {conversation_id[:8]}..., {len(content)} 字符)")
         
         await db.commit()
+        
+        # 触发后台向量化任务
+        asyncio.create_task(_embed_and_store_dialogue_memory(conversation_id, content))
+        
     except Exception as e:
         logger.error(f"存储AI回复失败: {e}")
+    finally:
+        await db.close()
+
+async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_content: str):
+    """后台任务：把对话对存入 memories 表，并生成 embedding"""
+    db = await get_db()
+    try:
+        # 1. 查找最近一条 user message
+        cursor = await db.execute(
+            '''SELECT content FROM messages 
+               WHERE conversation_id = ? AND role = 'user' 
+               ORDER BY message_index DESC LIMIT 1''',
+            (conversation_id,)
+        )
+        row = await cursor.fetchone()
+        user_content = row['content'] if row else ''
+        
+        # 简单清理一下多模态格式
+        if isinstance(user_content, str) and user_content.startswith('['):
+            try:
+                arr = json.loads(user_content)
+                if isinstance(arr, list):
+                    text_parts = [item.get('text', '') for item in arr if item.get('type') == 'text']
+                    user_content = '\n'.join(text_parts)
+            except:
+                pass
+                
+        # 2. 拼接
+        combined_text = f"User: {user_content}\nAssistant: {assistant_content}"
+        
+        # 3. 调 embedding API
+        from embedding import get_embedding
+        emb_vector = await get_embedding(combined_text)
+        
+        emb_json = json.dumps(emb_vector) if emb_vector else None
+        
+        # 4. 存入 memories 表
+        await db.execute(
+            '''INSERT INTO memories (content, category, embedding)
+               VALUES (?, 'dialogue', ?)''',
+            (combined_text, emb_json)
+        )
+        await db.commit()
+        logger.info(f"[EMBEDDING] 成功将对话对存入 memories 表并生成向量 (dim={len(emb_vector) if emb_vector else 0})")
+    except Exception as e:
+        logger.error(f"[EMBEDDING] 对话向量化存储失败: {e}")
     finally:
         await db.close()

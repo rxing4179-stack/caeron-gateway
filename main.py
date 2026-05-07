@@ -1420,6 +1420,54 @@ async def admin_panel():
         return FileResponse(html_path, media_type='text/html')
     return HTMLResponse("<h1>管理面板文件未找到</h1>", status_code=404)
 
+@app.get("/admin/test-recall")
+async def test_recall_page():
+    """返回语义记忆召回测试页面"""
+    html_path = os.path.join(os.path.dirname(__file__), 'static', 'test_recall.html')
+    if os.path.exists(html_path):
+        return FileResponse(html_path, media_type='text/html')
+    return HTMLResponse("<h1>页面文件未找到</h1>", status_code=404)
+
+@app.post("/admin/api/test-recall")
+async def api_test_recall(request: Request):
+    """测试记忆召回"""
+    body = await request.json()
+    text = body.get('text', '')
+    if not text:
+        return {'success': False, 'error': '文本不能为空'}
+    
+    try:
+        from embedding import get_embedding, cosine_similarity
+        user_emb = await get_embedding(text)
+        if not user_emb:
+            return {'success': False, 'error': 'Embedding API 调用失败或未配置 Key'}
+        
+        db = await get_db()
+        try:
+            cursor = await db.execute("SELECT id, content, embedding FROM memories WHERE embedding IS NOT NULL")
+            memories_rows = await cursor.fetchall()
+            
+            scored = []
+            for row in memories_rows:
+                try:
+                    mem_emb = json.loads(row['embedding'])
+                    sim = cosine_similarity(user_emb, mem_emb)
+                    if sim > 0.5:
+                        content_trunc = row['content'][:100] + ('...' if len(row['content']) > 100 else '')
+                        scored.append({'sim': f"{sim:.2f}", 'content': content_trunc, 'raw_sim': sim})
+                except Exception:
+                    pass
+            
+            scored.sort(key=lambda x: x['raw_sim'], reverse=True)
+            top_5 = scored[:5]
+            
+            return {'success': True, 'results': top_5}
+        finally:
+            await db.close()
+            
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
 
 # ==================== 小游戏 ====================
 @app.get("/games/snake")
