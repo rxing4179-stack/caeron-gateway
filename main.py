@@ -115,6 +115,7 @@ async def lifespan(app: FastAPI):
 
     # 启动定时总结任务（日总/周总/月总）
     summary_cron_task = asyncio.create_task(_summary_cron_loop())
+    
     logger.info("Caeron Gateway 启动完成，等待请求...")
 
     yield
@@ -122,6 +123,7 @@ async def lifespan(app: FastAPI):
     # 关闭时停止后台任务
     health_probe_task.cancel()
     summary_cron_task.cancel()
+    
     for task in [health_probe_task, summary_cron_task]:
         try:
             await task
@@ -137,6 +139,11 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+from log_viewer import log_app
+app.mount("/syslogs", log_app)
+
+from qq_adapter import qq_router
+app.include_router(qq_router)
 
 # ==================== Admin 认证中间件 ====================
 class AdminAuthMiddleware(BaseHTTPMiddleware):
@@ -153,6 +160,46 @@ class AdminAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 app.add_middleware(AdminAuthMiddleware)
+
+import time
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+        
+        try:
+            response = await call_next(request)
+        except Exception as e:
+            # Error happened during request processing
+            raise e
+        finally:
+            # We want to log completions
+            if request.url.path == "/v1/chat/completions" and hasattr(request.state, 'log_info'):
+                duration = (time.time() - start_time) * 1000
+                info = request.state.log_info
+                ip = request.client.host if request.client else "Unknown"
+                ua = request.headers.get("user-agent", "Unknown UA")
+                
+                # Try to use x-forwarded-for if behind proxy
+                forwarded_for = request.headers.get("x-forwarded-for")
+                if forwarded_for:
+                    ip = forwarded_for.split(',')[0].strip()
+                    
+                source = f"{ip} - {ua}"
+                
+                # Send to log viewer
+                from log_viewer import log_request_event
+                asyncio.create_task(log_request_event(
+                    source=source,
+                    last_user_msg=info.get('msg', ''),
+                    status_code=response.status_code,
+                    duration_ms=duration,
+                    is_stream=info.get('is_stream', False)
+                ))
+                
+        return response
+
+app.add_middleware(RequestLoggingMiddleware)
 
 # ==================== 核心路由 ====================
 
@@ -218,7 +265,24 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="无效的 JSON 请求体")
 
     model = body.get('model', '')
-    logger.info(f"收到请求: model={model}, stream={body.get('stream', False)}")
+    is_stream = body.get('stream', False)
+    logger.info(f"收到请求: model={model}, stream={is_stream}")
+    
+    # 获取最后一条用户消息用于日志展示
+    last_user_msg = ""
+    for msg in reversed(body.get('messages', [])):
+        if msg.get('role') == 'user':
+            c = msg.get('content', '')
+            if isinstance(c, str):
+                last_user_msg = c
+            else:
+                last_user_msg = "[图片/文件等多模态内容]"
+            break
+            
+    request.state.log_info = {
+        'msg': last_user_msg,
+        'is_stream': is_stream
+    }
 
     # === 总结请求拦截器 ===
     # 检测Operit的总结请求并拦截，阻止其消耗上游token
@@ -397,7 +461,15 @@ async def chat_completions(request: Request):
     # === Step 2: 消息存储管道 ===
     # 在injection之前，对原始消息做存档
     raw_messages = body.get('messages', [])
-    conversation_id = generate_conversation_id(raw_messages)
+    
+    # 允许通过 Header 显式指定 session_id 和 source
+    explicit_session_id = request.headers.get('x-session-id')
+    explicit_source = request.headers.get('x-source', 'operit')
+    
+    if explicit_session_id:
+        conversation_id = explicit_session_id
+    else:
+        conversation_id = generate_conversation_id(raw_messages)
     
     # 异步存储，不阻塞主流程（存储失败不影响请求转发）
     stored_count = 0
@@ -533,23 +605,27 @@ async def chat_completions(request: Request):
     SUMMARY_BLOB_PATTERNS = ['【日常】', '【技术】', '【学习】', '==========对话摘要==========', 
                               'Conversation Summary', '对话摘要', '<context_summaries>']
     
-    for msg in raw_msgs:
+    # 第一轮：标记每条消息的处理方式，但不立即丢弃
+    # action: 'keep' | 'strip_a' | 'strip_b' | 'strip_c'
+    msg_actions = []
+    
+    for idx, msg in enumerate(raw_msgs):
         role = msg.get('role', '')
         content = msg.get('content', '')
         if not isinstance(content, str):
-            cleaned_msgs.append(msg)
+            msg_actions.append('keep')
             continue
         
         stripped = content.strip()
         
         # A: 网关注入的 user_wrapped_system
         if role == 'user' and stripped.startswith('<system>') and stripped.endswith('</system>'):
-            strip_a += 1
+            msg_actions.append('strip_a')
             continue
         
         # B: 网关注入的 context_summaries
         if role == 'system' and '<context_summaries>' in stripped:
-            strip_b += 1
+            msg_actions.append('strip_b')
             continue
         
         # C: Operit手动总结产生的总结块消息 (可能是user或assistant)
@@ -561,11 +637,45 @@ async def chat_completions(request: Request):
         if is_assistant_summary or is_user_summary_blob:
             first_100 = content[:100]
             if any(pat in first_100 for pat in SUMMARY_BLOB_PATTERNS):
-                strip_c += 1
+                msg_actions.append('strip_c')
                 logger.info(f"[DEDUP] 检测到Operit总结残留 (role={role}): {len(content)} 字符, 前50字={content[:50]}")
                 continue
         
-        cleaned_msgs.append(msg)
+        msg_actions.append('keep')
+    
+    # === 安全检查：如果剥离 C 类消息后，没有任何真实 user 对话消息，则回退 ===
+    # "真实 user 对话消息" = role=user 且内容不是 <system>...</system> 包裹的规则注入
+    def _is_real_user_msg(m):
+        if m.get('role') != 'user':
+            return False
+        c = m.get('content', '')
+        if not isinstance(c, str):
+            return True  # multimodal content counts as real
+        s = c.strip()
+        if s.startswith('<system>') and s.endswith('</system>'):
+            return False
+        return True
+    
+    # 假设 C 类全部剥离后，检查是否还有真实 user 消息
+    msgs_after_strip = [raw_msgs[i] for i, a in enumerate(msg_actions) if a == 'keep']
+    has_real_user_after_strip = any(_is_real_user_msg(m) for m in msgs_after_strip)
+    has_pending_strip_c = any(a == 'strip_c' for a in msg_actions)
+    
+    if has_pending_strip_c and not has_real_user_after_strip:
+        # 剥离总结残留会导致零真实用户消息 → 回退：将 strip_c 改为 keep
+        logger.warning(f"[DEDUP] ⚠️ 剥离总结残留后将无真实用户消息，回退保留以防吞消息")
+        msg_actions = ['keep' if a == 'strip_c' else a for a in msg_actions]
+    
+    # 第二轮：按标记组装最终消息列表
+    for idx, (msg, action) in enumerate(zip(raw_msgs, msg_actions)):
+        if action == 'keep':
+            cleaned_msgs.append(msg)
+        elif action == 'strip_a':
+            strip_a += 1
+        elif action == 'strip_b':
+            strip_b += 1
+        elif action == 'strip_c':
+            strip_c += 1
     
     total_stripped = strip_a + strip_b + strip_c
     if total_stripped > 0:

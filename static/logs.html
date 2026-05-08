@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Caeron Gateway - 实时日志</title>
+    <style>
+        :root {
+            --bg-color: #f0f4f8;
+            --card-bg: #ffffff;
+            --text-primary: #1e293b;
+            --text-secondary: #64748b;
+            --primary-color: #0ea5e9;
+            --success-color: #10b981;
+            --error-color: #ef4444;
+            --border-color: #e2e8f0;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            padding: 20px;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding: 15px 25px;
+            background: var(--card-bg);
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+
+        .header h1 {
+            font-size: 1.5rem;
+            color: var(--primary-color);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .status-badge {
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        .status-connected { background: #dcfce7; color: #166534; }
+        .status-disconnected { background: #fee2e2; color: #991b1b; }
+
+        .log-container {
+            background: var(--card-bg);
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 120px);
+        }
+
+        .table-wrapper {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        th, td {
+            padding: 12px 15px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        th {
+            background-color: #f8fafc;
+            font-weight: 600;
+            color: var(--text-secondary);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        tr:hover {
+            background-color: #f1f5f9;
+        }
+
+        .msg-preview {
+            max-width: 400px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .status-code {
+            font-weight: 600;
+        }
+        .status-200 { color: var(--success-color); }
+        .status-error { color: var(--error-color); }
+        
+        .auth-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        
+        .auth-box {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        }
+        
+        .auth-box input {
+            padding: 10px;
+            margin-top: 15px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            width: 200px;
+        }
+        
+        .auth-box button {
+            padding: 10px 20px;
+            margin-top: 15px;
+            background: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        .source-badge {
+            background: #e0f2fe;
+            color: #0369a1;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>📊 Gateway 实时日志流</h1>
+        <span id="conn-status" class="status-badge status-disconnected">未连接</span>
+    </div>
+
+    <div class="log-container">
+        <div class="table-wrapper">
+            <table id="log-table">
+                <thead>
+                    <tr>
+                        <th width="15%">时间</th>
+                        <th width="15%">来源 (IP/UA)</th>
+                        <th width="40%">用户消息 (预览)</th>
+                        <th width="10%">流式</th>
+                        <th width="10%">状态</th>
+                        <th width="10%">耗时</th>
+                    </tr>
+                </thead>
+                <tbody id="log-body">
+                    <!-- Logs will be inserted here -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let pingInterval = null;
+
+        function connect() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/syslogs/ws`);
+
+            ws.onopen = () => {
+                document.getElementById('conn-status').className = 'status-badge status-connected';
+                document.getElementById('conn-status').innerText = '已连接';
+                
+                pingInterval = setInterval(() => {
+                    if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+                }, 30000);
+            };
+
+            ws.onmessage = (event) => {
+                if (event.data === 'pong') return;
+                
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'history') {
+                        data.data.forEach(appendLog);
+                    } else {
+                        appendLog(data);
+                    }
+                } catch(e) {}
+            };
+
+            ws.onclose = () => {
+                document.getElementById('conn-status').className = 'status-badge status-disconnected';
+                document.getElementById('conn-status').innerText = '已断开 (点击重连)';
+                document.getElementById('conn-status').onclick = connect;
+                if(pingInterval) clearInterval(pingInterval);
+            };
+        }
+        
+        window.onload = connect;
+
+        function appendLog(log) {
+            const tbody = document.getElementById('log-body');
+            const tr = document.createElement('tr');
+            
+            const isSuccess = log.status_code === 200;
+            const statusClass = isSuccess ? 'status-200' : 'status-error';
+            
+            tr.innerHTML = `
+                <td>${log.timestamp.split(' ')[1]}</td>
+                <td><span class="source-badge">${log.source}</span></td>
+                <td class="msg-preview" title="${log.msg_preview.replace(/"/g, '&quot;')}">${log.msg_preview || '<span style="color:#cbd5e1">无用户消息/文件传输</span>'}</td>
+                <td>${log.is_stream ? 'Yes' : 'No'}</td>
+                <td class="status-code ${statusClass}">${log.status_code}</td>
+                <td>${log.duration_ms}ms</td>
+            `;
+            
+            // Insert at the top
+            tbody.insertBefore(tr, tbody.firstChild);
+            
+            // Keep max 200 rows in UI
+            if (tbody.children.length > 200) {
+                tbody.removeChild(tbody.lastChild);
+            }
+        }
+    </script>
+</body>
+</html>
