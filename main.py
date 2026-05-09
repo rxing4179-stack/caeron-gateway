@@ -43,6 +43,9 @@ logger = logging.getLogger('caeron')
 # 初始化供应商管理器（全局单例）
 provider_manager = ProviderManager()
 
+# 技术模式：跳过轮总触发和上下文压缩
+tech_mode = True  # 默认技术模式，手动切回日常时自动总结
+
 
 async def _summary_cron_loop():
     """后台定时任务：每天UTC 15:59（北京时间23:59）触发日总，周日额外触发周总，月末额外触发月总"""
@@ -106,7 +109,7 @@ async def lifespan(app: FastAPI):
             'unhealthy_since = NULL, fail_count = 0 WHERE is_enabled = 1'
         )
         await db.commit()
-        logger.info("已重置所有供应商健康状态")
+        logger.info("���重置所有供应商健康状态")
     finally:
         await db.close()
 
@@ -228,7 +231,7 @@ async def list_models(request: Request):
         if api_key:
             provider = await provider_manager.get_provider_by_api_key(api_key)
 
-        # 匹配不到则回退到默认（优先级最高的供应商）
+        # 匹配不到则回退������认（优先级最高的供应商）
         if not provider:
             logger.info(f"API Key 未匹配到供应商，回退到默认")
             provider = await provider_manager.get_provider("")
@@ -481,6 +484,7 @@ async def chat_completions(request: Request):
     
     # === Step 2.5: 主动轮总触发 ===
     # 每存入N条消息（跨对话累计），后台触发一次轮总
+    global tech_mode
     if stored_count > 0:
         try:
             trigger_threshold = int(await get_config('summary_interval', '16'))
@@ -492,8 +496,8 @@ async def chat_completions(request: Request):
                 current_count = int(row['value']) if row else 0
                 new_count = current_count + stored_count
                 
-                if new_count >= trigger_threshold:
-                    # 达到阈值，后台触发轮总
+                if new_count >= trigger_threshold and not tech_mode:
+                    # 达到阈值且非技术模式，后台触发轮总
                     logger.info(f"[AUTO_SUMMARY] 累计 {new_count} 条消息，触发轮总生成")
                     
                     # --- Bug 修复：防止异步并发导致的重复生成 ---
@@ -511,6 +515,8 @@ async def chat_completions(request: Request):
                             logger.error(f"[AUTO_SUMMARY] 轮总生成失败: {e}")
                     
                     asyncio.create_task(_bg_round_summary())
+                elif tech_mode and new_count >= trigger_threshold:
+                    logger.info(f"[AUTO_SUMMARY] 技术模式启用中，跳过轮总触发 (累计 {new_count} 条)")
                 
                 # 更新计数器
                 await db.execute(
@@ -582,11 +588,12 @@ async def chat_completions(request: Request):
     # === End Step 2.8 ===
 
     # === Step 3: 预处理 — 清理上下文膨胀源 ===
+    # 技术模式下仍然清理网关自身注入的残留（A/B类），但跳过C类（保留原始上下文）
     # Operit会保留上一轮网关注入的内容，如果不清理，每轮都会翻倍。
     # 需要清理三类残留：
     #   A. user_wrapped_system 消息 (role=user, <system>...</system>)
     #   B. context_summaries 系统消息 (role=system, <context_summaries>)  
-    #   C. Operit手动总结产生的巨型user消息 (role=user, 以摘要格式开头, >5000字符)
+    #   C. Operit手动��结产��的巨型user消息 (role=user, 以摘要格式开头, >5000字符)
     raw_msgs = body.get('messages', [])
     pre_dedup_count = len(raw_msgs)
     def _msg_chars(m):
@@ -702,8 +709,17 @@ async def chat_completions(request: Request):
                     c = c.replace('...', '').replace('…', '').strip()
                     msg['content'] = c if c else ' '
 
-    injection_engine = InjectionEngine()
-    body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
+    # 检查是否需要跳过注入引擎
+    skip_injection = request.headers.get('x-skip-injection', '').lower() == 'true'
+    
+    # 技术模式 或 QQ非蕊蕊来源(已自带QQ prompt) 跳过注入引擎
+    if tech_mode:
+        logger.info(f"[TECH_MODE] 技术模式启用，跳过注入引擎，保留原始 {len(body.get('messages', []))} 条消息")
+    elif skip_injection:
+        logger.info(f"[SKIP_INJECTION] 请求来源已自带提示词 (source={explicit_source})，跳过注入引擎")
+    else:
+        injection_engine = InjectionEngine()
+        body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
 
     # 打印最终发送给 API 的 context
     final_msg_count = len(body['messages'])
@@ -852,7 +868,7 @@ class FetchModelsRequest(BaseModel):
 
 @app.post("/admin/api/providers/fetch-models")
 async def admin_fetch_models(req: FetchModelsRequest):
-    """代理拉取上游模型列表"""
+    """代���拉取上游模型列表"""
     import httpx
     try:
         base_url = req.base_url.rstrip('/')
@@ -1290,6 +1306,57 @@ async def admin_delete_status(status_id: int):
         await db.close()
 
 
+@app.post("/admin/api/sync-memories")
+async def admin_sync_memories(request: Request):
+    """从Operit记忆库批量导入记忆到Gateway memories表（带embedding生成）"""
+    from embedding import get_embedding
+    body = await request.json()
+    items = body.get('memories', [])
+    if not items:
+        return {'success': False, 'error': 'no memories provided'}
+    
+    db = await get_db()
+    imported = 0
+    skipped = 0
+    try:
+        for item in items:
+            title = item.get('title', '')
+            content = item.get('content', '')
+            tags = item.get('tags', '')
+            source = item.get('source', 'operit_sync')
+            
+            # 用 title + content 的前200字符做去重检查
+            check_text = f"{title}: {content[:200]}"
+            cursor = await db.execute(
+                "SELECT id FROM memories WHERE category = 'operit' AND content LIKE ?",
+                (f"%{title[:50]}%",)
+            )
+            existing = await cursor.fetchone()
+            if existing:
+                skipped += 1
+                continue
+            
+            # 组合存储内容
+            full_content = f"[{title}] {content}"
+            if tags:
+                full_content += f" (标签: {tags})"
+            
+            # 生成embedding
+            emb = await get_embedding(full_content[:500])  # 取前500字做embedding
+            emb_str = json.dumps(emb) if emb else None
+            
+            await db.execute(
+                "INSERT INTO memories (content, category, embedding, created_at) VALUES (?, 'operit', ?, datetime('now', '+8 hours'))",
+                (full_content, emb_str)
+            )
+            imported += 1
+        
+        await db.commit()
+        return {'success': True, 'imported': imported, 'skipped': skipped, 'total': len(items)}
+    finally:
+        await db.close()
+
+
 @app.get("/admin/api/conversations/search")
 async def admin_search_messages(q: str, limit: int = 50):
     """搜索消息内容"""
@@ -1496,6 +1563,91 @@ async def save_summary_config(request: Request):
         return {"ok": True}
     finally:
         await db.close()
+
+# ==================== QQ Bot 配置 API ====================
+@app.get("/admin/api/qq-config")
+async def get_qq_config():
+    """获取QQ Bot配置"""
+    from qq_config import config as qq_config
+    qq_config.reload()
+    return {
+        'BOT_QQ': qq_config.BOT_QQ,
+        'RUIRUI_QQ': qq_config.RUIRUI_QQ,
+        'END_EMOJI': qq_config.END_EMOJI,
+        'SILENCE_TIMEOUT': qq_config.SILENCE_TIMEOUT,
+        'GROUP_KEYWORDS': ','.join(qq_config.GROUP_KEYWORDS),
+        'GROUP_BUFFER_SIZE': qq_config.GROUP_BUFFER_SIZE,
+        'GROUP_BUFFER_TIME': qq_config.GROUP_BUFFER_TIME,
+        'SESSION_MAX_TURNS': qq_config.SESSION_MAX_TURNS,
+        'REPLY_DELAY_MIN': qq_config.REPLY_DELAY_MIN,
+        'REPLY_DELAY_MAX': qq_config.REPLY_DELAY_MAX,
+        'DEFAULT_PROMPT': qq_config.DEFAULT_PROMPT,
+        'RUIRUI_PROMPT': qq_config.RUIRUI_PROMPT,
+        'DEFAULT_MODEL': qq_config.DEFAULT_MODEL
+    }
+
+@app.post("/admin/api/qq-config")
+async def save_qq_config(request: Request):
+    """保存QQ Bot配置"""
+    data = await request.json()
+    from qq_config import config as qq_config
+    if 'BOT_QQ' in data: qq_config.BOT_QQ = int(data['BOT_QQ'])
+    if 'RUIRUI_QQ' in data: qq_config.RUIRUI_QQ = int(data['RUIRUI_QQ'])
+    if 'END_EMOJI' in data: qq_config.END_EMOJI = data['END_EMOJI']
+    if 'SILENCE_TIMEOUT' in data: qq_config.SILENCE_TIMEOUT = int(data['SILENCE_TIMEOUT'])
+    if 'GROUP_KEYWORDS' in data: qq_config.GROUP_KEYWORDS = data['GROUP_KEYWORDS'].split(',')
+    if 'GROUP_BUFFER_SIZE' in data: qq_config.GROUP_BUFFER_SIZE = int(data['GROUP_BUFFER_SIZE'])
+    if 'GROUP_BUFFER_TIME' in data: qq_config.GROUP_BUFFER_TIME = int(data['GROUP_BUFFER_TIME'])
+    if 'SESSION_MAX_TURNS' in data: qq_config.SESSION_MAX_TURNS = int(data['SESSION_MAX_TURNS'])
+    if 'REPLY_DELAY_MIN' in data: qq_config.REPLY_DELAY_MIN = float(data['REPLY_DELAY_MIN'])
+    if 'REPLY_DELAY_MAX' in data: qq_config.REPLY_DELAY_MAX = float(data['REPLY_DELAY_MAX'])
+    if 'DEFAULT_PROMPT' in data: qq_config.DEFAULT_PROMPT = data['DEFAULT_PROMPT']
+    if 'RUIRUI_PROMPT' in data: qq_config.RUIRUI_PROMPT = data['RUIRUI_PROMPT']
+    if 'DEFAULT_MODEL' in data: qq_config.DEFAULT_MODEL = data['DEFAULT_MODEL']
+    qq_config.save()
+    return {"ok": True}
+
+# ==================== 技术模式 API ====================
+@app.get("/admin/api/tech-mode")
+async def get_tech_mode():
+    """获取技术模式状态"""
+    global tech_mode
+    return {"enabled": tech_mode}
+
+@app.post("/admin/api/tech-mode")
+async def set_tech_mode(request: Request):
+    """切换技术模式"""
+    global tech_mode
+    data = await request.json()
+    new_state = bool(data.get('enabled', False))
+    old_state = tech_mode
+    tech_mode = new_state
+    logger.info(f"[TECH_MODE] 技术模式切换: {old_state} → {new_state}")
+    
+    # 从技术模式切回正常模式时，自动触发一次轮总，压缩技术模式期间积累的消息
+    if old_state and not new_state:
+        logger.info("[TECH_MODE] 切回正常模式，自动触发一次轮总压缩积累的消息")
+        async def _bg_catchup_summary():
+            try:
+                summarizer = get_summarizer()
+                result = await summarizer.generate_round_summary()
+                logger.info(f"[TECH_MODE] 切回后轮总完成 ({len(result) if result else 0} 字符)")
+                # 重置计数器
+                db = await get_db()
+                try:
+                    await db.execute(
+                        "INSERT INTO config (key, value, description) VALUES ('_msg_counter', '0', '轮总触发计数器') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '0'"
+                    )
+                    await db.commit()
+                    logger.info("[TECH_MODE] 计数器已重置为 0")
+                finally:
+                    await db.close()
+            except Exception as e:
+                logger.error(f"[TECH_MODE] 切回后轮总失败: {e}")
+        asyncio.create_task(_bg_catchup_summary())
+    
+    return {"ok": True, "enabled": tech_mode}
 
 @app.post("/admin/api/trigger-round-summary")
 async def trigger_round_summary():

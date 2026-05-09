@@ -110,7 +110,16 @@ Line: ' + line + ', Col: ' + col + '
             <h1 class="text-xl font-bold bg-gradient-to-r from-blue-400 to-cyan-300 bg-clip-text text-transparent">
                 Caeron Gateway
             </h1>
-            <div class="text-xs text-[#5a7a7d] font-mono">v0.1.0</div>
+            <div class="flex items-center gap-3">
+                <!-- 技术模式开关 -->
+                <div class="flex items-center gap-1.5 select-none cursor-pointer" @click="toggleTechMode()">
+                    <span class="text-[10px] font-medium" :class="techMode ? 'text-amber-500' : 'text-[#5a7a7d]'">{{ techMode ? '⚙ 技术' : '💬 日常' }}</span>
+                    <div class="relative w-9 h-5 rounded-full transition-colors duration-300" :class="techMode ? 'bg-amber-400' : 'bg-[#aecfd1]'">
+                        <div class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-md transition-all duration-300" :class="techMode ? 'left-[18px]' : 'left-0.5'"></div>
+                    </div>
+                </div>
+                <div class="text-xs text-[#5a7a7d] font-mono">v0.1.0</div>
+            </div>
         </header>
 
         <nav class="flex overflow-x-auto hide-scrollbar border-b border-[#aecfd1] bg-white px-2">
@@ -120,6 +129,7 @@ Line: ' + line + ', Col: ' + col + '
             <button @click="currentTab = 'memory'; fetchSummaries(); fetchSummaryStats(); fetchSummaryConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'memory', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'memory'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">记忆总览</button>
             <button @click="currentTab = 'status'; fetchStatus()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'status', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'status'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">状态便签</button>
             <button @click="currentTab = 'recall'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'recall', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'recall'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">向量召回</button>
+            <button @click="currentTab = 'qq_config'; fetchQQConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'qq_config', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'qq_config'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">QQ设置</button>
             <a href="/games/snake" target="_blank" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors text-[#5a7a7d] hover:text-[#4199a0] inline-flex items-center">小游戏</a>
         </nav>
 
@@ -760,6 +770,131 @@ Line: ' + line + ', Col: ' + col + '
                     </div>
                 </div>
             </section>
+
+            <!-- QQ设置 -->
+            <section v-show="currentTab === 'qq_config'">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-lg font-semibold text-[#2c3e50]">QQ Bot 配置</h2>
+                    <button @click="saveQQConfig()" :disabled="loading.qqConfig" class="bg-[#4199a0] hover:bg-[#77b5b4] text-white px-4 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 flex items-center">
+                        <span v-if="loading.qqConfig" class="mr-2">
+                            <svg class="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                        </span>
+                        保存配置
+                    </button>
+                </div>
+                
+                <div v-if="loading.fetchQqConfig" class="text-center py-8 text-[#5a7a7d]">加载配置中...</div>
+                <div v-else class="space-y-4">
+                    
+                    <!-- 核心模型配置 -->
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4">
+                        <h3 class="text-sm font-semibold text-[#2c3e50] mb-3 pb-2 border-b border-[#aecfd1]/50">核心模型配置</h3>
+                        <div class="space-y-3">
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">默认调用模型</label>
+                                <select v-model="qqConfig.DEFAULT_MODEL" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0] focus:ring-1 focus:ring-[#4199a0]">
+                                    <optgroup v-for="p in providers" :key="p.id" :label="p.name">
+                                        <option v-for="m in parseModels(p.supported_models)" :key="m" :value="m">{{ m }}</option>
+                                    </optgroup>
+                                    <option v-if="qqConfig.DEFAULT_MODEL && !allAvailableModels.includes(qqConfig.DEFAULT_MODEL)" :value="qqConfig.DEFAULT_MODEL">
+                                        {{ qqConfig.DEFAULT_MODEL }} (当前自定义)
+                                    </option>
+                                </select>
+                                <p class="text-[10px] text-[#77b5b4] mt-1">选择网关中已配置供应商支持的模型。如果选中的模型不可用，将返回 502/503 错误。</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 提示词配置 -->
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4">
+                        <h3 class="text-sm font-semibold text-[#2c3e50] mb-3 pb-2 border-b border-[#aecfd1]/50">人格提示词 (System Prompt)</h3>
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">QQ 社交人格 (通用)</label>
+                                <textarea v-model="qqConfig.DEFAULT_PROMPT" rows="8" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-xs text-[#2c3e50] focus:outline-none focus:border-[#4199a0] font-mono" placeholder="输入通用的 QQ 机器人人格设定..."></textarea>
+                                <p class="text-[10px] text-[#77b5b4] mt-1">适用于所有 QQ 消息来源的基础人格设定。</p>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">蕊蕊专属规则 (追加)</label>
+                                <textarea v-model="qqConfig.RUIRUI_PROMPT" rows="4" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-xs text-[#2c3e50] focus:outline-none focus:border-[#4199a0] font-mono" placeholder="输入对蕊蕊的特殊规则设定..."></textarea>
+                                <p class="text-[10px] text-[#77b5b4] mt-1">当发送者为蕊蕊时，此规则将追加在基础人格之后。</p>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">蕊蕊 QQ 专属提示词 (独立)</label>
+                                <textarea v-model="qqConfig.RUIRUI_QQ_PROMPT" rows="10" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-2 text-xs text-[#2c3e50] focus:outline-none focus:border-[#4199a0] font-mono" placeholder="输入蕊蕊QQ私聊的独立提示词..."></textarea>
+                                <p class="text-[10px] text-[#77b5b4] mt-1">蕊蕊私聊时使用此独立提示词，不与通用QQ人格叠加。态度亲密但遵守QQ短消息格式。</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 基础参数配置 -->
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4">
+                        <h3 class="text-sm font-semibold text-[#2c3e50] mb-3 pb-2 border-b border-[#aecfd1]/50">基础参数</h3>
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">Bot QQ号</label>
+                                <input v-model.number="qqConfig.BOT_QQ" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-1.5 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">蕊蕊 QQ号</label>
+                                <input v-model.number="qqConfig.RUIRUI_QQ" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-1.5 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">私聊静默超时(秒)</label>
+                                <input v-model.number="qqConfig.SILENCE_TIMEOUT" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-1.5 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                                <p class="text-[10px] text-[#77b5b4] mt-0.5">多久不说话认为一波消息发完</p>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">结束符 Emoji</label>
+                                <input v-model="qqConfig.END_EMOJI" type="text" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-1.5 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                                <p class="text-[10px] text-[#77b5b4] mt-0.5">发此表情立即触发回复</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 群聊聚合配置 -->
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4">
+                        <h3 class="text-sm font-semibold text-[#2c3e50] mb-3 pb-2 border-b border-[#aecfd1]/50">群聊聚合</h3>
+                        <div class="space-y-3">
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">触发关键词 (英文逗号分隔)</label>
+                                <input v-model="qqConfig.GROUP_KEYWORDS" type="text" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-1.5 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]" placeholder="沈,杏仁,完能,浣熊">
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs font-medium text-[#5a7a7d] mb-1">上下文保留条数</label>
+                                    <input v-model.number="qqConfig.GROUP_BUFFER_SIZE" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-1.5 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-medium text-[#5a7a7d] mb-1">上下文保留时间(秒)</label>
+                                    <input v-model.number="qqConfig.GROUP_BUFFER_TIME" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-1.5 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 高级控制 -->
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4">
+                        <h3 class="text-sm font-semibold text-[#2c3e50] mb-3 pb-2 border-b border-[#aecfd1]/50">高级控制</h3>
+                        <div class="grid grid-cols-2 gap-3 mb-3">
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">回复分段延迟(最小/秒)</label>
+                                <input v-model.number="qqConfig.REPLY_DELAY_MIN" type="number" step="0.1" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-1.5 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-[#5a7a7d] mb-1">回复分段延迟(最大/秒)</label>
+                                <input v-model.number="qqConfig.REPLY_DELAY_MAX" type="number" step="0.1" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-1.5 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-[#5a7a7d] mb-1">Session最大保留轮次</label>
+                            <input v-model.number="qqConfig.SESSION_MAX_TURNS" type="number" class="w-full bg-white border border-[#aecfd1] rounded-lg px-3 py-1.5 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                            <p class="text-[10px] text-[#77b5b4] mt-0.5">送入模型的短期记忆上下文长度上限（结合记忆网关可保持较小值）</p>
+                        </div>
+                    </div>
+
+                </div>
+            </section>
         </main>
 
         <!-- 窗口创建/编辑弹窗 -->
@@ -1124,6 +1259,19 @@ Line: ' + line + ', Col: ' + col + '
                 const modelSearchText = ref('');
                 const selectedModels = ref([]);
 
+                // QQ Config状态
+                const qqConfig = ref({});
+
+                // 技术模式状态
+                const techMode = ref(false);
+                
+                const allAvailableModels = Vue.computed(() => {
+                    const models = new Set();
+                    providers.value.forEach(p => {
+                        parseModels(p.supported_models).forEach(m => models.add(m));
+                    });
+                    return Array.from(models);
+                });
                 
                 // 对话记录��态
                 const conversations = ref([]);
@@ -1249,6 +1397,77 @@ Line: ' + line + ', Col: ' + col + '
                 const confirmModelSelection = () => {
                     providerForm.supported_models = selectedModels.value.join(', ');
                     showModelModal.value = false;
+                };
+
+                // QQ Config API 调用
+                const fetchQQConfig = async () => {
+                    loading.fetchQqConfig = true;
+                    try {
+                        const res = await fetch('/admin/api/qq-config');
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        const data = await res.json();
+                        if (typeof data.GROUP_KEYWORDS === 'string') {
+                            qqConfig.value = data;
+                        } else {
+                            qqConfig.value = data;
+                        }
+                    } catch (error) {
+                        showToast(`加载QQ配置失败: ${error.message}`, 'error');
+                    } finally {
+                        loading.fetchQqConfig = false;
+                    }
+                };
+
+                const saveQQConfig = async () => {
+                    loading.qqConfig = true;
+                    try {
+                        const res = await fetch('/admin/api/qq-config', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(qqConfig.value)
+                        });
+                        if (!res.ok) {
+                            const err = await res.json();
+                            throw new Error(err.detail || '保存失败');
+                        }
+                        showToast('QQ配置已保存生效', 'success');
+                    } catch (error) {
+                        showToast(error.message, 'error');
+                    } finally {
+                        loading.qqConfig = false;
+                    }
+                };
+
+                // 技术模式 API
+                const fetchTechMode = async () => {
+                    try {
+                        const res = await fetch('/admin/api/tech-mode');
+                        if (res.ok) {
+                            const data = await res.json();
+                            techMode.value = data.enabled;
+                        }
+                    } catch (e) { console.error('fetchTechMode:', e); }
+                };
+                const toggleTechMode = async () => {
+                    const newState = !techMode.value;
+                    try {
+                        const res = await fetch('/admin/api/tech-mode', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ enabled: newState })
+                        });
+                        if (res.ok) {
+                            const data = await res.json();
+                            techMode.value = data.enabled;
+                            if (data.enabled) {
+                                showToast('已切换至技术模式：跳过总结，保留原始上下文', 'info');
+                            } else {
+                                showToast('已切回日常模式：自动触发轮总压缩积累的消息', 'success');
+                            }
+                        }
+                    } catch (e) {
+                        showToast('切换失败: ' + e.message, 'error');
+                    }
                 };
                 // API 调用
                 const fetchProviders = async () => {
@@ -1416,7 +1635,7 @@ Line: ' + line + ', Col: ' + col + '
                     const c = msg.content.trim();
                     // Operit原生摘要
                     if (msg.role === 'user' && c.startsWith('==========对话摘要')) return true;
-                    // 网关注入的轮总/日总/周总/月总 (可能被Operit转为user角色)
+                    // 网关注入的轮总/日总/周总/月总 (可��被Operit转为user角色)
                     if (/^\[(?:轮总总?|日总|周总|月总)/.test(c)) return true;
                     if (/^(?:- )?\[(?:轮总总?|日总|周总|月总)/.test(c)) return true;
                     // 以 【日常】【技术】【学习】 开头的轮总内容
@@ -1428,7 +1647,7 @@ Line: ' + line + ', Col: ' + col + '
                     const c = msg.content.trim();
                     if (c.startsWith('==========对话摘要')) return '对话摘要';
                     if (/^\[轮总总/.test(c) || /^- \[轮总总/.test(c)) return '轮总总';
-                    if (/^\[轮总/.test(c) || /^- \[轮总/.test(c)) return '轮总';
+                    if (/^\[轮总/.test(c) || /^- \[轮���/.test(c)) return '轮总';
                     if (/^\[日总/.test(c) || /^- \[日总/.test(c)) return '日总';
                     if (/^\[周总/.test(c) || /^- \[周总/.test(c)) return '周总';
                     if (/^\[月总/.test(c) || /^- \[月总/.test(c)) return '月总';
@@ -2067,6 +2286,7 @@ Line: ' + line + ', Col: ' + col + '
                 onMounted(() => {
                     fetchProviders();
                     fetchRules();
+                    fetchTechMode();
                 });
 
                 return {
@@ -2090,7 +2310,9 @@ Line: ' + line + ', Col: ' + col + '
                     summaries, summaryStats, summaryFilter, summaryActiveOnly, summaryConfig,
                     fetchSummaries, fetchSummaryStats, deleteSummary, fetchSummaryConfig, saveSummaryConfig, triggerRoundSummary, groupedConversations, expandedConvs, loadingConvs, messagesMap,
                     statusList, showStatusModal, editingStatus, statusForm, fetchStatus, openAddStatusModal, editStatus, saveStatus, deleteStatus,
-                    recallInputText, recallResults, hasSearchedRecall, testRecall
+                    recallInputText, recallResults, hasSearchedRecall, testRecall,
+                    qqConfig, allAvailableModels, fetchQQConfig, saveQQConfig,
+                    techMode, fetchTechMode, toggleTechMode
                 };
             }
         });
