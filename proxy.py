@@ -49,6 +49,48 @@ async def proxy_chat_completion(request_body: dict, provider: dict, conversation
     根据 stream 参数自动选择流式或非流式转发
     conversation_id: 可选，传入时会自动存储AI回复
     """
+    # === 修复：确保消息以user结尾（部分模型不支持assistant prefill）===
+    pre_msgs = request_body.get('messages', [])
+    if pre_msgs and pre_msgs[-1].get('role') == 'assistant':
+        pre_msgs.pop()
+        logger.info(f"[PROXY_PREFILL_FIX] 删除末尾assistant消息，确保以user结尾")
+
+    # === 最终安全网：清理 tool 调用（OpenAI格式和Claude格式都处理）===
+    msgs = request_body.get('messages', [])
+    cleaned_msgs = []
+    tool_stripped = 0
+    for msg in msgs:
+        role = msg.get('role', '')
+        # 删掉所有 role=tool 消息
+        if role == 'tool':
+            tool_stripped += 1
+            continue
+        if role == 'assistant':
+            msg = dict(msg)  # 避免修改原对象
+            # OpenAI格式：删掉 tool_calls 字段
+            if 'tool_calls' in msg:
+                del msg['tool_calls']
+            # Claude格式：content是list且含tool_use
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                has_tool = any(isinstance(b, dict) and b.get('type') == 'tool_use' for b in content)
+                if has_tool:
+                    text_parts = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text']
+                    msg['content'] = '\n'.join(text_parts) if text_parts else ''
+            elif isinstance(content, str) and 'tool_use' in content:
+                try:
+                    import json as _json
+                    parsed = _json.loads(content)
+                    if isinstance(parsed, list):
+                        text_parts = [b.get('text', '') for b in parsed if isinstance(b, dict) and b.get('type') == 'text']
+                        msg['content'] = '\n'.join(text_parts) if text_parts else ''
+                except:
+                    pass
+        cleaned_msgs.append(msg)
+    request_body['messages'] = cleaned_msgs
+    if tool_stripped > 0:
+        logger.info(f"[PROXY_TOOL_CLEANUP] 清理 {tool_stripped} 条 tool 消息")
+
     upstream_url = build_upstream_url(provider['api_base_url'])
     is_stream = request_body.get('stream', False)
 

@@ -76,7 +76,7 @@ DAILY_SUMMARY_PROMPT = """你是日总结器。将今天的所有轮总压缩为
 - 禁止复述每条轮总的原文，要合并同类事项
 - 允许保留1-2个能让这天"活过来"的具体细节
 - 禁止笼统情感评价（如"度过了充实的一天""感情更进一步"）
-- 格式：纯文本，一段话���句号分隔
+- 格式：纯文本，一段话����句号分隔
 - 主语用蕊蕊和沈栖
 """
 
@@ -358,7 +358,14 @@ class MultiLevelSummarizer:
                 if conv_id == "qq-ruirui" or not conv_id.startswith("qq-"):
                     role_label = "蕊蕊"
                 elif conv_id.startswith("qq-group-"):
-                    role_label = f"群友(群{conv_id.split('-')[-1]})"
+                    # 从content里提取 [发送者] 标签
+                    import re as _re
+                    _sender_match = _re.match(r'\[(?:触发消息 - |)(.+?)\]', content)
+                    if _sender_match:
+                        _sender = _sender_match.group(1)
+                        role_label = f"{_sender}(群{conv_id.split('-')[-1]})"
+                    else:
+                        role_label = f"群友(群{conv_id.split('-')[-1]})"
                 elif conv_id.startswith("qq-private-"):
                     role_label = f"QQ用户({conv_id.split('-')[-1]})"
                 else:

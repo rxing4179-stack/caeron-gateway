@@ -1377,7 +1377,8 @@ Line: ' + line + ', Col: ' + col + '
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 base_url: providerForm.api_base_url,
-                                api_key: providerForm.api_key || (editingProvider.value ? editingProvider.value.api_key : '')
+                                api_key: providerForm.api_key || '',
+                                provider_id: editingProvider.value ? editingProvider.value.id : 0
                             })
                         });
                         const data = await res.json();
@@ -1547,7 +1548,7 @@ Line: ' + line + ', Col: ' + col + '
                         if (data.success) {
                             showToast(data.message, 'success');
                         } else {
-                            showToast(`测试失败: ${data.error}`, 'error');
+                            showToast(`测��失败: ${data.error}`, 'error');
                         }
                         
                         // 刷新列表�������更新健康状态
@@ -1948,7 +1949,7 @@ Line: ' + line + ', Col: ' + col + '
                 };
 
                 const saveWindow = async () => {
-                    if (!windowForm.name.trim()) { showToast('窗口名称不能为空', 'error'); return; }
+                    if (!windowForm.name.trim()) { showToast('窗口名称���能为空', 'error'); return; }
                     try {
                         if (editingWindow.value) {
                             const res = await fetch(`/admin/api/windows/${editingWindow.value.window_id}`, {

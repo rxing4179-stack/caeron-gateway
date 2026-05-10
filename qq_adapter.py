@@ -204,8 +204,149 @@ async def handle_generation(session_id: str, source: str, target_type: str, targ
     
     try:
         await _do_generation(session_id, source, target_type, target_id, user_input, is_ruirui)
+    except Exception as e:
+        import traceback
+        print(f"[QQ] [ERROR] handle_generation异常: {e}", flush=True)
+        traceback.print_exc()
     finally:
         qq_state.generating[session_id] = False
+
+async def _get_context_injection():
+    """获取轮总/日总/周总/月总 + 状态便签，返回 (text, unsummarized_count, has_summaries)"""
+    from utils import now_cst, today_cst_str
+    db = await get_db()
+    try:
+        parts = []
+        today = today_cst_str()
+        
+        # 月总：最新2条
+        cursor = await db.execute(
+            "SELECT content, created_at FROM summaries WHERE tag = 'monthly' AND is_active = 1 ORDER BY created_at DESC LIMIT 2"
+        )
+        for r in reversed(await cursor.fetchall()):
+            r = dict(r)
+            parts.append(f"- [月总] [{r['created_at']}] {r['content']}")
+        
+        # 周总：最新1条
+        cursor = await db.execute(
+            "SELECT content, created_at FROM summaries WHERE tag = 'weekly' AND is_active = 1 ORDER BY created_at DESC LIMIT 1"
+        )
+        rows = await cursor.fetchall()
+        latest_weekly_time = None
+        for r in rows:
+            r = dict(r)
+            latest_weekly_time = r['created_at']
+            parts.append(f"- [周总] [{r['created_at']}] {r['content']}")
+        
+        # 日总
+        if latest_weekly_time:
+            cursor = await db.execute(
+                "SELECT content, created_at FROM summaries WHERE tag = 'daily' AND is_active = 1 AND created_at > ? ORDER BY created_at ASC LIMIT 7",
+                (latest_weekly_time,)
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT content, created_at FROM summaries WHERE tag = 'daily' AND is_active = 1 ORDER BY created_at DESC LIMIT 3"
+            )
+        rows = await cursor.fetchall()
+        if not latest_weekly_time:
+            rows = list(reversed(rows))
+        for r in rows:
+            r = dict(r)
+            parts.append(f"- [日总] [{r['created_at']}] {r['content']}")
+        
+        # 轮总总：当天+昨天
+        from datetime import timedelta
+        yesterday = (now_cst() - timedelta(days=1)).strftime('%Y-%m-%d')
+        cursor = await db.execute(
+            "SELECT content, created_at FROM summaries WHERE tag = 'round_rollup' AND is_active = 1 AND date(created_at) IN (?, ?) ORDER BY created_at DESC LIMIT 8",
+            (today, yesterday)
+        )
+        rollup_rows = list(reversed(await cursor.fetchall()))
+        for idx, r in enumerate(rollup_rows, 1):
+            r = dict(r)
+            parts.append(f"- [轮总总 #{idx}/{len(rollup_rows)}] [{r['created_at']}] {r['content']}")
+        
+        # 轮总：当天+昨天
+        cursor = await db.execute(
+            "SELECT content, created_at FROM summaries WHERE tag = 'round' AND is_active = 1 AND date(created_at) IN (?, ?) ORDER BY created_at DESC LIMIT 8",
+            (today, yesterday)
+        )
+        round_rows = list(reversed(await cursor.fetchall()))
+        total = len(round_rows)
+        for idx, r in enumerate(round_rows, 1):
+            r = dict(r)
+            parts.append(f"- [轮总 #{idx}/{total}] [{r['created_at']}] {r['content']}")
+        
+        # 状态便签
+        cursor = await db.execute("SELECT content, updated_at, threshold_hours FROM memories WHERE category = 'status'")
+        status_rows = await cursor.fetchall()
+        status_lines = []
+        if status_rows:
+            status_lines.append("[状态便签]")
+            now = now_cst()
+            for r in status_rows:
+                key = r['content']
+                updated_at_str = r['updated_at']
+                threshold = r['threshold_hours'] or 24
+                if not updated_at_str:
+                    status_lines.append(f"- {key}: 未记录")
+                    continue
+                try:
+                    updated_at = datetime.strptime(updated_at_str, '%Y-%m-%d %H:%M:%S')
+                    diff_hours = (now - updated_at).total_seconds() / 3600.0
+                    diff_str = f"{diff_hours*60:.0f}m前" if diff_hours < 1 else f"{diff_hours:.1f}h前"
+                    state = "正常" if diff_hours < threshold else "超时"
+                    status_lines.append(f"- {key}: {diff_str} ({state})")
+                except:
+                    status_lines.append(f"- {key}: {updated_at_str}")
+            status_lines.append("[/状态便签]")
+        
+        # 组装
+        result_parts = []
+        if status_lines:
+            result_parts.extend(status_lines)
+        if parts:
+            result_parts.append(f"[对话记忆摘要]")
+            result_parts.append(f"以下���������������������今天（{today}）的对话记忆摘要：")
+            result_parts.extend(parts)
+            result_parts.append("[/对话记忆摘要]")
+        
+        # 读取当前消息计数器（未总结消息数）
+        unsummarized_count = 0
+        try:
+            cursor2 = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")
+            row2 = await cursor2.fetchone()
+            unsummarized_count = int(row2['value']) if row2 else 0
+        except:
+            pass
+        
+        has_summaries = bool(parts) or bool(status_lines)
+        text = "\n".join(result_parts) if result_parts else ""
+        return (text, unsummarized_count, has_summaries)
+    except Exception as e:
+        logger.error(f"[QQ] 轮总注入获取失败: {e}")
+        return ("", 0, False)
+    finally:
+        await db.close()
+
+async def _get_daily_info() -> str:
+    """获取当前时间+天气信息"""
+    from utils import now_cst
+    now = now_cst()
+    weekdays = ['一', '二', '三', '四', '五', '六', '日']
+    lines = [f"【当前时间】{now.strftime('%Y-%m-%d %H:%M')} 星期{weekdays[now.weekday()]}"]
+    
+    # 轻量天气（异步，超时不阻塞）
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get("https://wttr.in/Chongqing?format=%C+%t+%h", headers={"Accept-Language": "zh"})
+            if resp.status_code == 200:
+                lines.append(f"【重庆天气】{resp.text.strip()}")
+    except:
+        pass
+    
+    return "\n".join(lines)
 
 async def _do_generation(session_id: str, source: str, target_type: str, target_id: int, user_input: str, is_ruirui: bool = False):
     """实际生成逻辑"""
@@ -214,19 +355,43 @@ async def _do_generation(session_id: str, source: str, target_type: str, target_
     is_group = (target_type == "group")
     
     if is_ruirui:
-        # 蕊蕊：使用蕊蕊QQ专属提示词
         system_prompt = config.RUIRUI_QQ_PROMPT
     else:
-        # 非蕊蕊：使用QQ社交人格提示词
         system_prompt = get_qq_prompt(is_ruirui=False, is_group=is_group)
     
-    # 所有QQ来源都做记忆检索（用用户实际输入做向量查询）
+    # 1. 记忆检索（向量语义）
     memory = await retrieve_memory(user_input)
     if memory:
         system_prompt += f"\n\n[相关记忆片段]\n{memory}"
     
-    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_input}]
-    skip_injection = True  # 全部QQ来源跳过operit注入引擎，已有自己的prompt
+    # 2. 轮总/状态便签注入
+    injection_text, unsummarized_count, has_summaries = await _get_context_injection()
+    if injection_text:
+        system_prompt += f"\n\n{injection_text}"
+    
+    # 3. 轮总后裁剪上下文：有活跃总结时，只保留最近的未总结消息+buffer
+    if has_summaries and history:
+        buffer = 8
+        keep_count = max(unsummarized_count + buffer, 10)  # 至少保留10条
+        if len(history) > keep_count:
+            trimmed = len(history) - keep_count
+            history = history[-keep_count:]
+            logger.info(f"[QQ] [裁剪] 裁掉 {trimmed} 条已总结旧消息，保留 {keep_count} 条 (未总结:{unsummarized_count})")
+    
+    # 4. 日常信息（时间+天气）——作为独立system消息插在user消息前面，确保模型注意到
+    daily_info = await _get_daily_info()
+    
+    # system prompt用正常的system角色发（不要用<system>标签包裹，会被main.py去重逻辑strip掉）
+    messages = [{"role": "system", "content": system_prompt}] + history
+    if daily_info:
+        messages.append({"role": "system", "content": daily_info})
+    messages.append({"role": "user", "content": user_input})
+    skip_injection = True
+    
+    # DEBUG: 打印发给API的完整消息结构
+    for i, m in enumerate(messages):
+        c = m.get('content', '')
+        print(f"[QQ] [MSGS] msg[{i}] role={m['role']} len={len(c)} preview={c[:60]}", flush=True)  # 全部QQ来源跳过operit注入引擎，已有自己的prompt
     
     # 记录输入日志
     logger.info(f"[QQ] [{session_id}] [IN] {'(蕊蕊)' if is_ruirui else ''} {user_input[:50]}")
@@ -241,13 +406,16 @@ async def _do_generation(session_id: str, source: str, target_type: str, target_
 # ==================== 场景处理 ====================
 
 async def ruirui_timeout_handler():
+    print(f"[QQ] [DEBUG] ruirui_timeout_handler启动, 等待{config.SILENCE_TIMEOUT}秒", flush=True)
     await asyncio.sleep(config.SILENCE_TIMEOUT)
+    print(f"[QQ] [DEBUG] timeout到期, queue长度={len(qq_state.ruirui_queue)}", flush=True)
     if qq_state.ruirui_queue:
         combined = "\n".join(qq_state.ruirui_queue)
         qq_state.ruirui_queue.clear()
         asyncio.create_task(handle_generation("qq-ruirui", "qq-ruirui", "private", config.RUIRUI_QQ, combined, is_ruirui=True))
 
 async def process_ruirui(msg_content: str):
+    print(f"[QQ] [DEBUG] process_ruirui被调用: msg={msg_content[:30]}", flush=True)
     # 取消旧定时器
     if hasattr(qq_state, '_ruirui_timer') and qq_state._ruirui_timer:
         qq_state._ruirui_timer.cancel()
@@ -255,9 +423,9 @@ async def process_ruirui(msg_content: str):
     qq_state.ruirui_queue.append(msg_content)
     
     if len(qq_state.ruirui_queue) > 50:
-        logger.warning("[QQ] 蕊蕊缓存队列超过50条！")
+        logger.warning("[QQ] 蕊蕊缓存队列超过50条��")
     
-    # 设置新定时器 (和其他人一样用 SILENCE_TIMEOUT)
+    # ��置新定时器 (和其他人一样用 SILENCE_TIMEOUT)
     qq_state._ruirui_timer = asyncio.create_task(ruirui_timeout_handler())
 
 async def private_timeout_handler(qq: int):
@@ -301,9 +469,9 @@ async def process_group(group_id: int, sender_name: str, msg_content: str, raw_d
         is_triggered = True
         msg_content = msg_content.replace(f"[CQ:at,qq={config.BOT_QQ}]", "").strip()
     
-    # 2. 引用回复触发 (回复Bot的消息)
+    # 2. 引用回复触发 (仅回复Bot自己的消息才触发)
     if not is_triggered:
-        if f"[CQ:reply," in msg_content:
+        if f"[CQ:reply," in msg_content and f"[CQ:at,qq={config.BOT_QQ}]" in msg_content:
             is_triggered = True
             msg_content = re.sub(r'\[CQ:reply,id=[^\]]*\]', '', msg_content)
             msg_content = re.sub(r'\[CQ:at,qq=\d+\]', '', msg_content).strip()
@@ -332,6 +500,7 @@ async def process_group(group_id: int, sender_name: str, msg_content: str, raw_d
 async def qq_ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     qq_state.ws = websocket
+    print("[QQ] NapCat WebSocket 已连接", flush=True)
     logger.info("[QQ] NapCat WebSocket 已连接")
     
     # 连接后自动拉取好友列表缓存备注
@@ -352,6 +521,7 @@ async def qq_ws_endpoint(websocket: WebSocket):
                 sender = data.get("sender", {})
                 user_id = sender.get("user_id")
                 raw_message = data.get("raw_message", "")
+                print(f"[QQ] 收到消息: type={msg_type} user={user_id} raw={raw_message[:50]}", flush=True)
                 
                 # 过滤Bot自身消息，防止回复循环
                 self_id = data.get("self_id")
@@ -398,7 +568,7 @@ async def qq_ws_endpoint(websocket: WebSocket):
                     # 更新本地缓存
                     qq_state.friend_remarks[user_id] = comment if comment else str(user_id)
                     
-                    # 通过后延迟一下再设备注（有些协议端需要先通过再改备注）
+                    # 通过后延迟一下再设��注（有些协议端需要先通过再改备注）
                     async def _set_remark():
                         await asyncio.sleep(3)
                         if qq_state.ws and comment:
@@ -427,8 +597,10 @@ async def qq_ws_endpoint(websocket: WebSocket):
                 pass
                 
     except WebSocketDisconnect:
+        print("[QQ] NapCat WebSocket 断开连接", flush=True)
         logger.warning("[QQ] NapCat WebSocket 断开连接")
         qq_state.ws = None
     except Exception as e:
+        print(f"[QQ] WebSocket 处理异常: {e}", flush=True)
         logger.error(f"[QQ] WebSocket 处理异���: {e}")
         qq_state.ws = None

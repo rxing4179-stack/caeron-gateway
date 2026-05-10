@@ -109,7 +109,7 @@ async def lifespan(app: FastAPI):
             'unhealthy_since = NULL, fail_count = 0 WHERE is_enabled = 1'
         )
         await db.commit()
-        logger.info("���重置所有供应商健康状态")
+        logger.info("���������重置所有供应商健康状态")
     finally:
         await db.close()
 
@@ -215,6 +215,21 @@ async def health_check():
         "name": "Caeron Gateway"
     }
 
+@app.get("/napcat/qr")
+async def napcat_qr():
+    """实时获取NapCat登录二维码"""
+    import subprocess, tempfile, os
+    try:
+        tmp = '/tmp/napcat_qr_live.png'
+        subprocess.run(['sudo', 'docker', 'cp', 'napcat:/app/napcat/cache/qrcode.png', tmp],
+                      capture_output=True, timeout=5)
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            return FileResponse(tmp, media_type='image/png')
+        else:
+            return JSONResponse({'error': 'QR code not found'}, status_code=404)
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=500)
+
 
 @app.get("/v1/models")
 async def list_models(request: Request):
@@ -231,7 +246,7 @@ async def list_models(request: Request):
         if api_key:
             provider = await provider_manager.get_provider_by_api_key(api_key)
 
-        # 匹配不到则回退������认（优先级最高的供应商）
+        # 匹配不到则回���������认（优先级最高的供应商）
         if not provider:
             logger.info(f"API Key 未匹配到供应商，回退到默认")
             provider = await provider_manager.get_provider("")
@@ -261,6 +276,18 @@ async def chat_completions(request: Request):
     3. 尝试转发，失败时自动 fallback（最多重试 2 次）
     4. 全部失败返回 502
     """
+    # 全局异常捕获（调试500用）
+    try:
+        return await _handle_chat_completions(request)
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        logger.error(f"[FATAL] chat_completions 未捕获异常: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def _handle_chat_completions(request: Request):
     # 解析请求体
     try:
         body = await request.json()
@@ -331,7 +358,7 @@ async def chat_completions(request: Request):
                     break
     
     if not is_summary_request:
-        # 调试日志：打印所有system消息的前200字符，帮助排查漏网的总结请求
+        # 调试日志：打印所有system消息的前200字符，帮助排查漏网的总��请求
         for i, msg in enumerate(body.get('messages', [])):
             if msg.get('role') == 'system':
                 preview = str(msg.get('content', ''))[:200]
@@ -697,6 +724,42 @@ async def chat_completions(request: Request):
     logger.info(f"[SIZE] 注入前: {len(body.get('messages', []))} 条消息, {post_dedup_chars} 字符 "
                 f"(去重前 {pre_dedup_count} 条, {pre_dedup_chars} 字符)")
 
+    # === Bug 0.5 修复：彻底清理 tool 调用链 ===
+    # DEBUG: 打印清理前的messages结构
+    for i, _m in enumerate(body.get('messages', [])[:5]):
+        _c = _m.get('content', '')
+        _ct = type(_c).__name__
+        logger.info(f"[TOOL_DEBUG_PRE] msg[{i}] role={_m.get('role')} content_type={_ct} len={len(str(_c))} has_tool_use={'tool_use' in str(_c)[:500]}")
+    logger.info(f"[TOOL_DEBUG_PRE] total msgs: {len(body.get('messages', []))}, tool msgs: {sum(1 for m in body.get('messages', []) if m.get('role')=='tool')}")
+
+    # Claude API 要求 tool_use 和 tool_result 严格配对，否则 400 错误
+    # 最安全做法：删掉所有 role=tool 消息，并清理 assistant 消息中的 tool_use blocks
+    msgs = body.get('messages', [])
+    cleaned = []
+    tool_strip_count = 0
+    for msg in msgs:
+        if msg.get('role') == 'tool':
+            tool_strip_count += 1
+            continue
+        # assistant消息如果content是list且含tool_use block，只保留text部分
+        if msg.get('role') == 'assistant':
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                text_blocks = [b for b in content if isinstance(b, dict) and b.get('type') == 'text']
+                non_tool_blocks = [b for b in content if not isinstance(b, dict) or b.get('type') != 'tool_use']
+                if len(non_tool_blocks) != len(content):
+                    # 有tool_use被剥掉了，重组content
+                    if text_blocks:
+                        msg = dict(msg)
+                        msg['content'] = '\n'.join(b.get('text', '') for b in text_blocks)
+                    else:
+                        msg = dict(msg)
+                        msg['content'] = ''
+        cleaned.append(msg)
+    if tool_strip_count > 0:
+        body['messages'] = cleaned
+        logger.info(f"[TOOL_CLEANUP] 清理 {tool_strip_count} 条 tool 消息及对应 tool_use blocks")
+
     # === Bug 1 修复：清理幽灵省略号 ===
     # 客户端在仅发送图片/空消息时可能使用 "..." 或 "…" 占位，导致 AI 误解
     for msg in body.get('messages', []):
@@ -741,7 +804,7 @@ async def chat_completions(request: Request):
     # 尝试转发，最多 5 次（主供应商 + 健康fallback + 冷却期到期的供应商）
     last_error = None
     tried_ids = set()
-    used_cooled_down = False  # 是否已经尝试过冷却期到期的供应商
+    used_cooled_down = False  # 是否已经尝试过冷却期到期的���应商
 
     for attempt in range(5):
         # 跳过已尝试的供应商
@@ -863,25 +926,46 @@ async def admin_test_provider(provider_id: int):
 from pydantic import BaseModel
 
 class FetchModelsRequest(BaseModel):
-    base_url: str
-    api_key: str
+    base_url: str = ''
+    api_key: str = ''
+    provider_id: int = 0
 
 @app.post("/admin/api/providers/fetch-models")
 async def admin_fetch_models(req: FetchModelsRequest):
     """代���拉取上游模型列表"""
     import httpx
     try:
-        base_url = req.base_url.rstrip('/')
+        api_key = req.api_key
+        base_url = req.base_url.rstrip('/') if req.base_url else ''
+        
+        # 如果没传 api_key 但传了 provider_id，从数据库取原始 key
+        if not api_key and req.provider_id:
+            db = await get_db()
+            try:
+                cursor = await db.execute('SELECT api_key, api_base_url FROM providers WHERE id = ?', (req.provider_id,))
+                row = await cursor.fetchone()
+                if row:
+                    api_key = row['api_key']
+                    if not base_url:
+                        base_url = row['api_base_url'].rstrip('/')
+            finally:
+                await db.close()
+        
+        if not api_key:
+            raise HTTPException(status_code=400, detail="API Key 为空，请先填写并保存后再拉取")
+        
         url = f"{base_url}/models"
-        headers = {"Authorization": f"Bearer {req.api_key}"}
+        headers = {"Authorization": f"Bearer {api_key}"}
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, headers=headers, timeout=10.0)
+            resp = await client.get(url, headers=headers, timeout=15.0)
             resp.raise_for_status()
             data = resp.json()
             models = [m.get('id') for m in data.get('data', []) if m.get('id')]
             return {"models": models}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"获取模型����表失败: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"获取模型����表���败: {str(e)}")
 
 
 # ==================== 提示词注入规则 API ====================
@@ -1215,7 +1299,7 @@ async def admin_assign_conversations(window_id: int, request: Request):
     try:
         cur = await db.execute('SELECT id FROM windows WHERE id = ?', [window_id])
         if not await cur.fetchone():
-            return JSONResponse({'error': '窗口不存在'}, status_code=404)
+            return JSONResponse({'error': '窗���不存在'}, status_code=404)
         placeholders = ','.join(['?' for _ in conversation_ids])
         await db.execute(
             f'UPDATE conversations SET window_id = ? WHERE conversation_id IN ({placeholders})',
@@ -1632,7 +1716,7 @@ async def set_tech_mode(request: Request):
                 summarizer = get_summarizer()
                 result = await summarizer.generate_round_summary()
                 logger.info(f"[TECH_MODE] 切回后轮总完成 ({len(result) if result else 0} 字符)")
-                # 重置计数器
+                # 重置计数��
                 db = await get_db()
                 try:
                     await db.execute(

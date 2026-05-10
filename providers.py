@@ -30,7 +30,7 @@ class ProviderManager:
         """
         db = await get_db()
         try:
-            # 获取所有启用且健康的供应商，按优先级排序（数字越小越优先）
+            # 先查健康的供应商
             cursor = await db.execute('''
                 SELECT * FROM providers 
                 WHERE is_enabled = 1 AND is_healthy = 1 
@@ -38,18 +38,32 @@ class ProviderManager:
             ''')
             providers = [dict(row) for row in await cursor.fetchall()]
 
-            if not providers:
-                raise Exception("没有可用的供应商")
-
-            # 精确匹配：找到 supported_models 包含该 model 的供应商
+            # 精确匹配健康供应商
             if model:
                 for provider in providers:
                     supported = json.loads(provider.get('supported_models', '[]'))
                     if model in supported:
                         logger.info(f"模型 {model} 精确匹配供应商: {provider['name']}")
                         return provider
+            
+            # 健康供应商没匹配到，再查所有启用的（含不健康的）做精确匹配
+            if model:
+                cursor2 = await db.execute('''
+                    SELECT * FROM providers 
+                    WHERE is_enabled = 1
+                    ORDER BY priority ASC
+                ''')
+                all_providers = [dict(row) for row in await cursor2.fetchall()]
+                for provider in all_providers:
+                    supported = json.loads(provider.get('supported_models', '[]'))
+                    if model in supported:
+                        logger.info(f"模型 {model} 精确匹配供应商(含不健康): {provider['name']}")
+                        return provider
 
-            # 通配：返回优先级最高的供应商
+            if not providers:
+                raise Exception("没有可用的供应商")
+
+            # 通配：返回优先级最高的健康供应商
             logger.info(f"模型 {model} 无精确匹配，使用默认供应商: {providers[0]['name']}")
             return providers[0]
         finally:
@@ -210,7 +224,7 @@ class ProviderManager:
                     fields.append(f'{key} = ?')
                     values.append(data[key])
 
-            # 特殊处理 supported_models
+            # 特殊�����理 supported_models
             if 'supported_models' in data:
                 models = data['supported_models']
                 if isinstance(models, str):
@@ -280,7 +294,10 @@ class ProviderManager:
                     continue
 
                 cooldown = self._get_cooldown_seconds(p.get('fail_count', 1))
-                if (now - unhealthy_time).total_seconds() >= cooldown:
+                # 统一为naive datetime比较（数据库存的是naive CST字符串）
+                now_naive = now.replace(tzinfo=None) if now.tzinfo else now
+                uht_naive = unhealthy_time.replace(tzinfo=None) if unhealthy_time.tzinfo else unhealthy_time
+                if (now_naive - uht_naive).total_seconds() >= cooldown:
                     result.append(p)
                     logger.info(
                         f"供应商 {p['name']} 冷却期已过 "
