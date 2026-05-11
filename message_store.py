@@ -257,7 +257,19 @@ async def store_incoming_messages(conversation_id: str, messages: list):
         for i, msg in enumerate(new_messages):
             content = msg.get('content', '')
             if isinstance(content, list):
-                content = json.dumps(content, ensure_ascii=False)
+                # 多模态消息：提取文本，把base64图片替换为占位符，避免存储膨胀
+                text_parts = []
+                img_count = 0
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get('type') == 'text':
+                            text_parts.append(part.get('text', ''))
+                        elif part.get('type') == 'image_url':
+                            img_count += 1
+                            text_parts.append(f'[图片{img_count}]')
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                content = ' '.join(text_parts) if text_parts else json.dumps(content, ensure_ascii=False)
             
             await db.execute(
                 '''INSERT INTO messages (conversation_id, role, content, message_index, created_at)

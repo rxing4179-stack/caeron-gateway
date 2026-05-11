@@ -273,7 +273,7 @@ class MultiLevelSummarizer:
                 if last_row:
                     from datetime import datetime
                     last_time = datetime.strptime(last_row['created_at'], '%Y-%m-%d %H:%M:%S')
-                    now = now_cst()
+                    now = datetime.now()
                     diff_seconds = (now - last_time).total_seconds()
                     logger.info(f"[SUMMARIZER] 上次轮总时间: {last_row['created_at']} (距今 {diff_seconds:.1f} 秒)")
                     if diff_seconds < 180:
@@ -520,7 +520,7 @@ class MultiLevelSummarizer:
         try:
             today = today_cst_str()
             cursor = await db.execute(
-                """SELECT id, content, created_at, period_start, period_end FROM summaries
+                """SELECT id, content, created_at FROM summaries
                    WHERE tag = 'round' AND is_active = 1
                    AND date(created_at) = ?
                    ORDER BY created_at ASC
@@ -554,8 +554,8 @@ class MultiLevelSummarizer:
             level='round_rollup',
             content=rollup_content,
             msg_count=len(old_rounds),
-            period_start=old_rounds[0].get('period_start') or old_rounds[0]['created_at'],
-            period_end=old_rounds[-1].get('period_end') or old_rounds[-1]['created_at']
+            period_start=old_rounds[0]['created_at'],
+            period_end=old_rounds[-1]['created_at']
         )
         
         # 归档被压缩的轮总
@@ -864,19 +864,6 @@ class MultiLevelSummarizer:
                             msg_count: int = 0, period_start: str = None, period_end: str = None,
                             category: str = None, valence: float = None, arousal: float = None, anchor: str = None, tags: str = None):
         """保存总结到数据库"""
-        # 在content前添加时间跨度标记（admin面板+注入都能直接看到）
-        if period_start and period_end:
-            try:
-                ps_t = period_start[11:16] if len(period_start) >= 16 else period_start
-                pe_t = period_end[11:16] if len(period_end) >= 16 else period_end
-                ps_d = period_start[:10] if len(period_start) >= 10 else ''
-                pe_d = period_end[:10] if len(period_end) >= 10 else ''
-                if ps_d == pe_d:
-                    content = f"⏱{ps_t}~{pe_t} | {content}"
-                else:
-                    content = f"⏱{ps_d} {ps_t}~{pe_d} {pe_t} | {content}"
-            except Exception:
-                pass
         now_bj = now_cst().strftime('%Y-%m-%d %H:%M:%S')
         db = await get_db()
         try:

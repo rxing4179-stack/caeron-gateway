@@ -91,6 +91,33 @@ async def proxy_chat_completion(request_body: dict, provider: dict, conversation
     if tool_stripped > 0:
         logger.info(f"[PROXY_TOOL_CLEANUP] 清理 {tool_stripped} 条 tool 消息")
 
+    # === 修复：合并连续同角色消息（防止QQ端assistant重复导致400）===
+    deduped_msgs = []
+    for msg in request_body.get('messages', []):
+        if deduped_msgs and msg.get('role') == deduped_msgs[-1].get('role') and msg.get('role') != 'system':
+            prev_content = deduped_msgs[-1].get('content', '')
+            curr_content = msg.get('content', '')
+            if curr_content == prev_content:
+                continue  # 完全重复，丢弃
+            # 只在两边都是字符串时才合并，否则直接保留
+            elif isinstance(prev_content, str) and isinstance(curr_content, str):
+                deduped_msgs[-1]['content'] = prev_content + '\n' + curr_content
+            else:
+                deduped_msgs.append(msg)  # 含多模态内容，不合并
+        else:
+            deduped_msgs.append(msg)
+    if len(deduped_msgs) < len(request_body.get('messages', [])):
+        merged_count = len(request_body['messages']) - len(deduped_msgs)
+        logger.info(f"[PROXY_DEDUP] 合并/去重 {merged_count} 条连续同角色消息")
+        request_body['messages'] = deduped_msgs
+
+    # === 最终prefill检查：确保消息以user结尾（在所有清理/去重之后）===
+    final_msgs = request_body.get('messages', [])
+    while final_msgs and final_msgs[-1].get('role') == 'assistant':
+        final_msgs.pop()
+        logger.info(f"[PROXY_PREFILL_FIX] 删除末尾assistant消息")
+    request_body['messages'] = final_msgs
+
     upstream_url = build_upstream_url(provider['api_base_url'])
     is_stream = request_body.get('stream', False)
 

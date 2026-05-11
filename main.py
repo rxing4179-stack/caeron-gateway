@@ -109,7 +109,7 @@ async def lifespan(app: FastAPI):
             'unhealthy_since = NULL, fail_count = 0 WHERE is_enabled = 1'
         )
         await db.commit()
-        logger.info("���������重置所有供应商健康状态")
+        logger.info("�����������重置所有供应商健康状态")
     finally:
         await db.close()
 
@@ -724,41 +724,37 @@ async def _handle_chat_completions(request: Request):
     logger.info(f"[SIZE] 注入前: {len(body.get('messages', []))} 条消息, {post_dedup_chars} 字符 "
                 f"(去重前 {pre_dedup_count} 条, {pre_dedup_chars} 字符)")
 
-    # === Bug 0.5 修复：彻底清理 tool 调用链 ===
-    # DEBUG: 打印清理前的messages结构
-    for i, _m in enumerate(body.get('messages', [])[:5]):
-        _c = _m.get('content', '')
-        _ct = type(_c).__name__
-        logger.info(f"[TOOL_DEBUG_PRE] msg[{i}] role={_m.get('role')} content_type={_ct} len={len(str(_c))} has_tool_use={'tool_use' in str(_c)[:500]}")
-    logger.info(f"[TOOL_DEBUG_PRE] total msgs: {len(body.get('messages', []))}, tool msgs: {sum(1 for m in body.get('messages', []) if m.get('role')=='tool')}")
-
-    # Claude API 要求 tool_use 和 tool_result 严格配对，否则 400 错误
-    # 最安全做法：删掉所有 role=tool 消息，并清理 assistant 消息中的 tool_use blocks
-    msgs = body.get('messages', [])
-    cleaned = []
-    tool_strip_count = 0
-    for msg in msgs:
-        if msg.get('role') == 'tool':
-            tool_strip_count += 1
-            continue
-        # assistant消息如果content是list且含tool_use block，只保留text部分
-        if msg.get('role') == 'assistant':
-            content = msg.get('content', '')
-            if isinstance(content, list):
-                text_blocks = [b for b in content if isinstance(b, dict) and b.get('type') == 'text']
-                non_tool_blocks = [b for b in content if not isinstance(b, dict) or b.get('type') != 'tool_use']
-                if len(non_tool_blocks) != len(content):
-                    # 有tool_use被剥掉了，重组content
-                    if text_blocks:
-                        msg = dict(msg)
-                        msg['content'] = '\n'.join(b.get('text', '') for b in text_blocks)
-                    else:
-                        msg = dict(msg)
-                        msg['content'] = ''
-        cleaned.append(msg)
-    if tool_strip_count > 0:
-        body['messages'] = cleaned
-        logger.info(f"[TOOL_CLEANUP] 清理 {tool_strip_count} 条 tool 消息及对应 tool_use blocks")
+    # === Bug 0.5 修复：彻底清理 tool 调用链（仅QQ来源） ===
+    # Operit端自带完整tool_use+tool_result配对，清理会导致模型复读工具调用
+    # 只对QQ来源（skip_injection=true）执行清理
+    _is_qq_source = request.headers.get('x-skip-injection', '').lower() == 'true'
+    
+    if _is_qq_source:
+        msgs = body.get('messages', [])
+        cleaned = []
+        tool_strip_count = 0
+        for msg in msgs:
+            if msg.get('role') == 'tool':
+                tool_strip_count += 1
+                continue
+            if msg.get('role') == 'assistant':
+                content = msg.get('content', '')
+                if isinstance(content, list):
+                    text_blocks = [b for b in content if isinstance(b, dict) and b.get('type') == 'text']
+                    non_tool_blocks = [b for b in content if not isinstance(b, dict) or b.get('type') != 'tool_use']
+                    if len(non_tool_blocks) != len(content):
+                        if text_blocks:
+                            msg = dict(msg)
+                            msg['content'] = '\n'.join(b.get('text', '') for b in text_blocks)
+                        else:
+                            msg = dict(msg)
+                            msg['content'] = ''
+            cleaned.append(msg)
+        if tool_strip_count > 0:
+            body['messages'] = cleaned
+            logger.info(f"[TOOL_CLEANUP] (QQ来源) 清理 {tool_strip_count} 条 tool 消息及 tool_use blocks")
+    else:
+        logger.info(f"[TOOL_CLEANUP] (Operit来源) 保留完整tool链，不清理")
 
     # === Bug 1 修复：清理幽灵省略号 ===
     # 客户端在仅发送图片/空消息时可能使用 "..." 或 "…" 占位，导致 AI 误解
@@ -1667,6 +1663,7 @@ async def get_qq_config():
         'REPLY_DELAY_MAX': qq_config.REPLY_DELAY_MAX,
         'DEFAULT_PROMPT': qq_config.DEFAULT_PROMPT,
         'RUIRUI_PROMPT': qq_config.RUIRUI_PROMPT,
+        'RUIRUI_QQ_PROMPT': qq_config.RUIRUI_QQ_PROMPT,
         'DEFAULT_MODEL': qq_config.DEFAULT_MODEL
     }
 
@@ -1687,6 +1684,7 @@ async def save_qq_config(request: Request):
     if 'REPLY_DELAY_MAX' in data: qq_config.REPLY_DELAY_MAX = float(data['REPLY_DELAY_MAX'])
     if 'DEFAULT_PROMPT' in data: qq_config.DEFAULT_PROMPT = data['DEFAULT_PROMPT']
     if 'RUIRUI_PROMPT' in data: qq_config.RUIRUI_PROMPT = data['RUIRUI_PROMPT']
+    if 'RUIRUI_QQ_PROMPT' in data: qq_config.RUIRUI_QQ_PROMPT = data['RUIRUI_QQ_PROMPT']
     if 'DEFAULT_MODEL' in data: qq_config.DEFAULT_MODEL = data['DEFAULT_MODEL']
     qq_config.save()
     return {"ok": True}

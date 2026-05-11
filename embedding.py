@@ -19,6 +19,12 @@ async def get_embedding(text: str) -> list[float]:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
+    # 截断过长文本防止413（bge-large-zh-v1.5 最大512 token，约1500汉字）
+    MAX_EMBED_CHARS = 1500
+    if len(text) > MAX_EMBED_CHARS:
+        text = text[:MAX_EMBED_CHARS]
+        logger.info(f"[EMBEDDING] 文本截断至 {MAX_EMBED_CHARS} 字符")
+
     payload = {
         "model": model,
         "input": text,

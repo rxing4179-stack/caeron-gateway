@@ -307,67 +307,6 @@ class InjectionEngine:
                     r = dict(r)
                     parts.append(f"- [轮总 #{idx}/{total}] [{r['created_at']}] {r['content']}")
 
-            # 7. 跨端微桥接：注入其他端还没被总结的最近消息原文
-            current_conv_id = request_info.get('conversation_id', '')
-            if current_conv_id:
-                try:
-                    # 找到最新轮总的时间作为基准线
-                    cursor = await db.execute(
-                        """SELECT created_at FROM summaries 
-                           WHERE tag = 'round' AND is_active = 1 
-                           ORDER BY created_at DESC LIMIT 1"""
-                    )
-                    latest_round_row = await cursor.fetchone()
-                    cutoff_time = dict(latest_round_row)['created_at'] if latest_round_row else yesterday
-                    
-                    # 查询其他端在最新轮总之后的消息（排除system角色）
-                    cursor = await db.execute(
-                        """SELECT conversation_id, role, content, created_at 
-                           FROM messages 
-                           WHERE conversation_id != ? 
-                           AND created_at > ?
-                           AND role IN ('user', 'assistant')
-                           AND content NOT LIKE '%tool_result%'
-                           AND content NOT LIKE '%tool_use%'
-                           AND content NOT LIKE '%package_proxy%'
-                           AND content NOT LIKE '%linux_ssh%'
-                           AND length(content) > 5
-                           AND length(content) < 2000
-                           ORDER BY created_at ASC
-                           LIMIT 12""",
-                        (current_conv_id, cutoff_time)
-                    )
-                    cross_rows = await cursor.fetchall()
-                    
-                    if cross_rows:
-                        has_any_summaries = True
-                        parts.append('')
-                        parts.append('【跨端未总结上下文 — 另一端最近的对话原文】')
-                        for r in cross_rows:
-                            r = dict(r)
-                            conv = r['conversation_id']
-                            if conv == 'qq-ruirui':
-                                src = 'QQ私聊'
-                            elif conv.startswith('qq-group-'):
-                                src = 'QQ群聊'
-                            elif conv.startswith('qq-private-'):
-                                src = 'QQ私聊'
-                            else:
-                                src = 'Operit'
-                            
-                            role_label = '蕊蕊' if r['role'] == 'user' else '沈栖'
-                            content = r['content'] or ''
-                            if len(content) > 300:
-                                content = content[:300] + '...'
-                            # 提取时间 HH:MM
-                            time_str = r['created_at'][-8:-3] if r['created_at'] and len(r['created_at']) >= 8 else '?'
-                            parts.append(f'- [{time_str} {src}] {role_label}: {content}')
-                        
-                        tag_counts['cross_endpoint'] = len(cross_rows)
-                        logger.info(f'[记忆注入] 跨端微桥接：注入 {len(cross_rows)} 条来自其他端的未总结消息')
-                except Exception as e:
-                    logger.error(f'[记忆注入] 跨端微桥接异常（不影响请求）: {e}')
-
             # 读取当前消息计数器
             unsummarized_count = 0
             cursor = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")

@@ -346,6 +346,31 @@ async def _get_daily_info() -> str:
     except:
         pass
     
+    # 位置信息：从Operit最近消息中提取
+    try:
+        from database import get_db
+        import re
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                """SELECT content FROM messages 
+                   WHERE conversation_id NOT LIKE 'qq-%' 
+                   AND role = 'user'
+                   AND content LIKE '%当前位置%'
+                   ORDER BY created_at DESC LIMIT 1"""
+            )
+            row = await cursor.fetchone()
+            if row:
+                content = row[0] or ''
+                # 提取位置信息块
+                loc_match = re.search(r'【当前位置】\n地址: (.+?)\n坐标: (.+?)\n', content)
+                if loc_match:
+                    lines.append(f"【蕊蕊位置】{loc_match.group(1)}（坐标{loc_match.group(2)}）")
+        finally:
+            await db.close()
+    except:
+        pass
+
     return "\n".join(lines)
 
 async def _do_generation(session_id: str, source: str, target_type: str, target_id: int, user_input: str, is_ruirui: bool = False):
@@ -369,6 +394,66 @@ async def _do_generation(session_id: str, source: str, target_type: str, target_
     if injection_text:
         system_prompt += f"\n\n{injection_text}"
     
+    # 2.5 跨端微桥接：注入其他端还没被总结的最近消息原文
+    try:
+        from database import get_db
+        from utils import now_cst
+        from datetime import timedelta as td
+        db = await get_db()
+        try:
+            yesterday = (now_cst() - td(days=1)).strftime('%Y-%m-%d')
+            cursor = await db.execute(
+                """SELECT created_at FROM summaries 
+                   WHERE tag = 'round' AND is_active = 1 
+                   ORDER BY created_at DESC LIMIT 1"""
+            )
+            latest_round_row = await cursor.fetchone()
+            cutoff_time = dict(latest_round_row)['created_at'] if latest_round_row else yesterday
+            
+            cursor = await db.execute(
+                """SELECT conversation_id, role, content, created_at 
+                   FROM messages 
+                   WHERE conversation_id != ? 
+                   AND created_at > ?
+                   AND role IN ('user', 'assistant')
+                   AND content NOT LIKE '%tool_result%'
+                   AND content NOT LIKE '%tool_use%'
+                   AND content NOT LIKE '%package_proxy%'
+                   AND content NOT LIKE '%linux_ssh%'
+                   AND length(content) > 5
+                   AND length(content) < 2000
+                   ORDER BY created_at ASC
+                   LIMIT 12""",
+                (session_id, cutoff_time)
+            )
+            cross_rows = await cursor.fetchall()
+            
+            if cross_rows:
+                bridge_lines = ['[跨端未总结上下文 — 另一端最近的对话原文]']
+                for r in cross_rows:
+                    r = dict(r)
+                    conv = r['conversation_id']
+                    if conv == 'qq-ruirui':
+                        src = 'QQ私聊'
+                    elif conv.startswith('qq-group-'):
+                        src = 'QQ群聊'
+                    elif conv.startswith('qq-private-'):
+                        src = 'QQ私聊'
+                    else:
+                        src = 'Operit'
+                    role_label = '蕊蕊' if r['role'] == 'user' else '沈栖'
+                    content = r['content'] or ''
+                    if len(content) > 300:
+                        content = content[:300] + '...'
+                    time_str = r['created_at'][-8:-3] if r['created_at'] and len(r['created_at']) >= 8 else '?'
+                    bridge_lines.append(f'- [{time_str} {src}] {role_label}: {content}')
+                system_prompt += '\n\n' + '\n'.join(bridge_lines)
+                logger.info(f'[QQ] [跨端桥接] 注入 {len(cross_rows)} 条来自其他端的未总结消息')
+        finally:
+            await db.close()
+    except Exception as e:
+        logger.error(f'[QQ] [跨端桥接] 异常（不影响请求）: {e}')
+
     # 3. 轮总后裁剪上下文：有活跃总结时，只保留最近的未总结消息+buffer
     if has_summaries and history:
         buffer = 8
@@ -385,7 +470,42 @@ async def _do_generation(session_id: str, source: str, target_type: str, target_
     messages = [{"role": "system", "content": system_prompt}] + history
     if daily_info:
         messages.append({"role": "system", "content": daily_info})
-    messages.append({"role": "user", "content": user_input})
+
+    # 5. 图片处理：把CQ:image转成OpenAI多模态格式
+    import re as _re
+    cq_image_pattern = _re.compile(r'\[CQ:image,[^\]]*url=([^,\]]+)[^\]]*\]')
+    image_urls = cq_image_pattern.findall(user_input)
+    if image_urls:
+        # 去掉CQ码，保留纯文本部分
+        text_part = cq_image_pattern.sub('', user_input).strip()
+        content_parts = []
+        if text_part:
+            content_parts.append({"type": "text", "text": text_part})
+        import html as _html
+        import base64 as _b64
+        for url in image_urls:
+            clean_url = _html.unescape(url)
+            # 尝试下载图片转base64（QQ图片URL有防盗链，需要服务端中转）
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as dl_client:
+                    img_resp = await dl_client.get(clean_url, headers={'Referer': 'https://im.qq.com/', 'User-Agent': 'Mozilla/5.0'})
+                    if img_resp.status_code == 200:
+                        img_b64 = _b64.b64encode(img_resp.content).decode('utf-8')
+                        # 猜测content type
+                        ct = img_resp.headers.get('content-type', 'image/jpeg')
+                        data_url = f"data:{ct};base64,{img_b64}"
+                        content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+                        logger.info(f"[QQ] [图片下载] 成功，大小={len(img_resp.content)}字节")
+                    else:
+                        content_parts.append({"type": "text", "text": "[图片加载失败]"})
+                        logger.warning(f"[QQ] [图片下载] 失败: HTTP {img_resp.status_code}")
+            except Exception as img_e:
+                content_parts.append({"type": "text", "text": "[图片加载失败]"})
+                logger.error(f"[QQ] [图片下载] 异常: {img_e}")
+        messages.append({"role": "user", "content": content_parts})
+        logger.info(f"[QQ] [图片处理] 检测到 {len(image_urls)} 张图片，转为多模态格式")
+    else:
+        messages.append({"role": "user", "content": user_input})
     skip_injection = True
     
     # DEBUG: 打印发给API的完整消息结构
