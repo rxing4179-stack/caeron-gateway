@@ -503,9 +503,22 @@ async def _handle_chat_completions(request: Request):
     
     # 异步存储，不阻塞主流程（存储失败不影响请求转发）
     stored_count = 0
+    _is_qq = request.headers.get('x-skip-injection', '').lower() == 'true'
     try:
         await ensure_conversation(conversation_id, model=model)
-        stored_count = await store_incoming_messages(conversation_id, raw_messages)
+        if _is_qq:
+            # QQ端自己管history，不需要store_incoming_messages
+            # 只需要proxy的store_assistant_response单独存回复
+            # 但仍然需要存最新的user消息（用于轮总和记忆）
+            last_user = None
+            for msg in reversed(raw_messages):
+                if msg.get('role') == 'user':
+                    last_user = msg
+                    break
+            if last_user:
+                stored_count = await store_incoming_messages(conversation_id, [last_user])
+        else:
+            stored_count = await store_incoming_messages(conversation_id, raw_messages)
     except Exception as e:
         logger.error(f"消息存储管道异常（不影响转发）: {e}")
     

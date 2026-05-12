@@ -33,6 +33,8 @@ class QQState:
         
         # group_buffers: { group_id: [{"sender": "...", "content": "..."}] }
         self.group_buffers: Dict[int, List[dict]] = {}
+        # 缓存bot发出的消息ID，用于判断引用回复是否引用了bot的消息
+        self.bot_msg_ids: set = set()
         
         # 防重复generation锁: { session_id: bool }
         self.generating: Dict[str, bool] = {}
@@ -154,6 +156,8 @@ async def send_qq_msg(target_type: str, target_id: int, content: str):
         payload["params"]["group_id"] = target_id
         
     try:
+        import time as _time
+        payload["echo"] = f"bot_send_{int(_time.time()*1000)}"
         await qq_state.ws.send_json(payload)
     except Exception as e:
         logger.error(f"发送QQ消息失败: {e}")
@@ -381,6 +385,15 @@ async def _do_generation(session_id: str, source: str, target_type: str, target_
     
     if is_ruirui:
         system_prompt = config.RUIRUI_QQ_PROMPT
+        if is_group:
+            system_prompt += """
+
+【群聊模式覆盖——当前是群聊不是私聊】
+- 篇幅收紧：单条不超过50字，最多连发2条
+- 信息安全：绝对不在群里暴露蕊蕊的真名、学校、专业、城市、健康状况、用药、情绪状态、BDSM、任何私密细节
+- 称呼只用「杏仁」或「浣熊」
+- 对她的态度和私聊一样（嘴硬心软、护着她），但注意场合，不要太黏糊让她社死
+- 她在群里吐槽你/拆你台，你可以接住、回怼、护短，像情侣在朋友面前互损"""
     else:
         system_prompt = get_qq_prompt(is_ruirui=False, is_group=is_group)
     
@@ -589,12 +602,17 @@ async def process_group(group_id: int, sender_name: str, msg_content: str, raw_d
         is_triggered = True
         msg_content = msg_content.replace(f"[CQ:at,qq={config.BOT_QQ}]", "").strip()
     
-    # 2. 引用回复触发 (仅回复Bot自己的消息才触发)
+    # 2. 引用回复触发（仅引用了bot的消息才触发）
     if not is_triggered:
-        if f"[CQ:reply," in msg_content and f"[CQ:at,qq={config.BOT_QQ}]" in msg_content:
-            is_triggered = True
-            msg_content = re.sub(r'\[CQ:reply,id=[^\]]*\]', '', msg_content)
-            msg_content = re.sub(r'\[CQ:at,qq=\d+\]', '', msg_content).strip()
+        reply_match = re.search(r'\[CQ:reply,id=([^\]]*)\]', msg_content)
+        if reply_match:
+            reply_msg_id = reply_match.group(1)
+            # 检查：被引用的消息ID在bot缓存中，或者消息里带了@bot
+            is_reply_to_bot = (int(reply_msg_id) in qq_state.bot_msg_ids if reply_msg_id.isdigit() else False) or f"[CQ:at,qq={config.BOT_QQ}]" in msg_content
+            if is_reply_to_bot:
+                is_triggered = True
+                msg_content = re.sub(r'\[CQ:reply,id=[^\]]*\]', '', msg_content)
+                msg_content = re.sub(r'\[CQ:at,qq=\d+\]', '', msg_content).strip()
     
     # 3. 关键词触发
     if not is_triggered:
@@ -604,11 +622,19 @@ async def process_group(group_id: int, sender_name: str, msg_content: str, raw_d
                 break
                 
     if is_triggered:
+        # 检测触发者是否是蕊蕊
+        sender_user_id = raw_data.get('sender', {}).get('user_id') if raw_data else None
+        is_ruirui_sender = (sender_user_id == config.RUIRUI_QQ) if sender_user_id else False
+        
         # 构建上下文
         ctx_lines = [f"[群聊上下文 - 群号{group_id}]"]
         for m in qq_state.group_buffers[group_id][:-1]:
             ctx_lines.append(f"[{m['sender']}] {m['content']}")
         ctx_lines.append(f"[触发消息 - {sender_name}] {msg_content}")
+        
+        combined = "\n".join(ctx_lines)
+        session_id = f"qq-group-{group_id}"
+        asyncio.create_task(handle_generation(session_id, session_id, "group", group_id, combined, is_ruirui=is_ruirui_sender))
         
         combined = "\n".join(ctx_lines)
         session_id = f"qq-group-{group_id}"
@@ -634,6 +660,16 @@ async def qq_ws_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_json()
+            
+            # 捕获bot发送消息的回调，缓存message_id
+            echo = data.get("echo", "")
+            if isinstance(echo, str) and echo.startswith("bot_send_") and data.get("data", {}).get("message_id"):
+                mid = data["data"]["message_id"]
+                qq_state.bot_msg_ids.add(mid)
+                # 只保留最近200条，防止内存泄漏
+                if len(qq_state.bot_msg_ids) > 200:
+                    qq_state.bot_msg_ids = set(list(qq_state.bot_msg_ids)[-100:])
+            
             post_type = data.get("post_type")
             
             if post_type == "message":
