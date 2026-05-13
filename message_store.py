@@ -271,10 +271,42 @@ async def store_incoming_messages(conversation_id: str, messages: list):
                         text_parts.append(part)
                 content = ' '.join(text_parts) if text_parts else json.dumps(content, ensure_ascii=False)
             
+            # 去重/覆盖逻辑：检查数据库最后一条同角色消息
+            msg_role = msg.get('role', '')
+            content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()[:16] if isinstance(content, str) else ''
+            
+            cursor_dup = await db.execute(
+                '''SELECT message_index, content FROM messages 
+                   WHERE conversation_id = ? AND role = ?
+                   ORDER BY message_index DESC LIMIT 1''',
+                (conversation_id, msg_role)
+            )
+            last_same_role = await cursor_dup.fetchone()
+            
+            if last_same_role:
+                last_content = last_same_role['content'] or ''
+                last_hash = hashlib.md5(last_content.encode('utf-8')).hexdigest()[:16]
+                last_idx = last_same_role['message_index']
+                
+                if content_hash == last_hash:
+                    # 完全重复，跳过（重roll/重试场景）
+                    logger.info(f"[STORE_DEDUP] 跳过重复{msg_role}消息 (hash={content_hash}, 对话: {conversation_id[:8]}...)")
+                    continue
+                elif msg_role == 'user' and last_idx == start_index + i:
+                    # 同位置但内容不同，视为编辑重发，覆盖
+                    await db.execute(
+                        '''UPDATE messages SET content = ?, created_at = ? 
+                           WHERE conversation_id = ? AND message_index = ?''',
+                        (content, now_bj, conversation_id, last_idx)
+                    )
+                    logger.info(f"[STORE_DEDUP] 覆盖编辑后的user消息 (idx={last_idx}, 对话: {conversation_id[:8]}...)")
+                    stored += 1
+                    continue
+            
             await db.execute(
                 '''INSERT INTO messages (conversation_id, role, content, message_index, created_at)
                    VALUES (?, ?, ?, ?, ?)''',
-                (conversation_id, msg['role'], content, start_index + i, now_bj)
+                (conversation_id, msg_role, content, start_index + i, now_bj)
             )
             stored += 1
         

@@ -43,80 +43,121 @@ def build_models_url(api_base_url: str) -> str:
         return f"{url}/v1/models"
 
 
-async def proxy_chat_completion(request_body: dict, provider: dict, conversation_id: str = None):
+async def proxy_chat_completion(request_body: dict, provider: dict, conversation_id: str = None, skip_tool_cleanup: bool = False, skip_context_trim: bool = False):
     """
     转发 chat completion 请求到上游供应商
     根据 stream 参数自动选择流式或非流式转发
     conversation_id: 可选，传入时会自动存储AI回复
+    skip_tool_cleanup: 为True时跳过tool消息清理（Operit来源自带完整tool链）
+    skip_context_trim: 为True时跳过上下文裁剪（技术窗按次计费不需要裁剪）
     """
     # === 修复：确保消息以user结尾（部分模型不支持assistant prefill）===
-    pre_msgs = request_body.get('messages', [])
-    if pre_msgs and pre_msgs[-1].get('role') == 'assistant':
-        pre_msgs.pop()
-        logger.info(f"[PROXY_PREFILL_FIX] 删除末尾assistant消息，确保以user结尾")
+    if not skip_tool_cleanup:
+        pre_msgs = request_body.get('messages', [])
+        if pre_msgs and pre_msgs[-1].get('role') == 'assistant':
+            pre_msgs.pop()
+            logger.info(f"[PROXY_PREFILL_FIX] 删除末尾assistant消息，确保以user结尾")
 
     # === 最终安全网：清理 tool 调用（OpenAI格式和Claude格式都处理）===
-    msgs = request_body.get('messages', [])
-    cleaned_msgs = []
-    tool_stripped = 0
-    for msg in msgs:
-        role = msg.get('role', '')
-        # 删掉所有 role=tool 消息
-        if role == 'tool':
-            tool_stripped += 1
-            continue
-        if role == 'assistant':
-            msg = dict(msg)  # 避免修改原对象
-            # OpenAI格式：删掉 tool_calls 字段
-            if 'tool_calls' in msg:
-                del msg['tool_calls']
-            # Claude格式：content是list且含tool_use
-            content = msg.get('content', '')
-            if isinstance(content, list):
-                has_tool = any(isinstance(b, dict) and b.get('type') == 'tool_use' for b in content)
-                if has_tool:
-                    text_parts = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text']
-                    msg['content'] = '\n'.join(text_parts) if text_parts else ''
-            elif isinstance(content, str) and 'tool_use' in content:
-                try:
-                    import json as _json
-                    parsed = _json.loads(content)
-                    if isinstance(parsed, list):
-                        text_parts = [b.get('text', '') for b in parsed if isinstance(b, dict) and b.get('type') == 'text']
+    if skip_tool_cleanup:
+        logger.info(f"[PROXY_TOOL_CLEANUP] skip_tool_cleanup=True，跳过清理")
+    else:
+        msgs = request_body.get('messages', [])
+        cleaned_msgs = []
+        tool_stripped = 0
+        for msg in msgs:
+            role = msg.get('role', '')
+            # 删掉所有 role=tool 消息
+            if role == 'tool':
+                tool_stripped += 1
+                continue
+            if role == 'assistant':
+                msg = dict(msg)  # 避免修改原对象
+                # OpenAI格式：删掉 tool_calls 字段
+                if 'tool_calls' in msg:
+                    del msg['tool_calls']
+                # Claude格式：content是list且含tool_use
+                content = msg.get('content', '')
+                if isinstance(content, list):
+                    has_tool = any(isinstance(b, dict) and b.get('type') == 'tool_use' for b in content)
+                    if has_tool:
+                        text_parts = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text']
                         msg['content'] = '\n'.join(text_parts) if text_parts else ''
-                except:
-                    pass
-        cleaned_msgs.append(msg)
-    request_body['messages'] = cleaned_msgs
-    if tool_stripped > 0:
-        logger.info(f"[PROXY_TOOL_CLEANUP] 清理 {tool_stripped} 条 tool 消息")
+                elif isinstance(content, str) and 'tool_use' in content:
+                    try:
+                        import json as _json
+                        parsed = _json.loads(content)
+                        if isinstance(parsed, list):
+                            text_parts = [b.get('text', '') for b in parsed if isinstance(b, dict) and b.get('type') == 'text']
+                            msg['content'] = '\n'.join(text_parts) if text_parts else ''
+                    except:
+                        pass
+            cleaned_msgs.append(msg)
+        request_body['messages'] = cleaned_msgs
+        if tool_stripped > 0:
+            logger.info(f"[PROXY_TOOL_CLEANUP] 清理 {tool_stripped} 条 tool 消息")
 
     # === 修复：合并连续同角色消息（防止QQ端assistant重复导致400）===
-    deduped_msgs = []
-    for msg in request_body.get('messages', []):
-        if deduped_msgs and msg.get('role') == deduped_msgs[-1].get('role') and msg.get('role') != 'system':
-            prev_content = deduped_msgs[-1].get('content', '')
-            curr_content = msg.get('content', '')
-            if curr_content == prev_content:
-                continue  # 完全重复，丢弃
-            # 只在两边都是字符串时才合并，否则直接保留
-            elif isinstance(prev_content, str) and isinstance(curr_content, str):
-                deduped_msgs[-1]['content'] = prev_content + '\n' + curr_content
+    if not skip_tool_cleanup:
+        deduped_msgs = []
+        for msg in request_body.get('messages', []):
+            if deduped_msgs and msg.get('role') == deduped_msgs[-1].get('role') and msg.get('role') != 'system':
+                prev_content = deduped_msgs[-1].get('content', '')
+                curr_content = msg.get('content', '')
+                if curr_content == prev_content:
+                    continue  # 完全重复，���弃
+                # 只在两边都是字符串时才合并，否则直接保留
+                elif isinstance(prev_content, str) and isinstance(curr_content, str):
+                    deduped_msgs[-1]['content'] = prev_content + '\n' + curr_content
+                else:
+                    deduped_msgs.append(msg)  # 含多模态内容，不合并
             else:
-                deduped_msgs.append(msg)  # 含多模态内容，不合并
-        else:
-            deduped_msgs.append(msg)
-    if len(deduped_msgs) < len(request_body.get('messages', [])):
-        merged_count = len(request_body['messages']) - len(deduped_msgs)
-        logger.info(f"[PROXY_DEDUP] 合并/去重 {merged_count} 条连续同角色消息")
-        request_body['messages'] = deduped_msgs
+                deduped_msgs.append(msg)
+        if len(deduped_msgs) < len(request_body.get('messages', [])):
+            merged_count = len(request_body['messages']) - len(deduped_msgs)
+            logger.info(f"[PROXY_DEDUP] 合并/去重 {merged_count} 条连续同角色消息")
+            request_body['messages'] = deduped_msgs
 
-    # === 最终prefill检查：确保消息以user结尾（在所有清理/去重之后）===
-    final_msgs = request_body.get('messages', [])
-    while final_msgs and final_msgs[-1].get('role') == 'assistant':
-        final_msgs.pop()
-        logger.info(f"[PROXY_PREFILL_FIX] 删除末尾assistant消息")
-    request_body['messages'] = final_msgs
+        # === 最终prefill检查：确保消息以user结尾（在所有清理/去重之后）===
+        final_msgs = request_body.get('messages', [])
+        while final_msgs and final_msgs[-1].get('role') == 'assistant':
+            final_msgs.pop()
+            logger.info(f"[PROXY_PREFILL_FIX] 删除末尾assistant消息")
+        request_body['messages'] = final_msgs
+
+    # === 上下文长度安全阀：已禁用，由注入引擎裁剪独立负责 ===
+    msgs = request_body.get('messages', [])
+    total_chars = sum(len(str(m.get('content', ''))) for m in msgs)
+    logger.info(f"[CONTEXT_SAFETY] 安全阀已禁用，当前 {total_chars} 字符, {len(msgs)} 条消息，直接放行")
+    if False:
+        system_msgs = [m for m in msgs if m.get('role') == 'system']
+        non_system = [m for m in msgs if m.get('role') != 'system']
+        
+        # 从后往前保留，但至少保留 MIN_KEEP_MSGS 条
+        kept = []
+        char_budget = MAX_CHAR_LIMIT - sum(len(str(m.get('content', ''))) for m in system_msgs)
+        running = 0
+        for m in reversed(non_system):
+            msg_chars = len(str(m.get('content', '')))
+            if running + msg_chars > char_budget and len(kept) >= MIN_KEEP_MSGS:
+                break
+            kept.append(m)
+            running += msg_chars
+        kept.reverse()
+        
+        # 对超长的单条消息进行截断（比如巨大的tool_result）
+        SINGLE_MSG_LIMIT = 8000
+        for m in kept:
+            content = m.get('content', '')
+            if isinstance(content, str) and len(content) > SINGLE_MSG_LIMIT:
+                m['content'] = content[:SINGLE_MSG_LIMIT] + '\n... [内容已截断，原长' + str(len(content)) + '字符]'
+        
+        trimmed_count = len(non_system) - len(kept)
+        request_body['messages'] = system_msgs + kept
+        new_total = sum(len(str(m.get('content', ''))) for m in request_body['messages'])
+        logger.info(f"[CONTEXT_SAFETY] 上下文超限 {total_chars}字符>{MAX_CHAR_LIMIT}，裁剪 {trimmed_count} 条旧消息，保留 {len(kept)} 条 + {len(system_msgs)} 条system，裁剪后 {new_total} 字符")
+
+    # === model名不做清洗：方括号前缀是上游中转站的渠道路由格式，必须保留 ===
 
     upstream_url = build_upstream_url(provider['api_base_url'])
     is_stream = request_body.get('stream', False)

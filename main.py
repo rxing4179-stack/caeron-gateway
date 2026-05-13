@@ -109,7 +109,7 @@ async def lifespan(app: FastAPI):
             'unhealthy_since = NULL, fail_count = 0 WHERE is_enabled = 1'
         )
         await db.commit()
-        logger.info("�����������重置所有供应商健康状态")
+        logger.info("�������������重置所有供应商健康状态")
     finally:
         await db.close()
 
@@ -583,8 +583,16 @@ async def _handle_chat_completions(request: Request):
             cursor = await db.execute("SELECT content, aliases FROM memories WHERE category = 'status'")
             status_items = await cursor.fetchall()
             
-            for msg in body.get('messages', []):
+            # 只检查最新一条user消息，避免历史消息反复刷新状态
+            latest_user_txt = None
+            for msg in reversed(body.get('messages', [])):
                 if msg.get('role') == 'user':
+                    txt = msg.get('content', '')
+                    if isinstance(txt, str) and len(txt.strip()) > 0:
+                        latest_user_txt = txt
+                        break
+            
+            for msg in [{'content': latest_user_txt}] if latest_user_txt else []:
                     txt = msg.get('content', '')
                     if not isinstance(txt, str):
                         continue
@@ -843,9 +851,9 @@ async def _handle_chat_completions(request: Request):
             await provider_manager.update_last_used(provider['id'])
 
             # 转发请求（传入conversation_id用于存储AI回复）
-            response = await proxy_chat_completion(body, provider, conversation_id=conversation_id)
+            response = await proxy_chat_completion(body, provider, conversation_id=conversation_id, skip_tool_cleanup=(not _is_qq), skip_context_trim=tech_mode)
 
-            # 成功，确保���记为健康
+            # 成功，确保���记为��康
             await provider_manager.mark_healthy(provider['id'])
             logger.info(f"请求成功: 供应商={provider['name']}, 尝试次数={attempt + 1}")
 
