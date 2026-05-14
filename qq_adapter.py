@@ -282,29 +282,8 @@ async def _get_context_injection():
             r = dict(r)
             parts.append(f"- [轮总 #{idx}/{total}] [{r['created_at']}] {r['content']}")
         
-        # 状态便签
-        cursor = await db.execute("SELECT content, updated_at, threshold_hours FROM memories WHERE category = 'status'")
-        status_rows = await cursor.fetchall()
+        # 状态便签（已禁用）
         status_lines = []
-        if status_rows:
-            status_lines.append("[状态便签]")
-            now = now_cst()
-            for r in status_rows:
-                key = r['content']
-                updated_at_str = r['updated_at']
-                threshold = r['threshold_hours'] or 24
-                if not updated_at_str:
-                    status_lines.append(f"- {key}: 未记录")
-                    continue
-                try:
-                    updated_at = datetime.strptime(updated_at_str, '%Y-%m-%d %H:%M:%S')
-                    diff_hours = (now - updated_at).total_seconds() / 3600.0
-                    diff_str = f"{diff_hours*60:.0f}m前" if diff_hours < 1 else f"{diff_hours:.1f}h前"
-                    state = "正常" if diff_hours < threshold else "超时"
-                    status_lines.append(f"- {key}: {diff_str} ({state})")
-                except:
-                    status_lines.append(f"- {key}: {updated_at_str}")
-            status_lines.append("[/状态便签]")
         
         # 组装
         result_parts = []

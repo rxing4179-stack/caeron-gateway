@@ -406,48 +406,8 @@ class InjectionEngine:
                 else:
                     logger.info(f"[记忆裁剪-出口] 对话 {len(dialog_indices)} 条 <= 保留阈值 {keep_count}，不裁剪")
 
-            # === 获取状态便签 ===
-            cursor = await db.execute("SELECT content, updated_at, threshold_hours FROM memories WHERE category = 'status'")
-            status_rows = await cursor.fetchall()
+            # === 状态便签已禁用 ===
             status_lines = []
-            if status_rows:
-                status_lines.append("<current_status>")
-                status_lines.append("| 项目 | 上次完成 | 距今 | 状态 |")
-                status_lines.append("|------|---------|------|------|")
-                now = now_cst()
-                from datetime import datetime
-                for r in status_rows:
-                    key = r['content']
-                    updated_at_str = r['updated_at']
-                    threshold = r['threshold_hours'] or 24
-                    
-                    if not updated_at_str:
-                        status_lines.append(f"| {key} | 未记录 | - | 未记录 |")
-                        continue
-                    
-                    try:
-                        updated_at = datetime.strptime(updated_at_str, '%Y-%m-%d %H:%M:%S')
-                        diff_hours = (now - updated_at).total_seconds() / 3600.0
-                        
-                        if diff_hours < 1:
-                            diff_str = f"{diff_hours*60:.0f}m前"
-                        else:
-                            diff_str = f"{diff_hours:.1f}h前"
-                        
-                        time_str = updated_at.strftime('%m-%d %H:%M')
-                        
-                        if diff_hours < threshold:
-                            state_str = "正常"
-                        elif diff_hours < threshold * 1.5:
-                            state_str = "即将超时"
-                        else:
-                            state_str = "超时"
-                            
-                        status_lines.append(f"| {key} | {time_str} | {diff_str} | {state_str} |")
-                    except Exception as e:
-                        logger.error(f"解析状态便签时间失败: {e}")
-                        status_lines.append(f"| {key} | {updated_at_str} | - | 解析异常 |")
-                status_lines.append("</current_status>\n")
 
             # 组装总结文本
             summary_lines = []

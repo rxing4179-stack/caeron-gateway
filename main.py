@@ -109,7 +109,7 @@ async def lifespan(app: FastAPI):
             'unhealthy_since = NULL, fail_count = 0 WHERE is_enabled = 1'
         )
         await db.commit()
-        logger.info("�������������重置所有供应商健康状态")
+        logger.info("����������������重置所有供应商健康状态")
     finally:
         await db.close()
 
@@ -571,68 +571,7 @@ async def _handle_chat_completions(request: Request):
             logger.error(f"[AUTO_SUMMARY] 计数器异常（不影响转发）: {e}")
     # === End Step 2.5 ===
 
-    # === Step 2.8: 状态便签追踪 ===
-    try:
-        import re
-        from utils import now_cst
-        db = await get_db()
-        try:
-            status_updates = []
-            
-            # 从DB加载所有的状态项和别名
-            cursor = await db.execute("SELECT content, aliases FROM memories WHERE category = 'status'")
-            status_items = await cursor.fetchall()
-            
-            # 只检查最新一条user消息，避免历史消息反复刷新状态
-            latest_user_txt = None
-            for msg in reversed(body.get('messages', [])):
-                if msg.get('role') == 'user':
-                    txt = msg.get('content', '')
-                    if isinstance(txt, str) and len(txt.strip()) > 0:
-                        latest_user_txt = txt
-                        break
-            
-            for msg in [{'content': latest_user_txt}] if latest_user_txt else []:
-                    txt = msg.get('content', '')
-                    if not isinstance(txt, str):
-                        continue
-                    
-                    # 语义检查
-                    has_intention = bool(re.search(r'(要|想|打算|准备|明天|待会|等下)', txt))
-                    has_completion = bool(re.search(r'(了|完|过|好了|吃过|洗完|吸了)', txt))
-                    
-                    for row in status_items:
-                        key = row['content']
-                        aliases_str = row['aliases'] or ''
-                        
-                        patterns = [re.escape(key)]
-                        for a in aliases_str.split('|'):
-                            if a.strip():
-                                patterns.append(re.escape(a.strip()))
-                        
-                        pattern = r'(' + '|'.join(patterns) + r')'
-                        
-                        if re.search(pattern, txt):
-                            # 关键词前后需要有完成态标记词才触发写入
-                            # 仅含意向态标记词时不触发
-                            if has_intention and not has_completion:
-                                continue
-                            if has_completion:
-                                status_updates.append(key)
-            
-            if status_updates:
-                now_str = now_cst().strftime('%Y-%m-%d %H:%M:%S')
-                for key in set(status_updates):
-                    await db.execute(
-                        "UPDATE memories SET updated_at = ? WHERE category = 'status' AND content = ?",
-                        (now_str, key)
-                    )
-                await db.commit()
-                logger.info(f"[STATUS] 更新状态便签: {set(status_updates)}")
-        finally:
-            await db.close()
-    except Exception as e:
-        logger.error(f"[STATUS] 状态便签更新异常: {e}")
+    # === Step 2.8: 状态便签追踪（已禁用）===
     # === End Step 2.8 ===
 
     # === Step 3: 预处理 — 清理上下文膨胀源 ===
@@ -1347,64 +1286,25 @@ async def admin_unassign_conversations(request: Request):
     finally:
         await db.close()
 
-# ==================== 状态便签 API ====================
+# ==================== 状态便签 API（已禁用）====================
 
 @app.get("/admin/api/status")
 async def admin_get_status():
-    """获取所有状态便签"""
-    db = await get_db()
-    try:
-        cursor = await db.execute("SELECT * FROM memories WHERE category = 'status' ORDER BY id DESC")
-        rows = [dict(r) for r in await cursor.fetchall()]
-        return rows
-    finally:
-        await db.close()
+    """状态便签已禁用"""
+    return {"message": "状态便签功能已禁用", "items": []}
 
 @app.post("/admin/api/status")
 async def admin_create_status(request: Request):
-    """新增状态便签"""
-    body = await request.json()
-    db = await get_db()
-    try:
-        await db.execute(
-            "INSERT INTO memories (content, category, threshold_hours, aliases, updated_at) VALUES (?, 'status', ?, ?, NULL)",
-            (body.get('content'), body.get('threshold_hours', 24), body.get('aliases', ''))
-        )
-        await db.commit()
-        return {'success': True}
-    finally:
-        await db.close()
+    return {"message": "状态便签功能已禁用"}
 
 @app.put("/admin/api/status/{status_id}")
 async def admin_update_status(status_id: int, request: Request):
-    """修改状态便签（比如手动设置已完成时间）"""
-    body = await request.json()
-    db = await get_db()
-    try:
-        fields = []
-        params = []
-        for k in ['content', 'threshold_hours', 'aliases', 'updated_at']:
-            if k in body:
-                fields.append(f"{k} = ?")
-                params.append(body[k])
-        if fields:
-            params.append(status_id)
-            await db.execute(f"UPDATE memories SET {', '.join(fields)} WHERE id = ?", params)
-            await db.commit()
-        return {'success': True}
-    finally:
-        await db.close()
+    return {"message": "状态便签功能已禁用"}
 
 @app.delete("/admin/api/status/{status_id}")
 async def admin_delete_status(status_id: int):
-    """删除状态便签"""
-    db = await get_db()
-    try:
-        await db.execute("DELETE FROM memories WHERE id = ?", (status_id,))
-        await db.commit()
-        return {'success': True}
-    finally:
-        await db.close()
+    return {"message": "状态便签功能已禁用"}
+
 
 
 @app.post("/admin/api/sync-memories")
