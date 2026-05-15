@@ -125,6 +125,90 @@ async def proxy_chat_completion(request_body: dict, provider: dict, conversation
             logger.info(f"[PROXY_PREFILL_FIX] 删除末尾assistant消息")
         request_body['messages'] = final_msgs
 
+    # === 图片处理：1)压缩当前图片 2)清理历史图片 ===
+    import base64 as _b64
+    import io as _io
+    
+    def _compress_base64_image(data_url: str, max_edge: int = 1120, quality: int = 75) -> str:
+        """压缩base64图片：缩放到max_edge以内，JPEG压缩"""
+        try:
+            from PIL import Image
+            # 解析 data:image/xxx;base64,xxxx
+            header, b64data = data_url.split(',', 1)
+            raw = _b64.b64decode(b64data)
+            img = Image.open(_io.BytesIO(raw))
+            
+            # 缩放
+            w, h = img.size
+            if max(w, h) > max_edge:
+                ratio = max_edge / max(w, h)
+                new_w, new_h = int(w * ratio), int(h * ratio)
+                img = img.resize((new_w, new_h), Image.LANCZOS)
+            
+            # 转JPEG压缩（去掉alpha通道）
+            if img.mode in ('RGBA', 'P', 'LA'):
+                bg = Image.new('RGB', img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = bg
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            buf = _io.BytesIO()
+            img.save(buf, format='JPEG', quality=quality, optimize=True)
+            compressed = buf.getvalue()
+            new_b64 = _b64.b64encode(compressed).decode('utf-8')
+            return f"data:image/jpeg;base64,{new_b64}", len(raw), len(compressed)
+        except Exception as e:
+            logger.warning(f"[IMG_COMPRESS] 压缩失败，保留原图: {e}")
+            return data_url, 0, 0
+    
+    _msgs = request_body.get('messages', [])
+    # 找到最后一条user消息的索引
+    _last_user_idx = -1
+    for _i in range(len(_msgs) - 1, -1, -1):
+        if _msgs[_i].get('role') == 'user':
+            _last_user_idx = _i
+            break
+    
+    _img_cleaned = 0
+    _img_compressed = 0
+    _bytes_saved = 0
+    for _i, _msg in enumerate(_msgs):
+        content = _msg.get('content')
+        if not isinstance(content, list):
+            continue
+            
+        if _i == _last_user_idx:
+            # 最新user消息：保留图片但压缩
+            for part in content:
+                if isinstance(part, dict) and part.get('type') == 'image_url':
+                    url = part.get('image_url', {}).get('url', '')
+                    if url.startswith('data:image'):
+                        new_url, orig_size, comp_size = _compress_base64_image(url)
+                        part['image_url']['url'] = new_url
+                        if orig_size > 0:
+                            _img_compressed += 1
+                            _bytes_saved += orig_size - comp_size
+        else:
+            # 历史消息：移除图片，替换为占位符
+            new_parts = []
+            had_images = False
+            for part in content:
+                if isinstance(part, dict) and part.get('type') == 'image_url':
+                    had_images = True
+                    _img_cleaned += 1
+                else:
+                    new_parts.append(part)
+            if had_images:
+                new_parts.append({'type': 'text', 'text': '[图片]'})
+                if len(new_parts) == 1 and new_parts[0].get('type') == 'text':
+                    _msg['content'] = new_parts[0].get('text', '')
+                else:
+                    _msg['content'] = new_parts
+    
+    if _img_cleaned > 0 or _img_compressed > 0:
+        logger.info(f"[IMG_PROCESS] 压缩 {_img_compressed} 张图片(节省 {_bytes_saved//1024}KB)，清理历史 {_img_cleaned} 张")
+
     # === 上下文长度安全阀：已禁用，由注入引擎裁剪独立负责 ===
     msgs = request_body.get('messages', [])
     total_chars = sum(len(str(m.get('content', ''))) for m in msgs)
