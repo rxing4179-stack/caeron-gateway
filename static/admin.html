@@ -735,38 +735,132 @@ Line: ' + line + ', Col: ' + col + '
                 </div>
             </section>
             
-            <!-- 向量召回 -->
+            <!-- 记忆库 -->
             <section v-show="currentTab === 'recall'">
                 <div class="flex justify-between items-center mb-4">
-                    <h2 class="text-lg font-semibold text-[#2c3e50]">向量召回测试</h2>
-                </div>
-                
-                <div class="bg-white rounded-xl border border-[#aecfd1] p-4 mb-4">
-                    <label class="block text-sm font-medium text-[#5a7a7d] mb-2">输入测试文本：</label>
-                    <textarea v-model="recallInputText" rows="3" class="w-full border border-[#aecfd1] rounded-lg p-3 text-[#2c3e50] focus:outline-none focus:ring-1 focus:ring-[#4199a0] focus:border-[#4199a0] bg-white transition-shadow" placeholder="例如：肚子疼..."></textarea>
-                    
-                    <button @click="testRecall" :disabled="loading.recall" class="mt-4 bg-[#4199a0] hover:bg-[#77b5b4] text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 flex items-center">
-                        <span v-if="loading.recall" class="mr-2">
-                            <svg class="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                        </span>
-                        测试召回
-                    </button>
+                    <h2 class="text-lg font-semibold text-[#2c3e50]">记忆库浏览与管理</h2>
                 </div>
 
-                <div>
-                    <h3 class="text-md font-semibold text-[#2c3e50] mb-3 pb-2 border-b border-[#aecfd1]">召回结果 (Top 5, 相似度 > 0.5)</h3>
-                    
-                    <div v-if="recallResults.length > 0" class="space-y-3">
-                        <div v-for="(item, index) in recallResults" :key="index" class="bg-white rounded-xl border border-[#aecfd1] p-4">
-                            <div class="flex items-center justify-between mb-2">
-                                <span class="text-xs font-semibold px-2 py-1 bg-[#deebec] text-[#4199a0] rounded">#{{ index + 1 }}</span>
-                                <span class="text-sm font-mono text-[#5a7a7d]">相似度: <span class="font-bold text-[#2c3e50]">{{ item.sim }}</span></span>
-                            </div>
-                            <p class="text-[#2c3e50] text-sm whitespace-pre-wrap">{{ item.content }}</p>
-                        </div>
+                <!-- 统计卡片 -->
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4 text-center shadow-sm">
+                        <div class="text-xs text-[#5a7a7d] mb-1">总计记忆</div>
+                        <div class="text-2xl font-bold text-[#2c3e50]">{{ memoryStats.total || 0 }}</div>
                     </div>
-                    <div v-else-if="hasSearchedRecall && recallResults.length === 0" class="text-center py-8 text-[#5a7a7d] bg-white/50 rounded-xl border border-[#aecfd1]/50">
-                        未找到相关记忆。
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4 text-center shadow-sm">
+                        <div class="text-xs text-[#5a7a7d] mb-1">对话对 (dialogue)</div>
+                        <div class="text-2xl font-bold text-[#4199a0]">{{ memoryStats.categories?.dialogue || 0 }}</div>
+                    </div>
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4 text-center shadow-sm">
+                        <div class="text-xs text-[#5a7a7d] mb-1">向量覆盖</div>
+                        <div class="text-2xl font-bold text-[#2c3e50]">{{ memoryStats.has_emb || 0 }} <span class="text-sm font-normal text-[#5a7a7d]">/ {{ memoryStats.total || 0 }}</span></div>
+                    </div>
+                    <div class="bg-white rounded-xl border border-[#aecfd1] p-4 text-center shadow-sm">
+                        <div class="text-xs text-[#5a7a7d] mb-1">最后更新时间</div>
+                        <div class="text-sm font-medium text-[#2c3e50] mt-2">{{ formatTime(memoryStats.latest_time) || '无' }}</div>
+                    </div>
+                </div>
+
+                <!-- 工具栏 -->
+                <div class="bg-white rounded-xl border border-[#aecfd1] p-4 mb-4 flex flex-wrap gap-4 items-center shadow-sm">
+                    <div class="flex items-center space-x-2">
+                        <label class="text-sm text-[#5a7a7d]">分类:</label>
+                        <select v-model="memoryFilter.category" @change="fetchMemories(1)" class="border border-[#aecfd1] rounded px-2 py-1 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                            <option value="">全部</option>
+                            <option value="dialogue">dialogue</option>
+                            <option value="operit">operit</option>
+                            <option value="status">status</option>
+                        </select>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <label class="text-sm text-[#5a7a7d]">向量:</label>
+                        <select v-model="memoryFilter.has_embedding" @change="fetchMemories(1)" class="border border-[#aecfd1] rounded px-2 py-1 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                            <option value="">全部</option>
+                            <option value="true">✅ 已生成</option>
+                            <option value="false">❌ 未生成</option>
+                        </select>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <label class="text-sm text-[#5a7a7d]">排序:</label>
+                        <select v-model="memoryFilter.order" @change="fetchMemories(1)" class="border border-[#aecfd1] rounded px-2 py-1 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                            <option value="time_desc">最新</option>
+                            <option value="time_asc">最旧</option>
+                        </select>
+                    </div>
+                    <div class="flex-1 flex items-center space-x-2 min-w-[200px]">
+                        <input v-model="memoryFilter.search" @keyup.enter="fetchMemories(1)" type="text" placeholder="搜索关键词..." class="w-full border border-[#aecfd1] rounded px-3 py-1 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
+                        <button @click="fetchMemories(1)" class="bg-[#4199a0] text-white px-3 py-1 rounded text-sm hover:bg-[#77b5b4] transition-colors">搜索</button>
+                    </div>
+                </div>
+
+                <!-- 列表展示 -->
+                <div class="bg-white rounded-xl border border-[#aecfd1] overflow-hidden mb-4 shadow-sm">
+                    <div v-if="loading.memories" class="text-center py-8 text-[#5a7a7d]">加载中...</div>
+                    <div v-else-if="memories.length === 0" class="text-center py-8 text-[#5a7a7d]">无相关记忆记录</div>
+                    <table v-else class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-[#f4f9f9] border-b border-[#aecfd1] text-xs text-[#5a7a7d]">
+                                <th class="p-3 font-medium">ID</th>
+                                <th class="p-3 font-medium">分类</th>
+                                <th class="p-3 font-medium w-1/2">内容预览</th>
+                                <th class="p-3 font-medium text-center">状态</th>
+                                <th class="p-3 font-medium text-right">时间</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-for="mem in memories" :key="mem.id" @click="viewMemoryDetail(mem)" class="border-b border-[#aecfd1]/30 hover:bg-[#f4f9f9] cursor-pointer transition-colors text-sm text-[#2c3e50]">
+                                <td class="p-3 font-mono text-xs">#{{ mem.id }}</td>
+                                <td class="p-3"><span class="px-2 py-0.5 bg-[#deebec] text-[#4199a0] rounded-full text-xs">{{ mem.category || 'unknown' }}</span></td>
+                                <td class="p-3 truncate max-w-[300px]" :title="mem.content_preview">{{ mem.content_preview }}</td>
+                                <td class="p-3 text-center">
+                                    <span v-if="mem.has_emb" title="已向量化">✅</span>
+                                    <span v-else title="未向量化">❌</span>
+                                </td>
+                                <td class="p-3 text-right text-xs text-[#5a7a7d] whitespace-nowrap">{{ formatTime(mem.created_at) }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- 分页 -->
+                <div v-if="memoryPagination.total > 0" class="flex justify-between items-center bg-white rounded-xl border border-[#aecfd1] p-3 shadow-sm">
+                    <div class="text-sm text-[#5a7a7d]">
+                        共 {{ memoryPagination.total }} 条，当前第 {{ memoryPagination.page }} / {{ Math.ceil(memoryPagination.total / memoryPagination.size) }} 页
+                    </div>
+                    <div class="flex space-x-2">
+                        <button @click="fetchMemories(memoryPagination.page - 1)" :disabled="memoryPagination.page <= 1" class="px-3 py-1 border border-[#aecfd1] rounded text-sm text-[#2c3e50] hover:bg-[#f4f9f9] disabled:opacity-50 transition-colors">上一页</button>
+                        <button @click="fetchMemories(memoryPagination.page + 1)" :disabled="memoryPagination.page >= Math.ceil(memoryPagination.total / memoryPagination.size)" class="px-3 py-1 border border-[#aecfd1] rounded text-sm text-[#2c3e50] hover:bg-[#f4f9f9] disabled:opacity-50 transition-colors">下一页</button>
+                    </div>
+                </div>
+
+                <!-- 原有召回测试 (收纳) -->
+                <div class="mt-8 border-t border-[#aecfd1] pt-6">
+                    <div class="flex items-center justify-between mb-4 cursor-pointer" @click="showRecallTest = !showRecallTest">
+                        <h3 class="text-md font-semibold text-[#2c3e50] flex items-center">
+                            <svg :class="{'rotate-90': showRecallTest}" class="w-4 h-4 mr-2 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                            语义召回测试工具
+                        </h3>
+                    </div>
+                    <div v-show="showRecallTest" class="bg-[#f4f9f9] rounded-xl border border-[#aecfd1] p-4">
+                        <label class="block text-sm font-medium text-[#5a7a7d] mb-2">输入测试文本：</label>
+                        <textarea v-model="recallInputText" rows="2" class="w-full border border-[#aecfd1] rounded-lg p-3 text-[#2c3e50] focus:outline-none focus:ring-1 focus:ring-[#4199a0] focus:border-[#4199a0] bg-white transition-shadow" placeholder="例如：肚子疼..."></textarea>
+                        
+                        <button @click="testRecall" :disabled="loading.recall" class="mt-4 bg-[#4199a0] hover:bg-[#77b5b4] text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 flex items-center">
+                            <span v-if="loading.recall" class="mr-2">
+                                <svg class="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                            </span>
+                            测试召回
+                        </button>
+
+                        <div class="mt-4" v-if="recallResults.length > 0 || hasSearchedRecall">
+                            <h4 class="text-sm font-semibold text-[#2c3e50] mb-2">召回结果 (Top 5, 相似度 > 0.5)</h4>
+                            <div v-if="recallResults.length > 0" class="space-y-2">
+                                <div v-for="(item, index) in recallResults" :key="index" class="bg-white rounded border border-[#aecfd1] p-3 text-sm text-[#2c3e50]">
+                                    <span class="font-bold text-[#4199a0] mr-2">[{{ item.sim }}]</span> {{ item.content }}
+                                </div>
+                            </div>
+                            <div v-else class="text-[#5a7a7d] text-sm py-2">未找到相关记忆。</div>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -1252,6 +1346,15 @@ Line: ' + line + ', Col: ' + col + '
                 const recallInputText = ref('');
                 const recallResults = ref([]);
                 const hasSearchedRecall = ref(false);
+                const showRecallTest = ref(false);
+
+                // 记忆库浏览状态
+                const memories = ref([]);
+                const memoryStats = ref({});
+                const memoryPagination = Vue.reactive({ page: 1, size: 50, total: 0 });
+                const memoryFilter = Vue.reactive({ category: '', has_embedding: '', search: '', order: 'time_desc' });
+                const showMemoryModal = ref(false);
+                const activeMemory = ref(null);
                 
                 // 模型选择弹窗状态
                 const showModelModal = ref(false);
@@ -2258,6 +2361,88 @@ Line: ' + line + ', Col: ' + col + '
                     }
                 };
 
+                                // ===== 记忆库逻辑 =====
+                const fetchMemoriesStats = async () => {
+                    try {
+                        const res = await fetch('/admin/api/memories/stats');
+                        if (res.ok) {
+                            memoryStats.value = await res.json();
+                        }
+                    } catch (err) { console.error('fetchMemoriesStats error', err); }
+                };
+
+                const fetchMemories = async (page = 1) => {
+                    memoryPagination.page = page;
+                    loading.memories = true;
+                    try {
+                        const params = new URLSearchParams({
+                            page: memoryPagination.page,
+                            size: memoryPagination.size,
+                            category: memoryFilter.category,
+                            has_embedding: memoryFilter.has_embedding,
+                            search: memoryFilter.search,
+                            order: memoryFilter.order
+                        });
+                        const res = await fetch('/admin/api/memories?' + params.toString());
+                        const data = await res.json();
+                        if (res.ok) {
+                            memories.value = data.items;
+                            memoryPagination.total = data.total;
+                        } else {
+                            showToast(data.detail || '获取记忆列表失败', 'error');
+                        }
+                    } catch (err) {
+                        showToast('网络错误', 'error');
+                    } finally {
+                        loading.memories = false;
+                    }
+                };
+
+                const viewMemoryDetail = (mem) => {
+                    activeMemory.value = mem;
+                    showMemoryModal.value = true;
+                };
+
+                const deleteMemory = async (id) => {
+                    if (!confirm('确定要彻底删除这条记忆吗？操作不可恢复！')) return;
+                    try {
+                        const res = await fetch('/admin/api/memories/' + id, { method: 'DELETE' });
+                        if (res.ok) {
+                            showToast('删除成功', 'success');
+                            showMemoryModal.value = false;
+                            fetchMemories(memoryPagination.page);
+                            fetchMemoriesStats();
+                        } else {
+                            const data = await res.json();
+                            showToast(data.detail || '删除失败', 'error');
+                        }
+                    } catch (err) {
+                        showToast('网络错误', 'error');
+                    }
+                };
+
+                const reembedMemory = async (id) => {
+                    loading.reembed = true;
+                    try {
+                        const res = await fetch('/admin/api/memories/' + id + '/vectorize', { method: 'POST' });
+                        const data = await res.json();
+                        if (res.ok) {
+                            showToast('向量生成成功，维度: ' + data.embedding_size, 'success');
+                            if (activeMemory.value && activeMemory.value.id === id) {
+                                activeMemory.value.has_emb = true;
+                            }
+                            fetchMemories(memoryPagination.page);
+                            fetchMemoriesStats();
+                        } else {
+                            showToast(data.detail || '生成失败', 'error');
+                        }
+                    } catch (err) {
+                        showToast('网络错误', 'error');
+                    } finally {
+                        loading.reembed = false;
+                    }
+                };
+
                 const testRecall = async () => {
                     if (!recallInputText.value.trim()) return;
                     
@@ -2311,7 +2496,9 @@ Line: ' + line + ', Col: ' + col + '
                     summaries, summaryStats, summaryFilter, summaryActiveOnly, summaryConfig,
                     fetchSummaries, fetchSummaryStats, deleteSummary, fetchSummaryConfig, saveSummaryConfig, triggerRoundSummary, groupedConversations, expandedConvs, loadingConvs, messagesMap,
                     statusList, showStatusModal, editingStatus, statusForm, fetchStatus, openAddStatusModal, editStatus, saveStatus, deleteStatus,
-                    recallInputText, recallResults, hasSearchedRecall, testRecall,
+                    recallInputText, recallResults, hasSearchedRecall, testRecall, showRecallTest,
+                    memories, memoryStats, memoryPagination, memoryFilter, showMemoryModal, activeMemory,
+                    fetchMemoriesStats, fetchMemories, viewMemoryDetail, deleteMemory, reembedMemory,
                     qqConfig, allAvailableModels, fetchQQConfig, saveQQConfig,
                     techMode, fetchTechMode, toggleTechMode
                 };

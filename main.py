@@ -1463,6 +1463,149 @@ async def admin_calendar(year: int = None, month: int = None):
 
 # ==================== 记忆总览 API ====================
 
+
+# ==========================================
+# Admin API: Memories (记忆库管理)
+# ==========================================
+
+@app.get("/admin/api/memories/stats")
+async def get_memories_stats():
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT COUNT(*) FROM memories")
+        row = await cursor.fetchone()
+        total = row[0] if row else 0
+        
+        cursor = await db.execute("SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL")
+        row = await cursor.fetchone()
+        has_emb = row[0] if row else 0
+        
+        cursor = await db.execute("SELECT category, COUNT(*) FROM memories GROUP BY category")
+        rows = await cursor.fetchall()
+        categories = {row[0] or "unknown": row[1] for row in rows}
+        
+        cursor = await db.execute("SELECT MAX(created_at) FROM memories")
+        row = await cursor.fetchone()
+        latest_time = row[0] if row else None
+        
+        return {
+            "total": total,
+            "has_emb": has_emb,
+            "categories": categories,
+            "latest_time": latest_time
+        }
+    finally:
+        await db.close()
+
+@app.get("/admin/api/memories")
+async def get_memories(
+    page: int = 1, 
+    size: int = 50, 
+    category: str = None, 
+    has_embedding: str = None,
+    search: str = None,
+    order: str = "time_desc"
+):
+    offset = (page - 1) * size
+    query = "SELECT id, content, category, sentiment, intensity, created_at, embedding IS NOT NULL as has_emb, aliases FROM memories WHERE 1=1"
+    params = []
+    
+    if category:
+        query += " AND category = ?"
+        params.append(category)
+        
+    if has_embedding == "true":
+        query += " AND embedding IS NOT NULL"
+    elif has_embedding == "false":
+        query += " AND embedding IS NULL"
+        
+    if search:
+        query += " AND content LIKE ?"
+        params.append(f"%{search}%")
+        
+    if order == "time_asc":
+        query += " ORDER BY created_at ASC"
+    else:
+        query += " ORDER BY created_at DESC"
+        
+    query += f" LIMIT {size} OFFSET {offset}"
+    
+    db = await get_db()
+    try:
+        # Count total for pagination
+        count_query = "SELECT COUNT(*) FROM memories WHERE 1=1"
+        count_params = params[:]
+        if category: count_query += " AND category = ?"
+        if has_embedding == "true": count_query += " AND embedding IS NOT NULL"
+        elif has_embedding == "false": count_query += " AND embedding IS NULL"
+        if search: count_query += " AND content LIKE ?"
+        
+        cursor = await db.execute(count_query, count_params)
+        row = await cursor.fetchone()
+        total = row[0] if row else 0
+        
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+        
+        memories = []
+        for row in rows:
+            content = row[1] or ""
+            content_preview = content[:100] + ("..." if len(content) > 100 else "")
+            memories.append({
+                "id": row[0],
+                "content_preview": content_preview,
+                "content": content,
+                "category": row[2],
+                "valence": row[3],
+                "arousal": row[4],
+                "anchor": None,
+                "tags": row[7],
+                "created_at": row[5],
+                "has_emb": bool(row[6])
+            })
+            
+        return {"total": total, "items": memories}
+    finally:
+        await db.close()
+
+@app.delete("/admin/api/memories/{memory_id}")
+async def delete_memory(memory_id: int):
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        await db.commit()
+        return {"status": "ok"}
+    finally:
+        await db.close()
+
+@app.post("/admin/api/memories/{memory_id}/vectorize")
+async def vectorize_memory(memory_id: int):
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT content FROM memories WHERE id = ?", (memory_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+            
+        content = row[0]
+        if not content:
+            raise HTTPException(status_code=400, detail="Content is empty")
+            
+        from embedding import get_embedding
+        import asyncio
+        emb = await asyncio.to_thread(get_embedding, content)
+        if not emb:
+            raise HTTPException(status_code=500, detail="Failed to generate embedding")
+            
+        import json
+        emb_bytes = json.dumps(emb).encode('utf-8')
+        await db.execute("UPDATE memories SET embedding = ? WHERE id = ?", (emb_bytes, memory_id))
+        await db.commit()
+        
+        return {"status": "ok", "embedding_size": len(emb)}
+    finally:
+        await db.close()
+
 @app.get("/admin/api/summaries")
 async def get_summaries(tag: str = None, is_active: int = None, limit: int = 100):
     """获取总结列表，支持按tag和is_active筛选"""
