@@ -128,7 +128,7 @@ Line: ' + line + ', Col: ' + col + '
             <button @click="currentTab = 'conversations'; fetchCalendar()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'conversations', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'conversations'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">对话记录</button>
             <button @click="currentTab = 'memory'; fetchSummaries(); fetchSummaryStats(); fetchSummaryConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'memory', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'memory'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">记忆总览</button>
             <button @click="currentTab = 'status'; fetchStatus()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'status', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'status'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">状态便签</button>
-            <button @click="currentTab = 'recall'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'recall', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'recall'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">向量召回</button>
+            <button @click="currentTab = 'recall'; fetchMemories(1); fetchMemoriesStats()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'recall', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'recall'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">向量召回</button>
             <button @click="currentTab = 'qq_config'; fetchQQConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'qq_config', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'qq_config'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">QQ设置</button>
             <a href="/games/snake" target="_blank" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors text-[#5a7a7d] hover:text-[#4199a0] inline-flex items-center">小游戏</a>
         </nav>
@@ -777,7 +777,7 @@ Line: ' + line + ', Col: ' + col + '
                         <select v-model="memoryFilter.has_embedding" @change="fetchMemories(1)" class="border border-[#aecfd1] rounded px-2 py-1 text-sm text-[#2c3e50] focus:outline-none focus:border-[#4199a0]">
                             <option value="">全部</option>
                             <option value="true">✅ 已生成</option>
-                            <option value="false">❌ 未生成</option>
+                            <option value="false">❌ 未生成(无向量)</option>
                         </select>
                     </div>
                     <div class="flex items-center space-x-2">
@@ -797,29 +797,31 @@ Line: ' + line + ', Col: ' + col + '
                 <div class="bg-white rounded-xl border border-[#aecfd1] overflow-hidden mb-4 shadow-sm">
                     <div v-if="loading.memories" class="text-center py-8 text-[#5a7a7d]">加载中...</div>
                     <div v-else-if="memories.length === 0" class="text-center py-8 text-[#5a7a7d]">无相关记忆记录</div>
-                    <table v-else class="w-full text-left border-collapse">
-                        <thead>
-                            <tr class="bg-[#f4f9f9] border-b border-[#aecfd1] text-xs text-[#5a7a7d]">
-                                <th class="p-3 font-medium">ID</th>
-                                <th class="p-3 font-medium">分类</th>
-                                <th class="p-3 font-medium w-1/2">内容预览</th>
-                                <th class="p-3 font-medium text-center">状态</th>
-                                <th class="p-3 font-medium text-right">时间</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr v-for="mem in memories" :key="mem.id" @click="viewMemoryDetail(mem)" class="border-b border-[#aecfd1]/30 hover:bg-[#f4f9f9] cursor-pointer transition-colors text-sm text-[#2c3e50]">
-                                <td class="p-3 font-mono text-xs">#{{ mem.id }}</td>
-                                <td class="p-3"><span class="px-2 py-0.5 bg-[#deebec] text-[#4199a0] rounded-full text-xs">{{ mem.category || 'unknown' }}</span></td>
-                                <td class="p-3 truncate max-w-[300px]" :title="mem.content_preview">{{ mem.content_preview }}</td>
-                                <td class="p-3 text-center">
-                                    <span v-if="mem.has_emb" title="已向量化">✅</span>
-                                    <span v-else title="未向量化">❌</span>
-                                </td>
-                                <td class="p-3 text-right text-xs text-[#5a7a7d] whitespace-nowrap">{{ formatTime(mem.created_at) }}</td>
-                            </tr>
-                        </tbody>
-                    </table>
+                    <div v-else class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse whitespace-nowrap">
+                            <thead>
+                                <tr class="bg-[#f4f9f9] border-b border-[#aecfd1] text-xs text-[#5a7a7d]">
+                                    <th class="p-3 font-medium">ID</th>
+                                    <th class="p-3 font-medium">分类</th>
+                                    <th class="p-3 font-medium w-full max-w-sm">内容预览</th>
+                                    <th class="p-3 font-medium text-center">状态</th>
+                                    <th class="p-3 font-medium text-right">时间</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-for="mem in memories" :key="mem.id" @click="viewMemoryDetail(mem)" class="border-b border-[#aecfd1]/30 hover:bg-[#f4f9f9] cursor-pointer transition-colors text-sm text-[#2c3e50]">
+                                    <td class="p-3 font-mono text-xs">#{{ mem.id }}</td>
+                                    <td class="p-3"><span class="px-2 py-0.5 bg-[#deebec] text-[#4199a0] rounded-full text-xs">{{ mem.category || 'unknown' }}</span></td>
+                                    <td class="p-3 truncate max-w-xs sm:max-w-md md:max-w-lg" :title="mem.content_preview">{{ mem.content_preview }}</td>
+                                    <td class="p-3 text-center">
+                                        <span v-if="mem.has_emb" title="已向量化">✅</span>
+                                        <span v-else title="未向量化">❌</span>
+                                    </td>
+                                    <td class="p-3 text-right text-xs text-[#5a7a7d]">{{ formatTime(mem.created_at) }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
 
                 <!-- 分页 -->

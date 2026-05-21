@@ -503,7 +503,7 @@ async def _handle_chat_completions(request: Request):
     
     # 异步存储，不阻塞主流程（存储失败不影响请求转发）
     stored_count = 0
-    _is_qq = request.headers.get('x-skip-injection', '').lower() == 'true'
+    _is_qq = request.headers.get('x-skip-rules', '').lower() == 'true'
     try:
         await ensure_conversation(conversation_id, model=model)
         if _is_qq:
@@ -687,7 +687,7 @@ async def _handle_chat_completions(request: Request):
     # === Bug 0.5 修复：彻底清理 tool 调用链（仅QQ来源） ===
     # Operit端自带完整tool_use+tool_result配对，清理会导致模型复读工具调用
     # 只对QQ来源（skip_injection=true）执行清理
-    _is_qq_source = request.headers.get('x-skip-injection', '').lower() == 'true'
+    _is_qq_source = request.headers.get('x-skip-rules', '').lower() == 'true'
     
     if _is_qq_source:
         msgs = body.get('messages', [])
@@ -728,15 +728,20 @@ async def _handle_chat_completions(request: Request):
                     c = c.replace('...', '').replace('…', '').strip()
                     msg['content'] = c if c else ' '
 
-    # 检查是否需要跳过注入引擎
-    skip_injection = request.headers.get('x-skip-injection', '').lower() == 'true'
+    # 检查是否为 QQ 来源（跳过规则注入，但保留记忆注入）
+    skip_rules = request.headers.get('x-skip-rules', '').lower() == 'true'
     
-    # 技术模式 或 QQ非蕊蕊来源(已自带QQ prompt) 跳过注入引擎
-    if tech_mode:
+    if skip_rules:
+        # QQ 来源：跳过 injection_rules（Operit人格提示词），但注入记忆/摘要（跨端桥接）
+        # QQ 始终以日常模式运行，不受技术模式影响
+        injection_engine = InjectionEngine()
+        body['messages'] = await injection_engine.inject_memory_only(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
+        logger.info(f"[QQ_INJECT] QQ来源: 跳过规则注入，执行记忆注入（跨端桥接）")
+    elif tech_mode:
+        # Operit 技术模式：跳过所有注入
         logger.info(f"[TECH_MODE] 技术模式启用，跳过注入引擎，保留原始 {len(body.get('messages', []))} 条消息")
-    elif skip_injection:
-        logger.info(f"[SKIP_INJECTION] 请求来源已自带提示词 (source={explicit_source})，跳过注入引擎")
     else:
+        # Operit 日常模式：完整注入（规则 + 记忆）
         injection_engine = InjectionEngine()
         body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
 
@@ -1524,9 +1529,9 @@ async def get_memories(
         params.append(f"%{search}%")
         
     if order == "time_asc":
-        query += " ORDER BY created_at ASC"
+        query += " ORDER BY created_at ASC, id ASC"
     else:
-        query += " ORDER BY created_at DESC"
+        query += " ORDER BY created_at DESC, id DESC"
         
     query += f" LIMIT {size} OFFSET {offset}"
     

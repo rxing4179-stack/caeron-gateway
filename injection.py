@@ -148,6 +148,26 @@ class InjectionEngine:
         logger.info(f"注入完成: 原始消息数={len(messages)}, 注入后消息数={len(injected_messages)}")
         return injected_messages
 
+    async def inject_memory_only(self, messages: list[dict], request_info: dict = None) -> list[dict]:
+        """
+        仅记忆注入模式（QQ 跨端桥接用）
+        跳过 injection_rules 中的规则（Operit人格提示词等），
+        只执行记忆注入（轮总/日总/语义召回/状态便签/裁剪逻辑）
+        """
+        injected_messages = copy.deepcopy(messages)
+        if not request_info:
+            request_info = {}
+        
+        logger.info(f"[记忆注入-QQ] 仅记忆模式启动, 消息数={len(injected_messages)}")
+        
+        try:
+            await self._inject_round_summaries(injected_messages, request_info)
+        except Exception as e:
+            logger.error(f"[记忆注入-QQ] 记忆注入异常（不影响请求）: {e}")
+        
+        logger.info(f"[记忆注入-QQ] 完成: 原始={len(messages)}, 注入后={len(injected_messages)}")
+        return injected_messages
+
     async def _inject_round_summaries(self, messages: list[dict], request_info: dict):
         """多级记忆注入：月总+周总+日总+轮总，按活跃状态自动切换，并裁剪已被总结覆盖的原始消息"""
         # 1. 检查是否已经注入过总结，防止重复
@@ -307,67 +327,6 @@ class InjectionEngine:
                     r = dict(r)
                     parts.append(f"- [轮总 #{idx}/{total}] [{r['created_at']}] {r['content']}")
 
-            # 7. 跨端微桥接：注入其他端还没被总结的最近消息原文
-            current_conv_id = request_info.get('conversation_id', '')
-            if current_conv_id:
-                try:
-                    # 找到最新轮总的时间作为基准线
-                    cursor = await db.execute(
-                        """SELECT created_at FROM summaries 
-                           WHERE tag = 'round' AND is_active = 1 
-                           ORDER BY created_at DESC LIMIT 1"""
-                    )
-                    latest_round_row = await cursor.fetchone()
-                    cutoff_time = dict(latest_round_row)['created_at'] if latest_round_row else yesterday
-                    
-                    # 查询其他端在最新轮总之后的消息（排除system角色）
-                    cursor = await db.execute(
-                        """SELECT conversation_id, role, content, created_at 
-                           FROM messages 
-                           WHERE conversation_id != ? 
-                           AND created_at > ?
-                           AND role IN ('user', 'assistant')
-                           AND content NOT LIKE '%tool_result%'
-                           AND content NOT LIKE '%tool_use%'
-                           AND content NOT LIKE '%package_proxy%'
-                           AND content NOT LIKE '%linux_ssh%'
-                           AND length(content) > 5
-                           AND length(content) < 2000
-                           ORDER BY created_at ASC
-                           LIMIT 12""",
-                        (current_conv_id, cutoff_time)
-                    )
-                    cross_rows = await cursor.fetchall()
-                    
-                    if cross_rows:
-                        has_any_summaries = True
-                        parts.append('')
-                        parts.append('【跨端未总结上下文 — 另一端最近的对话原文】')
-                        for r in cross_rows:
-                            r = dict(r)
-                            conv = r['conversation_id']
-                            if conv == 'qq-ruirui':
-                                src = 'QQ私聊'
-                            elif conv.startswith('qq-group-'):
-                                src = 'QQ群聊'
-                            elif conv.startswith('qq-private-'):
-                                src = 'QQ私聊'
-                            else:
-                                src = 'Operit'
-                            
-                            role_label = '蕊蕊' if r['role'] == 'user' else '沈栖'
-                            content = r['content'] or ''
-                            if len(content) > 300:
-                                content = content[:300] + '...'
-                            # 提取时间 HH:MM
-                            time_str = r['created_at'][-8:-3] if r['created_at'] and len(r['created_at']) >= 8 else '?'
-                            parts.append(f'- [{time_str} {src}] {role_label}: {content}')
-                        
-                        tag_counts['cross_endpoint'] = len(cross_rows)
-                        logger.info(f'[记忆注入] 跨端微桥接：注入 {len(cross_rows)} 条来自其他端的未总结消息')
-                except Exception as e:
-                    logger.error(f'[记忆注入] 跨端微桥接异常（不影响请求）: {e}')
-
             # 读取当前消息计数器
             unsummarized_count = 0
             cursor = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")
@@ -406,8 +365,48 @@ class InjectionEngine:
                 else:
                     logger.info(f"[记忆裁剪-出口] 对话 {len(dialog_indices)} 条 <= 保留阈值 {keep_count}，不裁剪")
 
-            # === 状态便签已禁用 ===
+            # === 获取状态便签 ===
+            cursor = await db.execute("SELECT content, updated_at, threshold_hours FROM memories WHERE category = 'status'")
+            status_rows = await cursor.fetchall()
             status_lines = []
+            if status_rows:
+                status_lines.append("<current_status>")
+                status_lines.append("| 项目 | 上次完成 | 距今 | 状态 |")
+                status_lines.append("|------|---------|------|------|")
+                now = now_cst()
+                from datetime import datetime
+                for r in status_rows:
+                    key = r['content']
+                    updated_at_str = r['updated_at']
+                    threshold = r['threshold_hours'] or 24
+                    
+                    if not updated_at_str:
+                        status_lines.append(f"| {key} | 未记录 | - | 未记录 |")
+                        continue
+                    
+                    try:
+                        updated_at = datetime.strptime(updated_at_str, '%Y-%m-%d %H:%M:%S')
+                        diff_hours = (now - updated_at).total_seconds() / 3600.0
+                        
+                        if diff_hours < 1:
+                            diff_str = f"{diff_hours*60:.0f}m前"
+                        else:
+                            diff_str = f"{diff_hours:.1f}h前"
+                        
+                        time_str = updated_at.strftime('%m-%d %H:%M')
+                        
+                        if diff_hours < threshold:
+                            state_str = "正常"
+                        elif diff_hours < threshold * 1.5:
+                            state_str = "即将超时"
+                        else:
+                            state_str = "超时"
+                            
+                        status_lines.append(f"| {key} | {time_str} | {diff_str} | {state_str} |")
+                    except Exception as e:
+                        logger.error(f"解析状态便签时间失败: {e}")
+                        status_lines.append(f"| {key} | {updated_at_str} | - | 解析异常 |")
+                status_lines.append("</current_status>\n")
 
             # 组装总结文本
             summary_lines = []
