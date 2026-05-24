@@ -15,7 +15,7 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gateway.db')
 
 async def get_db():
     """获取数据库连接"""
-    db = await aiosqlite.connect(DB_PATH)
+    db = await aiosqlite.connect(DB_PATH, timeout=20.0)
     db.row_factory = aiosqlite.Row
     # 启用 WAL 模式提升并发性能
     await db.execute("PRAGMA journal_mode=WAL")
@@ -109,6 +109,23 @@ async def init_db():
             )
         ''')
 
+        # ==================== 统一消息表（双端桥接存档） ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS unified_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT (datetime('now', '+8 hours')),
+                source TEXT NOT NULL,          -- 'qq' / 'operit'
+                source_context TEXT,           -- 'group_123', 'private_456', 或 'main'
+                role TEXT NOT NULL,            -- 'user' / 'assistant'
+                content TEXT NOT NULL,
+                char_count INTEGER,            -- 字符数估算 token
+                metadata TEXT                  -- JSON，用于存放图片等附加信息
+            )
+        ''')
+        await db.execute('''
+            CREATE INDEX IF NOT EXISTS idx_unified_ts ON unified_messages(timestamp DESC)
+        ''')
+
         # ==================== 总结表（多层级） ====================
         await db.execute('''
             CREATE TABLE IF NOT EXISTS summaries (
@@ -164,11 +181,37 @@ async def init_db():
         except Exception:
             pass  # 列已存在则忽略
             
+        # ==================== 记忆碎片表 (Dual Track Recall) ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS memory_fragments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_dialogue_id INTEGER,
+                content TEXT NOT NULL,
+                tier INTEGER NOT NULL,
+                energy INTEGER DEFAULT 5,
+                polarity TEXT DEFAULT 'neutral',
+                tags TEXT,
+                embedding BLOB,
+                activation_count INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
+                is_suspect INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
+                expired_at TIMESTAMP,
+                FOREIGN KEY (source_dialogue_id) REFERENCES memories(id)
+            )
+        ''')
+            
         # Migration: memories 表添加 aliases 列（状态便签别名）
         try:
             await db.execute("ALTER TABLE memories ADD COLUMN aliases TEXT DEFAULT ''")
         except Exception:
             pass  # 列已存在则忽略
+            
+        # Migration: memory_fragments 表添加 is_suspect 列
+        try:
+            await db.execute("ALTER TABLE memory_fragments ADD COLUMN is_suspect INTEGER DEFAULT 0")
+        except Exception:
+            pass
 
         # 初始化状态便签种子数据
         status_seeds = [

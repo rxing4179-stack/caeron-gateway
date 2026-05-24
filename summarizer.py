@@ -76,7 +76,7 @@ DAILY_SUMMARY_PROMPT = """你是日总结器。将今天的所有轮总压缩为
 - 禁止复述每条轮总的原文，要合并同类事项
 - 允许保留1-2个能让这天"活过来"的具体细节
 - 禁止笼统情感评价（如"度过了充实的一天""感情更进一步"）
-- 格式：纯文本，一段话����句号分隔
+- 格式：纯文本，一段话，句号分隔
 - 主语用蕊蕊和沈栖
 """
 
@@ -273,7 +273,7 @@ class MultiLevelSummarizer:
                 if last_row:
                     from datetime import datetime
                     last_time = datetime.strptime(last_row['created_at'], '%Y-%m-%d %H:%M:%S')
-                    now = now_cst()
+                    now = datetime.now()
                     diff_seconds = (now - last_time).total_seconds()
                     logger.info(f"[SUMMARIZER] 上次轮总时间: {last_row['created_at']} (距今 {diff_seconds:.1f} 秒)")
                     if diff_seconds < 180:
@@ -301,17 +301,7 @@ class MultiLevelSummarizer:
         # 构建LLM输入
         formatted_messages = []
         total_chars = 0
-        prev_conv_id = None
         for msg in messages:
-            # 场景切换标记
-            conv_id_raw = msg.get("conversation_id", "")
-            if prev_conv_id is not None and conv_id_raw != prev_conv_id:
-                scene_label = "QQ蕊蕊私聊" if conv_id_raw == "qq-ruirui" else (
-                    f"QQ群聊({conv_id_raw.split('-')[-1]})" if conv_id_raw.startswith("qq-group-") else (
-                    f"QQ私聊({conv_id_raw.split('-')[-1]})" if conv_id_raw.startswith("qq-private-") else "Operit对话"
-                ))
-                formatted_messages.append(f"--- 场景切换：{scene_label} ---")
-            prev_conv_id = conv_id_raw
             content = msg["content"] or ""
             
             # 处理多模态content（可能是JSON数组字符串）
@@ -352,28 +342,7 @@ class MultiLevelSummarizer:
             if len(content) > 2000:
                 content = content[:1000] + "\n...[内容截断]...\n" + content[-500:]
             
-            # 根据 conversation_id 区分对话者
-            conv_id = msg.get("conversation_id", "")
-            if msg["role"] == "user":
-                if conv_id == "qq-ruirui" or not conv_id.startswith("qq-"):
-                    role_label = "蕊蕊"
-                elif conv_id.startswith("qq-group-"):
-                    # 从content里提取 [发送者] 标签
-                    import re as _re
-                    _sender_match = _re.match(r'\[(?:触发消息 - |)(.+?)\]', content)
-                    if _sender_match:
-                        _sender = _sender_match.group(1)
-                        role_label = f"{_sender}(群{conv_id.split('-')[-1]})"
-                    else:
-                        role_label = f"群友(群{conv_id.split('-')[-1]})"
-                elif conv_id.startswith("qq-private-"):
-                    role_label = f"QQ用户({conv_id.split('-')[-1]})"
-                else:
-                    role_label = "蕊蕊"
-            else:
-                role_label = "沈栖"
-            
-            # 在跨conversation边界时插入场景切换标记
+            role_label = "蕊蕊" if msg["role"] == "user" else "沈栖"
             timestamp = msg["created_at"] or "?"
             line = f"[{timestamp}] {role_label}: {content}"
             total_chars += len(line)
@@ -520,7 +489,7 @@ class MultiLevelSummarizer:
         try:
             today = today_cst_str()
             cursor = await db.execute(
-                """SELECT id, content, created_at, period_start, period_end FROM summaries
+                """SELECT id, content, created_at FROM summaries
                    WHERE tag = 'round' AND is_active = 1
                    AND date(created_at) = ?
                    ORDER BY created_at ASC
@@ -554,8 +523,8 @@ class MultiLevelSummarizer:
             level='round_rollup',
             content=rollup_content,
             msg_count=len(old_rounds),
-            period_start=old_rounds[0].get('period_start') or old_rounds[0]['created_at'],
-            period_end=old_rounds[-1].get('period_end') or old_rounds[-1]['created_at']
+            period_start=old_rounds[0]['created_at'],
+            period_end=old_rounds[-1]['created_at']
         )
         
         # 归档被压缩的轮总
@@ -864,19 +833,6 @@ class MultiLevelSummarizer:
                             msg_count: int = 0, period_start: str = None, period_end: str = None,
                             category: str = None, valence: float = None, arousal: float = None, anchor: str = None, tags: str = None):
         """保存总结到数据库"""
-        # 在content前添加时间跨度标记（admin面板+注入都能直接看到）
-        if period_start and period_end:
-            try:
-                ps_t = period_start[11:16] if len(period_start) >= 16 else period_start
-                pe_t = period_end[11:16] if len(period_end) >= 16 else period_end
-                ps_d = period_start[:10] if len(period_start) >= 10 else ''
-                pe_d = period_end[:10] if len(period_end) >= 10 else ''
-                if ps_d == pe_d:
-                    content = f"⏱{ps_t}~{pe_t} | {content}"
-                else:
-                    content = f"⏱{ps_d} {ps_t}~{pe_d} {pe_t} | {content}"
-            except Exception:
-                pass
         now_bj = now_cst().strftime('%Y-%m-%d %H:%M:%S')
         db = await get_db()
         try:

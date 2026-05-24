@@ -11,6 +11,7 @@ from datetime import datetime
 
 from qq_config import config
 from database import get_db
+import message_store
 
 import logging
 logger = logging.getLogger(__name__)
@@ -95,34 +96,6 @@ class QQState:
         self.group_buffers: Dict[int, List[dict]] = {}
 
 qq_state = QQState()
-
-MAX_HISTORY_CHARS = 50000  # 5万字符硬上限
-
-async def get_session_history(session_id: str, limit: int = config.SESSION_MAX_TURNS * 2) -> List[dict]:
-    db = await get_db()
-    try:
-        cursor = await db.execute('''
-            SELECT role, content FROM messages 
-            WHERE conversation_id = ? 
-            ORDER BY message_index DESC LIMIT ?
-        ''', (session_id, limit))
-        rows = await cursor.fetchall()
-        # 先压缩历史中的图片
-        history = []
-        for row in reversed(rows):
-            content = _compress_history_images(row['content'])
-            history.append({"role": row['role'], "content": content})
-        
-        # 从最旧的开始丢弃，直到总字符 <= MAX_HISTORY_CHARS
-        total = sum(_content_chars(m['content']) for m in history)
-        while history and total > MAX_HISTORY_CHARS:
-            dropped = history.pop(0)
-            total -= _content_chars(dropped['content'])
-        
-        logger.info(f"[QQ] 历史回放: {len(history)} 条, {total} 字符")
-        return history
-    finally:
-        await db.close()
 
 async def send_to_gateway(session_id: str, source: str, messages: list):
     """请求网关进行处理"""
@@ -210,19 +183,28 @@ def get_qq_prompt(is_ruirui: bool = False, is_group: bool = False) -> str:
 
 async def handle_generation(session_id: str, source: str, target_type: str, target_id: int, user_input: str, is_ruirui: bool = False):
     """处理消息生成流程"""
-    history = await get_session_history(session_id)
+    source_context = f"group_{target_id}" if target_type == "group" else f"private_{target_id}"
+    
+    # 1. 保存用户的最新输入
+    await message_store.store_unified_message('qq', source_context, 'user', user_input)
+    logger.info(f"[QQ] [{session_id}] [IN] {user_input[:50]}")
     
     # 根据来源选择提示词
     is_group = (target_type == "group")
     system_prompt = get_qq_prompt(is_ruirui=is_ruirui, is_group=is_group)
     
-    # 记忆注入由 injection engine 统一处理（跨端桥接），不再在这里单独检索
-    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_input}]
-    
-    # 记录输入日志
-    logger.info(f"[QQ] [{session_id}] [IN] {user_input[:50]}")
-    
-    reply = await send_to_gateway(session_id, source, messages)
+    # 获取全局锁防并发冲突
+    async with message_store.GATEWAY_SEND_LOCK:
+        # 2. 拉取统一历史
+        history = await message_store.get_unified_history(char_limit=15000)
+        
+        # 3. 组装发给大模型的上下文（包含系统提示词 + 统一历史，这里历史已经包含刚存入的 user_input）
+        messages = [{"role": "system", "content": system_prompt}] + history
+        
+        reply = await send_to_gateway(session_id, source, messages)
+        
+        # 4. 保存大模型的回复
+        await message_store.store_unified_message('qq', source_context, 'assistant', reply)
     
     # 记录输出日志
     logger.info(f"[QQ] [{session_id}] [OUT] {reply[:50]}")

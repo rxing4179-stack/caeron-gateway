@@ -128,7 +128,8 @@ Line: ' + line + ', Col: ' + col + '
             <button @click="currentTab = 'conversations'; fetchCalendar()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'conversations', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'conversations'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">对话记录</button>
             <button @click="currentTab = 'memory'; fetchSummaries(); fetchSummaryStats(); fetchSummaryConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'memory', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'memory'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">记忆总览</button>
             <button @click="currentTab = 'status'; fetchStatus()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'status', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'status'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">状态便签</button>
-            <button @click="currentTab = 'recall'; fetchMemories(1); fetchMemoriesStats()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'recall', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'recall'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">向量召回</button>
+            <button @click="currentTab = 'recall'; fetchMemories(1); fetchMemoriesStats()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'recall', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'recall'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">便签库召回</button>
+            <button @click="currentTab = 'fragments'; fetchFragments()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'fragments', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'fragments'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">碎片记忆</button>
             <button @click="currentTab = 'qq_config'; fetchQQConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'qq_config', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'qq_config'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">QQ设置</button>
             <a href="/games/snake" target="_blank" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors text-[#5a7a7d] hover:text-[#4199a0] inline-flex items-center">小游戏</a>
         </nav>
@@ -867,6 +868,121 @@ Line: ' + line + ', Col: ' + col + '
                 </div>
             </section>
 
+            <!-- 碎片记忆 -->
+            <section v-show="currentTab === 'fragments'">
+                <div class="flex flex-col gap-4">
+                    <div class="flex justify-between items-center">
+                        <h2 class="text-lg font-semibold text-[#2c3e50]">碎片记忆库</h2>
+                    </div>
+
+                    <!-- 搜索框 -->
+                    <div class="relative">
+                        <input type="text" v-model="fragmentsSearchQuery" placeholder="🔍 搜索记忆摘要..." 
+                               class="w-full pl-10 pr-4 py-2 border border-[#aecfd1] rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-[#4199a0] focus:border-transparent">
+                        <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                            <span class="text-gray-400">🔍</span>
+                        </div>
+                    </div>
+
+                    <!-- 标签筛选栏 -->
+                    <div v-if="fragmentsAllTags.length > 0" class="flex overflow-x-auto hide-scrollbar gap-2 pb-1">
+                        <button @click="fragmentsSelectedTags = []" 
+                                :class="fragmentsSelectedTags.length === 0 ? 'bg-[#4199a0] text-white border-[#4199a0]' : 'bg-white text-[#5a7a7d] border-[#aecfd1] hover:bg-[#f4f9f9]'"
+                                class="flex-shrink-0 px-3 py-1 text-sm border rounded-full transition-colors font-medium">
+                            全部
+                        </button>
+                        <button v-for="tag in fragmentsAllTags" :key="tag" @click="toggleFragmentTag(tag)"
+                                :class="fragmentsSelectedTags.includes(tag) ? 'bg-[#4199a0] text-white border-[#4199a0]' : 'bg-white text-[#5a7a7d] border-[#aecfd1] hover:bg-[#f4f9f9]'"
+                                class="flex-shrink-0 px-3 py-1 text-sm border rounded-full transition-colors">
+                            {{ tag }}
+                        </button>
+                    </div>
+
+                    <!-- 列表 -->
+                    <div class="bg-white rounded border border-[#aecfd1] shadow-sm flex flex-col divide-y divide-[#aecfd1]">
+                        <div v-if="fragmentsLoading" class="text-center py-8 text-[#5a7a7d]">加载中...</div>
+                        <div v-else-if="filteredFragments.length === 0" class="text-center py-8 text-[#5a7a7d]">没有匹配的记忆</div>
+                        
+                        <div v-else v-for="frag in filteredFragments" :key="frag.id" 
+                             class="flex flex-col p-3 transition-colors hover:bg-[#f4f9f9] cursor-pointer"
+                             @click="expandedFragmentId = frag.id === expandedFragmentId ? null : frag.id">
+                            
+                            <!-- 收起视图（双行紧凑显示） -->
+                            <div class="flex flex-col gap-1.5 w-full">
+                                <!-- 第一行：内容摘要 -->
+                                <div class="text-[#2c3e50] text-sm leading-snug line-clamp-2 w-full pr-1">
+                                    {{ frag.content }}
+                                </div>
+                                
+                                <!-- 第二行：状态/ID/标签/开关 -->
+                                <div class="flex items-center justify-between mt-0.5">
+                                    <div class="flex items-center gap-2 overflow-hidden flex-1">
+                                        <!-- 状态指示灯 -->
+                                        <div class="flex-shrink-0 flex items-center gap-1 text-xs font-medium" :class="frag.is_active ? 'text-green-500' : 'text-gray-400'" title="状态：手动控制">
+                                            <span class="text-lg leading-none" style="margin-top:-2px">{{ frag.is_active ? '●' : '○' }}</span>
+                                        </div>
+                                        
+                                        <!-- ID -->
+                                        <span class="flex-shrink-0 text-xs text-blue-500 font-mono">#{{ frag.id }}</span>
+                                        
+                                        <!-- 前两个标签 -->
+                                        <div v-if="frag.tags" class="flex gap-1 overflow-hidden">
+                                            <span v-for="(tag, i) in frag.tags.split(',').map(t=>t.trim()).slice(0,2)" :key="i" 
+                                                  class="flex-shrink-0 bg-gray-100 px-1.5 py-0.5 rounded text-[10px] text-gray-600 truncate max-w-[80px]">
+                                                {{ tag }}
+                                            </span>
+                                            <span v-if="frag.tags.split(',').length > 2" class="text-[10px] text-gray-400">...</span>
+                                        </div>
+                                    </div>
+                                    
+                                    <!-- 迷你开关 (阻止冒泡，避免触发外层的折叠) -->
+                                    <div class="flex-shrink-0 ml-2" @click.stop>
+                                        <button @click="toggleFragment(frag.id)" 
+                                                class="relative inline-flex items-center h-5 rounded-full w-9 transition-colors duration-200 focus:outline-none"
+                                                :class="frag.is_active ? 'bg-[#4199a0]' : 'bg-gray-300'">
+                                            <span class="inline-block w-3 h-3 transform bg-white rounded-full transition-transform duration-200 ease-in-out"
+                                                  :class="frag.is_active ? 'translate-x-5' : 'translate-x-1'"></span>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- 展开视图（详情面板） -->
+                            <div v-if="expandedFragmentId === frag.id" class="mt-3 pt-3 border-t border-gray-100 text-xs flex flex-col gap-2 bg-[#f9fbfb] -mx-3 -mb-3 p-3 rounded-b">
+                                <div class="text-[#2c3e50] leading-relaxed break-words whitespace-pre-wrap">{{ frag.content }}</div>
+                                
+                                <div class="grid grid-cols-2 gap-2 mt-2 text-gray-500">
+                                    <div><strong>层级：</strong>Tier {{ frag.tier }}</div>
+                                    <div>
+                                        <strong>能量/极性：</strong>E{{ frag.energy }} 
+                                        {{ frag.polarity === 'positive' ? '😊' : (frag.polarity === 'negative' ? '😢' : '😐') }}
+                                    </div>
+                                    <div class="col-span-2">
+                                        <strong>完整标签：</strong>
+                                        <span v-if="frag.tags" class="inline-flex flex-wrap gap-1 mt-1">
+                                            <span v-for="tag in frag.tags.split(',')" class="bg-white border border-gray-200 px-1.5 py-0.5 rounded text-gray-600">{{ tag.trim() }}</span>
+                                        </span>
+                                        <span v-else>无</span>
+                                    </div>
+                                    <div><strong>创建于：</strong>{{ frag.created_at }}</div>
+                                    <div><strong>向量化：</strong>{{ frag.has_embedding ? '已完成' : '未生成' }}</div>
+                                    <div><strong>命中次数：</strong>{{ frag.activation_count }}</div>
+                                    <div>
+                                        <strong>溯源原文：</strong>
+                                        <span v-if="frag.source_dialogue_id" class="text-blue-500 cursor-pointer hover:underline" @click.stop="showAlert(frag.source_text ? frag.source_text : '关联原文对话行ID: ' + frag.source_dialogue_id)">#{{ frag.source_dialogue_id }}</span>
+                                        <span v-else>-</span>
+                                    </div>
+                                    <div class="col-span-2 mt-1">
+                                        <strong class="text-orange-500">【活跃判定规则】</strong>当前状态完全由 <span class="font-bold">手动</span> 开关控制。
+                                    </div>
+                                </div>
+                            </div>
+                            
+                        </div>
+                    </div>
+                </div>
+            </section>
+
             <!-- QQ设置 -->
             <section v-show="currentTab === 'qq_config'">
                 <div class="flex justify-between items-center mb-4">
@@ -1317,6 +1433,46 @@ Line: ' + line + ', Col: ' + col + '
                 const currentTab = ref('providers');
                 const providers = ref([]);
                 const rules = ref([]);
+                const fragments = ref([]);
+                const fragmentsLoading = ref(false);
+                const fragmentsSearchQuery = ref('');
+                const fragmentsSelectedTags = ref([]);
+                const expandedFragmentId = ref(null);
+
+                const fragmentsAllTags = computed(() => {
+                    const tagSet = new Set();
+                    fragments.value.forEach(f => {
+                        if (f.tags) {
+                            f.tags.split(',').forEach(t => tagSet.add(t.trim()));
+                        }
+                    });
+                    return Array.from(tagSet).filter(t => t);
+                });
+
+                const filteredFragments = computed(() => {
+                    let result = fragments.value;
+                    if (fragmentsSearchQuery.value.trim()) {
+                        const q = fragmentsSearchQuery.value.trim().toLowerCase();
+                        result = result.filter(f => f.content.toLowerCase().includes(q));
+                    }
+                    if (fragmentsSelectedTags.value.length > 0) {
+                        result = result.filter(f => {
+                            if (!f.tags) return false;
+                            const fragTags = f.tags.split(',').map(t => t.trim());
+                            return fragmentsSelectedTags.value.every(t => fragTags.includes(t));
+                        });
+                    }
+                    return result;
+                });
+
+                const toggleFragmentTag = (tag) => {
+                    const idx = fragmentsSelectedTags.value.indexOf(tag);
+                    if (idx === -1) {
+                        fragmentsSelectedTags.value.push(tag);
+                    } else {
+                        fragmentsSelectedTags.value.splice(idx, 1);
+                    }
+                };
                 const loading = reactive({
                     providers: false,
                     rules: false,
@@ -1951,6 +2107,10 @@ Line: ' + line + ', Col: ' + col + '
                         const res = await fetch('/admin/api/status');
                         if (res.ok) {
                             let data = await res.json();
+                            if (!Array.isArray(data)) {
+                                if (data.error) throw new Error(data.error);
+                                data = [];
+                            }
                             const now = new Date();
                             data.forEach(st => {
                                 if (!st.updated_at) {
@@ -2373,6 +2533,40 @@ Line: ' + line + ', Col: ' + col + '
                     } catch (err) { console.error('fetchMemoriesStats error', err); }
                 };
 
+                const fetchFragments = async () => {
+                    fragmentsLoading.value = true;
+                    try {
+                        const res = await fetch('/admin/api/fragments?page=1&page_size=100', {
+                            headers: { 'Authorization': `Bearer ${localStorage.getItem('adminToken')}` }
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            fragments.value = data.data;
+                        }
+                    } catch (e) {
+                        console.error('Failed to fetch fragments', e);
+                    } finally {
+                        fragmentsLoading.value = false;
+                    }
+                };
+
+                const toggleFragment = async (id) => {
+                    try {
+                        const res = await fetch(`/admin/api/fragments/${id}/toggle`, {
+                            method: 'POST',
+                            headers: { 'Authorization': `Bearer ${localStorage.getItem('adminToken')}` }
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            fetchFragments();
+                        } else {
+                            alert('切换失败: ' + data.error);
+                        }
+                    } catch (e) {
+                        alert('请求失败');
+                    }
+                };
+
                 const fetchMemories = async (page = 1) => {
                     memoryPagination.page = page;
                     loading.memories = true;
@@ -2477,10 +2671,15 @@ Line: ' + line + ', Col: ' + col + '
                     fetchTechMode();
                 });
 
+                const showAlert = (msg) => { window.alert(msg); };
+
                 return {
                     currentTab,
-                    providers, rules, loading, 
+                    providers, rules, loading,
+                    fragments, fragmentsLoading, fetchFragments, toggleFragment,
+                    fragmentsSearchQuery, fragmentsSelectedTags, expandedFragmentId, fragmentsAllTags, filteredFragments, toggleFragmentTag,
                     showProviderModal, showRuleModal, editingProvider, editingRule, providerForm, ruleForm,
+                    showAlert,
                     toast,
                     parseModels, openAddProviderModal, editProvider,
                     saveProvider, deleteProvider, testProvider,

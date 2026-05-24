@@ -44,7 +44,7 @@ logger = logging.getLogger('caeron')
 provider_manager = ProviderManager()
 
 # 技术模式：跳过轮总触发和上下文压缩
-tech_mode = True  # 默认技术模式，手动切回日常时自动总结
+tech_mode = False  # 默认日常模式
 
 
 async def _summary_cron_loop():
@@ -263,6 +263,7 @@ async def chat_completions(request: Request):
     """
     核心路由：转发 chat completion 请求
     """
+    global tech_mode
     # DEBUG: Log all request headers to identify Operit session markers
     hdrs = dict(request.headers)
     interesting = {k: v for k, v in hdrs.items() if k.lower() not in ('authorization', 'host', 'content-type', 'content-length', 'accept', 'accept-encoding', 'connection', 'user-agent')}
@@ -492,6 +493,37 @@ async def _handle_chat_completions(request: Request):
     # 在injection之前，对原始消息做存档
     raw_messages = body.get('messages', [])
     
+    # === DEBUG: 图片/附件结构探针 ===
+    # 用于排查截图类图片无法被模型解析的问题
+    for _dbg_idx, _dbg_msg in enumerate(raw_messages):
+        if _dbg_msg.get('role') != 'user':
+            continue
+        _dbg_content = _dbg_msg.get('content')
+        if isinstance(_dbg_content, list):
+            # 多模态消息：逐 block 检查
+            for _blk_idx, _blk in enumerate(_dbg_content):
+                if not isinstance(_blk, dict):
+                    continue
+                _blk_type = _blk.get('type', '?')
+                if _blk_type == 'image_url':
+                    # inline 图片
+                    _img_url = _blk.get('image_url', {})
+                    _url_str = str(_img_url.get('url', ''))[:120]
+                    logger.info(f"[IMG_DEBUG] msg[{_dbg_idx}] block[{_blk_idx}] type=image_url, url_preview={_url_str}")
+                elif _blk_type == 'text':
+                    _txt = _blk.get('text', '')
+                    # 检查文本中是否嵌入了 attachment 标签
+                    if '<attachment' in _txt or 'octet-stream' in _txt or 'cleanOnExit' in _txt:
+                        logger.info(f"[IMG_DEBUG] msg[{_dbg_idx}] block[{_blk_idx}] type=text, contains_attachment_tag! content_preview={_txt[:500]}")
+                else:
+                    # 未知类型的 block
+                    logger.info(f"[IMG_DEBUG] msg[{_dbg_idx}] block[{_blk_idx}] type={_blk_type}, keys={list(_blk.keys())}, preview={json.dumps(_blk, ensure_ascii=False)[:500]}")
+        elif isinstance(_dbg_content, str):
+            # 纯文本消息：检查是否包含 attachment 标签
+            if '<attachment' in _dbg_content or 'octet-stream' in _dbg_content or 'cleanOnExit' in _dbg_content:
+                logger.info(f"[IMG_DEBUG] msg[{_dbg_idx}] type=str, contains_attachment! content_preview={_dbg_content[:800]}")
+    # === END DEBUG ===
+    
     # 允许通过 Header 显式指定 session_id 和 source
     explicit_session_id = request.headers.get('x-session-id')
     explicit_source = request.headers.get('x-source', 'operit')
@@ -500,6 +532,38 @@ async def _handle_chat_completions(request: Request):
         conversation_id = explicit_session_id
     else:
         conversation_id = generate_conversation_id(raw_messages)
+
+    # === Reroll 消息清理 (Reroll Cleanup) ===
+    if raw_messages:
+        dropped_count = 0
+        dropped_texts = []
+        # Step 1: 移除末尾连续的废弃回复（Reroll 必然是针对最后一条 user 消息重新生成）
+        while raw_messages and raw_messages[-1].get('role') != 'user' and raw_messages[-1].get('role') != 'system':
+            dropped = raw_messages.pop()
+            dropped_count += 1
+            if dropped.get('role') == 'assistant' and dropped.get('content'):
+                dropped_texts.append(dropped.get('content'))
+            logger.info(f"[REROLL_CLEANUP] 移除末尾废弃消息: role={dropped.get('role')}")
+            
+        if dropped_count > 0 and explicit_source == 'operit':
+            # 必须同步等待清理，否则内存注入会提前触发，导致刚被废弃的回复作为记忆碎片又被注入！
+            import message_store
+            await message_store.cleanup_db_for_reroll(conversation_id, dropped_texts)
+            
+        # Step 2: 压缩中间的历史连续 assistant 消息，只保留连续段的最后一条
+        cleaned_history = []
+        for msg in raw_messages:
+            if msg.get('role') == 'assistant':
+                if cleaned_history and cleaned_history[-1].get('role') == 'assistant':
+                    # 发现连续的 assistant 消息，说明前面的是早期的 Reroll 废案
+                    cleaned_history[-1] = msg
+                else:
+                    cleaned_history.append(msg)
+            else:
+                cleaned_history.append(msg)
+        
+        body['messages'] = cleaned_history
+        raw_messages = cleaned_history
     
     # 异步存储，不阻塞主流程（存储失败不影响请求转发）
     stored_count = 0
@@ -518,13 +582,19 @@ async def _handle_chat_completions(request: Request):
             if last_user:
                 stored_count = await store_incoming_messages(conversation_id, [last_user])
         else:
-            stored_count = await store_incoming_messages(conversation_id, raw_messages)
+            if tech_mode:
+                import message_store
+                # 处于技术模式下，不存入原版 messages 表（避免进入轮总），但单独存入 unified_messages 桥接表
+                for msg in raw_messages:
+                    if msg.get('role') == 'user':
+                        await message_store.store_unified_message('operit', 'main', 'user', msg.get('content', ''))
+            else:
+                stored_count = await store_incoming_messages(conversation_id, raw_messages)
     except Exception as e:
         logger.error(f"消息存储管道异常（不影响转发）: {e}")
     
     # === Step 2.5: 主动轮总触发 ===
     # 每存入N条消息（跨对话累计），后台触发一次轮总
-    global tech_mode
     if stored_count > 0:
         try:
             trigger_threshold = int(await get_config('summary_interval', '16'))
@@ -536,8 +606,9 @@ async def _handle_chat_completions(request: Request):
                 current_count = int(row['value']) if row else 0
                 new_count = current_count + stored_count
                 
-                if new_count >= trigger_threshold and not tech_mode:
-                    # 达到阈值且非技术模式，后台触发轮总
+                if new_count >= trigger_threshold:
+                    # 达到阈值，后台触发轮总
+                    # 注意：技术模式下的消息已经跳过了 messages 表，所以这里的 new_count 都是日常模式消息
                     logger.info(f"[AUTO_SUMMARY] 累计 {new_count} 条消息，触发轮总生成")
                     
                     # --- Bug 修复：防止异步并发导致的重复生成 ---
@@ -745,6 +816,43 @@ async def _handle_chat_completions(request: Request):
         injection_engine = InjectionEngine()
         body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
 
+    # === 新增：统一跨端上下文构建 (仅 Operit) ===
+    # 无论是否是技术模式，Operit 都需要统一的跨端历史
+    if not skip_rules:
+        # 1. 提取所有 system 消息（包含刚刚 injection_engine 注入的提示词和记忆总结）
+        sys_msgs = [m for m in body.get('messages', []) if m.get('role') == 'system']
+        
+        # 2. 找到本轮对话的起点（最后一条 user 消息）
+        messages_without_sys = [m for m in body.get('messages', []) if m.get('role') != 'system']
+        last_user_idx = len(messages_without_sys) - 1
+        
+        while last_user_idx >= 0 and messages_without_sys[last_user_idx].get('role') != 'user':
+            last_user_idx -= 1
+            
+        if last_user_idx != -1:
+            # 往前找，把紧挨着的 user_wrapped_system (<system>...</system>) 规则也包含进 current_turn
+            start_idx = last_user_idx
+            while start_idx > 0:
+                prev_msg = messages_without_sys[start_idx - 1]
+                if prev_msg.get('role') == 'user':
+                    content = prev_msg.get('content', '')
+                    if isinstance(content, str) and content.strip().startswith('<system>') and content.strip().endswith('</system>'):
+                        start_idx -= 1
+                        continue
+                break
+            current_turn = messages_without_sys[start_idx:]
+        else:
+            current_turn = messages_without_sys
+            
+        # 3. 拉取统一历史
+        import message_store
+        unified_history = await message_store.get_unified_history(char_limit=15000)
+        
+        # 4. 组装新的 messages 数组 (system + unified_history + current_turn)
+        # 注意：这里我们允许 unified_history 的最后一条可能和 current_turn 第一条重合，模型可以理解这点冗余。
+        body['messages'] = sys_msgs + unified_history + current_turn
+        logger.info(f"[UNIFIED] 已替换 Operit 历史为跨端统一历史，包含 {len(unified_history)} 条记录")
+
     # 打印最终发送给 API 的 context
     final_msg_count = len(body['messages'])
     final_msg_chars = sum(_msg_chars(m) for m in body['messages'])
@@ -794,8 +902,13 @@ async def _handle_chat_completions(request: Request):
             # 更新最近使用时间
             await provider_manager.update_last_used(provider['id'])
 
-            # 转发请求（传入conversation_id用于存储AI回复）
-            response = await proxy_chat_completion(body, provider, conversation_id=conversation_id, skip_tool_cleanup=(not _is_qq), skip_context_trim=tech_mode)
+            response = await proxy_chat_completion(
+                body, 
+                provider, 
+                conversation_id=conversation_id, 
+                source=explicit_source,
+                skip_messages_table=(tech_mode and not _is_qq)
+            )
 
             # 成功，确保���记为��康
             await provider_manager.mark_healthy(provider['id'])
@@ -1881,6 +1994,72 @@ async def api_test_recall(request: Request):
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
+
+# ==================== 记忆碎片 Fragments ====================
+
+@app.get("/admin/api/fragments")
+async def get_fragments(page: int = 1, page_size: int = 50, tier: int = None):
+    """获取碎片记忆列表"""
+    db = await get_db()
+    try:
+        query = "SELECT memory_fragments.*, memories.content as source_text FROM memory_fragments LEFT JOIN memories ON memory_fragments.source_dialogue_id = memories.id WHERE 1=1"
+        params = []
+        if tier is not None:
+            query += " AND memory_fragments.tier = ?"
+            params.append(tier)
+            
+        # 算总数
+        count_query = "SELECT COUNT(*) FROM memory_fragments WHERE 1=1"
+        if tier is not None:
+            count_query += " AND tier = ?"
+            
+        cursor = await db.execute(count_query, params)
+        total_count = (await cursor.fetchone())[0]
+        
+        # 查数据
+        query += " ORDER BY memory_fragments.created_at DESC LIMIT ? OFFSET ?"
+        params.extend([page_size, (page - 1) * page_size])
+        
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+        
+        fragments = []
+        for r in rows:
+            f = dict(r)
+            f['has_embedding'] = bool(f.get('embedding'))
+            # 移除 embedding 二进制数据避免 JSON 序列化报错
+            if 'embedding' in f:
+                del f['embedding']
+            fragments.append(f)
+            
+        return {
+            'success': True,
+            'data': fragments,
+            'total': total_count,
+            'page': page,
+            'page_size': page_size
+        }
+    except Exception as e:
+        logger.error(f"获取碎片失败: {e}")
+        return {'success': False, 'error': str(e)}
+    finally:
+        await db.close()
+
+@app.post("/admin/api/fragments/{fragment_id}/toggle")
+async def toggle_fragment(fragment_id: int):
+    """切换碎片活跃状态"""
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT is_active FROM memory_fragments WHERE id = ?", (fragment_id,))
+        row = await cursor.fetchone()
+        if not row:
+            return {'success': False, 'error': 'Fragment not found'}
+        new_status = 0 if row['is_active'] == 1 else 1
+        await db.execute("UPDATE memory_fragments SET is_active = ? WHERE id = ?", (new_status, fragment_id))
+        await db.commit()
+        return {'success': True, 'is_active': new_status}
+    finally:
+        await db.close()
 
 # ==================== 小游戏 ====================
 @app.get("/games/snake")

@@ -196,43 +196,111 @@ class InjectionEngine:
                             try:
                                 c = '\n'.join([i.get('text', '') for i in c if i.get('type') == 'text'])
                             except: pass
-                        last_user_msg = c
-                        break
+                        import re
+                        # 剔除 Operit 自动附加的设备状态等 <attachment> 标签，避免污染语义向量
+                        c = re.sub(r'<attachment.*?>.*?</attachment>', '', c, flags=re.DOTALL)
+                        c = c.strip()
+                        if c:
+                            last_user_msg = c
+                            break
                 
                 if last_user_msg:
                     from embedding import get_embedding, cosine_similarity
                     import json
                     user_emb = await get_embedding(last_user_msg)
                     if user_emb:
-                        # 从 memories 表读取所有带有 embedding 的记忆
+                        import math
+                        # Step 1: 碎片召回
+                        cursor = await db.execute("SELECT id, source_dialogue_id, content, tier, embedding, activation_count FROM memory_fragments WHERE is_active = 1 AND embedding IS NOT NULL")
+                        fragments_rows = await cursor.fetchall()
+                        
+                        scored_fragments = []
+                        for row in fragments_rows:
+                            try:
+                                frag_emb = json.loads(row['embedding'])
+                                sim = cosine_similarity(user_emb, frag_emb)
+                                if sim > 0.5:
+                                    act_count = row.get('activation_count', 0)
+                                    final_score = sim * (1 + math.log1p(act_count) * 0.1)
+                                    scored_fragments.append((final_score, dict(row)))
+                            except Exception:
+                                pass
+                        
+                        top_fragments = []
+                        used_source_ids = set()
+                        if scored_fragments:
+                            scored_fragments.sort(key=lambda x: x[0], reverse=True)
+                            top_fragments = scored_fragments[:5]
+                            
+                            # 增加 activation_count
+                            frag_ids = [str(f[1]['id']) for f in top_fragments]
+                            if frag_ids:
+                                ids_str = ",".join(frag_ids)
+                                await db.execute(f"UPDATE memory_fragments SET activation_count = activation_count + 1 WHERE id IN ({ids_str})")
+                                await db.commit()
+                        
+                        # Step 2 & 3: 独立原文召回及碎片原文溯源
                         cursor = await db.execute("SELECT id, content, embedding FROM memories WHERE embedding IS NOT NULL")
                         memories_rows = await cursor.fetchall()
                         
+                        # 预先整理出 source_dialogue_id 对应的原文内容
+                        memories_dict = {row['id']: row['content'] for row in memories_rows}
+                        
+                        for sim, frag in top_fragments:
+                            src_id = frag.get('source_dialogue_id')
+                            if src_id is not None:
+                                used_source_ids.add(src_id)
+                                
                         scored_memories = []
                         for row in memories_rows:
+                            if row['id'] in used_source_ids:
+                                continue # 去重
                             try:
                                 mem_emb = json.loads(row['embedding'])
                                 sim = cosine_similarity(user_emb, mem_emb)
                                 if sim > 0.5:
-                                    scored_memories.append((sim, row['content']))
+                                    scored_memories.append((sim, dict(row)))
                             except Exception:
                                 pass
-                        
+                                
+                        top_memories = []
                         if scored_memories:
                             scored_memories.sort(key=lambda x: x[0], reverse=True)
-                            top_5 = scored_memories[:5]
+                            top_memories = scored_memories[:3]
                             
-                            parts.append("【相关历史记忆（按语义相关度召回）】")
-                            for sim, content in top_5:
-                                # 截断一下避免太长
-                                if len(content) > 300:
-                                    content = content[:300] + '...'
-                                parts.append(f"- (相关度: {sim:.2f}) {content}")
-                            
-                            tag_counts['semantic_recall'] = len(top_5)
+                        # 组装
+                        if top_fragments or top_memories:
+                            if top_fragments:
+                                parts.append("【相关记忆碎片（按语义相关度召回）】")
+                                for i, (sim, frag) in enumerate(top_fragments):
+                                    frag_content = frag['content']
+                                    src_id = frag.get('source_dialogue_id')
+                                    
+                                    parts.append(f"[碎片记忆] {frag_content}")
+                                    
+                                    # 仅给排名前 2 的碎片附加原文语境
+                                    if i < 2 and src_id is not None and src_id in memories_dict:
+                                        from utils import smart_truncate_dialogue
+                                        src_text = memories_dict[src_id]
+                                        trunc_text = smart_truncate_dialogue(src_text, 200).replace('\n', ' ')
+                                        parts.append(f"[原文语境] （来源：轮次 #{src_id}）{trunc_text}")
+                                        
+                                parts.append("") # 空行分隔
+                                
+                            if top_memories:
+                                parts.append("【相关历史对话（按语义相关度召回）】")
+                                from utils import smart_truncate_dialogue
+                                for sim, mem in top_memories:
+                                    mem_content = mem['content']
+                                    trunc_mem = smart_truncate_dialogue(mem_content, 200)
+                                    # 将独立记忆的换行也替换掉，防止系统 prompt 太长太散
+                                    trunc_mem = trunc_mem.replace('\n', '  ')
+                                    parts.append(f"- (相关度: {sim:.2f}) {trunc_mem}")
+                                    
+                            tag_counts['semantic_recall'] = len(top_fragments) + len(top_memories)
                             has_any_summaries = True
                             semantic_success = True
-                            logger.info(f"[记忆注入] 语义召回成功，找到 {len(top_5)} 条相关记忆")
+                            logger.info(f"[记忆注入] 语义召回成功: 碎片 {len(top_fragments)} 条，原文 {len(top_memories)} 条")
             except Exception as e:
                 logger.error(f"[记忆注入] 语义召回失败，将回退到时间排序: {e}")
 

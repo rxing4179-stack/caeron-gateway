@@ -254,6 +254,7 @@ async def store_incoming_messages(conversation_id: str, messages: list):
         
         now_bj = now_cst().strftime('%Y-%m-%d %H:%M:%S')
         stored = 0
+        unified_to_save = []
         for i, msg in enumerate(new_messages):
             content = msg.get('content', '')
             if isinstance(content, list):
@@ -265,6 +266,10 @@ async def store_incoming_messages(conversation_id: str, messages: list):
                 (conversation_id, msg['role'], content, start_index + i, now_bj)
             )
             stored += 1
+            
+            # 记录要同步到 unified_messages 的记录，稍后在关闭当前数据库连接后统一保存，避免死锁
+            if not conversation_id.startswith('qq-'):
+                unified_to_save.append(msg)
         
         # 更新对话元信息
         await db.execute(
@@ -277,15 +282,178 @@ async def store_incoming_messages(conversation_id: str, messages: list):
         
         await db.commit()
         logger.info(f"存储 {stored} 条入站消息 (对话: {conversation_id[:8]}...)")
-        return stored
     except Exception as e:
-        logger.error(f"存储入站消息失败: {e}")
+        logger.error(f"消息存档异常: {e}")
         return 0
     finally:
         await db.close()
 
+    # === 在主数据库连接关闭后，单独保存跨端同步记录，防止写锁冲突死锁 ===
+    for msg in unified_to_save:
+        await store_unified_message('operit', 'main', msg['role'], msg.get('content', ''))
 
-async def store_assistant_response(conversation_id: str, content: str):
+    return stored
+
+async def cleanup_db_for_reroll(conversation_id: str, dropped_texts: list = None):
+    """
+    Reroll 清理逻辑：
+    删除数据库中该对话最后一条 user 消息之后的所有消息（即废弃的 assistant 回复）。
+    """
+    db = await get_db()
+    try:
+        # 1. 找到最后一条 user 消息的 index
+        cursor = await db.execute('''
+            SELECT message_index FROM messages 
+            WHERE conversation_id = ? AND role = 'user' 
+            ORDER BY message_index DESC LIMIT 1
+        ''', (conversation_id,))
+        row = await cursor.fetchone()
+        if not row:
+            return
+            
+        last_user_idx = row['message_index']
+        
+        # 2. 删除该 user 之后的所有消息 (实际上就是之前被 Reroll 废弃的 assistant 回复)
+        cursor = await db.execute('''
+            DELETE FROM messages 
+            WHERE conversation_id = ? AND message_index > ?
+        ''', (conversation_id, last_user_idx))
+        deleted_count = cursor.rowcount
+        
+        if deleted_count > 0:
+            logger.info(f"[REROLL_DB_CLEANUP] 对话 {conversation_id[:8]} 删除了 {deleted_count} 条废弃记录")
+            # 同步删除 unified_messages 中的同等数量的 operit assistant 记录
+            await db.execute('''
+                DELETE FROM unified_messages 
+                WHERE id IN (
+                    SELECT id FROM unified_messages 
+                    WHERE source = 'operit' AND role = 'assistant'
+                    ORDER BY id DESC LIMIT ?
+                )
+            ''', (deleted_count,))
+            
+        # 3. 级联清理 memories 和 memory_fragments
+        if dropped_texts:
+            for text in dropped_texts:
+                if text.strip():
+                    # 匹配 memories 表中包含该废弃回复的记录
+                    cursor = await db.execute("SELECT id FROM memories WHERE content LIKE ?", ('%' + text.strip() + '%',))
+                    mem_rows = await cursor.fetchall()
+                    mem_ids = [str(r['id']) for r in mem_rows]
+                    
+                    if mem_ids:
+                        ids_str = ",".join(mem_ids)
+                        # 先删 fragments
+                        await db.execute(f"DELETE FROM memory_fragments WHERE source_dialogue_id IN ({ids_str})")
+                        # 再删 memories
+                        await db.execute(f"DELETE FROM memories WHERE id IN ({ids_str})")
+                        logger.info(f"[REROLL_DB_CLEANUP] 删除了 {len(mem_ids)} 条 memories 及其关联碎片")
+
+        await db.commit()
+    except Exception as e:
+        logger.error(f"Reroll 清理数据库异常: {e}")
+    finally:
+        await db.close()
+
+# ==================== 统一跨端上下文存储 ====================
+
+# 简单的并发发送锁，防止双端同时读取历史和发送导致状态不一致
+GATEWAY_SEND_LOCK = asyncio.Lock()
+
+async def store_unified_message(source: str, source_context: str, role: str, content: str):
+    """
+    存储统一的跨端消息
+    如果 content 是包含图片的 list，将其中的图片提取到 metadata 中，content 替换为纯文本
+    """
+    import json
+    metadata = {}
+    
+    if role == 'tool':
+        return  # 忽略工具返回结果，避免污染跨端上下文，也防止组装历史时引起 API 校验报错
+        
+    # 提取纯文本并处理图片
+    text_content = content
+    if isinstance(content, list):
+        text_parts = []
+        image_count = 0
+        for block in content:
+            if isinstance(block, dict):
+                if block.get('type') == 'text':
+                    text_parts.append(block.get('text', ''))
+                elif block.get('type') == 'image_url':
+                    image_count += 1
+        if image_count > 0:
+            metadata['images'] = image_count
+            text_parts.append(f"[发送了 {image_count} 张图片]")
+        text_content = '\n'.join(text_parts)
+    
+    char_count = len(text_content)
+    meta_str = json.dumps(metadata, ensure_ascii=False) if metadata else None
+    
+    db = await get_db()
+    try:
+        await db.execute('''
+            INSERT INTO unified_messages (source, source_context, role, content, char_count, metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (source, source_context, role, text_content, char_count, meta_str))
+        await db.commit()
+    except Exception as e:
+        logger.error(f"[UNIFIED] 统一消息存储异常: {e}")
+    finally:
+        await db.close()
+
+async def get_unified_history(char_limit: int = 15000) -> list:
+    """
+    拉取统一的跨端历史记录，并打上来源标签
+    """
+    db = await get_db()
+    try:
+        cursor = await db.execute('''
+            SELECT source, source_context, role, content, char_count 
+            FROM unified_messages 
+            ORDER BY timestamp DESC
+        ''')
+        rows = await cursor.fetchall()
+        
+        history = []
+        total_chars = 0
+        for row in rows:
+            if total_chars + row['char_count'] > char_limit:
+                break
+            
+            source = row['source']
+            source_context = row['source_context']
+            role = row['role']
+            content = row['content']
+            
+            # 打标签
+            prefix = ""
+            if source == 'qq':
+                if str(source_context).startswith('group_'):
+                    group_id = str(source_context).split('_')[1]
+                    prefix = f"[QQ·群聊 {group_id}] "
+                elif str(source_context).startswith('private_'):
+                    private_id = str(source_context).split('_')[1]
+                    prefix = f"[QQ·私聊 {private_id}] "
+                else:
+                    prefix = f"[QQ] "
+            elif source == 'operit':
+                prefix = f"[Operit] "
+            
+            tagged_content = f"{prefix}{content}"
+            history.append({'role': role, 'content': tagged_content})
+            total_chars += row['char_count']
+            
+        # 翻转顺序，按时间正序排列
+        return list(reversed(history))
+    except Exception as e:
+        logger.error(f"[UNIFIED] 获取统一历史异常: {e}")
+        return []
+    finally:
+        await db.close()
+
+
+async def store_assistant_response(conversation_id: str, content: str, source: str = 'operit', source_context: str = 'main', skip_messages_table: bool = False):
     """
     存储AI回复消息（出站）
     
@@ -298,6 +466,15 @@ async def store_assistant_response(conversation_id: str, content: str):
     if not content or not content.strip():
         return
     
+    # === 新增：统一历史桥接 ===
+    # 如果是 Operit 来源，则在此处保存 assistant 回复到 unified_messages。
+    # QQ 来源已经在 qq_adapter.py 中自行保存了，这里避免重复保存。
+    if source != 'qq':
+        await store_unified_message(source, source_context, 'assistant', content)
+        
+    if skip_messages_table:
+        return
+        
     now_bj = now_cst().strftime('%Y-%m-%d %H:%M:%S')
     db = await get_db()
     try:
@@ -369,8 +546,13 @@ async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_conte
             except:
                 pass
                 
-        # 2. 拼接
-        combined_text = f"User: {user_content}\nAssistant: {assistant_content}"
+        # 预处理清洗元数据
+        from utils import clean_chat_text
+        cleaned_user = clean_chat_text(user_content)
+        cleaned_ast = clean_chat_text(assistant_content)
+                
+        # 2. 拼接成对存储
+        combined_text = f"User: {cleaned_user}\nAssistant: {cleaned_ast}"
         
         # 3. 调 embedding API
         from embedding import get_embedding
@@ -386,6 +568,39 @@ async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_conte
         )
         await db.commit()
         logger.info(f"[EMBEDDING] 成功将对话对存入 memories 表并生成向量 (dim={len(emb_vector) if emb_vector else 0})")
+        
+        # === Memory Fragments 提取逻辑 ===
+        # 获取当前轮次计数
+        cursor = await db.execute("SELECT value FROM config WHERE key = 'fragment_extraction_round_counter'")
+        row = await cursor.fetchone()
+        counter = int(row['value']) if row else 0
+        counter += 1
+        
+        if counter >= 5:
+            # 重置计数器
+            await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('fragment_extraction_round_counter', '0')")
+            await db.commit()
+            
+            # 取最近5条对话记忆
+            cursor = await db.execute(
+                "SELECT id, content FROM memories WHERE category = 'dialogue' ORDER BY id DESC LIMIT 5"
+            )
+            rows = await cursor.fetchall()
+            if rows:
+                rows.reverse() # 时间正序
+                dialogue_text = ""
+                dialogue_ids = []
+                for idx, r in enumerate(rows):
+                    dialogue_text += f"[轮次{idx}] (memories_id={r['id']})\n{r['content']}\n\n"
+                    dialogue_ids.append(r['id'])
+                
+                # 异步触发提取
+                from memory_extractor import extract_fragments
+                asyncio.create_task(extract_fragments(dialogue_text, dialogue_ids))
+        else:
+            await db.execute(f"INSERT OR REPLACE INTO config (key, value) VALUES ('fragment_extraction_round_counter', '{counter}')")
+            await db.commit()
+            
     except Exception as e:
         logger.error(f"[EMBEDDING] 对话向量化存储失败: {e}")
     finally:
