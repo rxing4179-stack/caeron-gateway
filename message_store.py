@@ -440,6 +440,10 @@ async def get_unified_history(char_limit: int = 15000) -> list:
             elif source == 'operit':
                 prefix = f"[Operit] "
             
+            # 如果是带有系统/附件标签的，避免加前缀破坏解析
+            if '<attachment' in content or content.startswith('<system>'):
+                prefix = ""
+                
             tagged_content = f"{prefix}{content}"
             history.append({'role': role, 'content': tagged_content})
             total_chars += row['char_count']

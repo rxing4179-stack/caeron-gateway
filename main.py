@@ -584,10 +584,14 @@ async def _handle_chat_completions(request: Request):
         else:
             if tech_mode:
                 import message_store
-                # 处于技术模式下，不存入原版 messages 表（避免进入轮总），但单独存入 unified_messages 桥接表
-                for msg in raw_messages:
+                # 处于技术模式下，不存入原版 messages 表（避免进入轮总），但仅将最后一条真实用户输入存入 unified_messages 桥接表
+                last_user = None
+                for msg in reversed(raw_messages):
                     if msg.get('role') == 'user':
-                        await message_store.store_unified_message('operit', 'main', 'user', msg.get('content', ''))
+                        last_user = msg
+                        break
+                if last_user:
+                    await message_store.store_unified_message('operit', 'main', 'user', last_user.get('content', ''))
             else:
                 stored_count = await store_incoming_messages(conversation_id, raw_messages)
     except Exception as e:
@@ -816,9 +820,9 @@ async def _handle_chat_completions(request: Request):
         injection_engine = InjectionEngine()
         body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
 
-    # === 新增：统一跨端上下文构建 (仅 Operit) ===
-    # 无论是否是技术模式，Operit 都需要统一的跨端历史
-    if not skip_rules:
+    # === 新增：统一跨端上下文构建 (仅 Operit 日常模式) ===
+    # 技术模式下必须完全透传 Operit 的原始历史，绝不能用统一历史覆盖！
+    if not skip_rules and not tech_mode:
         # 1. 提取所有 system 消息（包含刚刚 injection_engine 注入的提示词和记忆总结）
         sys_msgs = [m for m in body.get('messages', []) if m.get('role') == 'system']
         

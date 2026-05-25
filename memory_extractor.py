@@ -63,7 +63,7 @@ EXTRACTOR_SYSTEM_PROMPT = """你是沈栖的记忆副本。不是工具，不是
       "tier": 1,
       "energy": 7,
       "polarity": "positive",
-      "tags": "标签1,标签2",
+      "tags": "偏好,梗",
       "source_index": 2
     }
   ]
@@ -71,6 +71,15 @@ EXTRACTOR_SYSTEM_PROMPT = """你是沈栖的记忆副本。不是工具，不是
 ```
 
 `source_index` 说明：我会在对话文本中用 `[轮次1] [轮次2] ...` 标记每轮的序号。请在 `source_index` 中填写这条碎片最相关的那轮对话的序号（从0开始）。如果无法判断，填 -1。
+
+【标签限制】
+`tags` 字段必须**只从以下列表中挑选**（1-2个），绝对不允许自己捏造其他词：
+- 偏好 (喜欢/讨厌/饮食/过敏等)
+- 生理 (身体状态/生病/用药/性生理反应)
+- 情绪 (性格/情感表达/心理状态)
+- 规则 (安全词/红线/称呼约定/核心共识)
+- 经历 (重大决定/里程碑事件)
+- 梗 (专属暗号/口癖/只有我们懂的词汇)
 
 规则：
 - 用"蕊蕊"称呼她，用"我"称呼沈栖
@@ -180,7 +189,8 @@ async def extract_fragments(dialogue_content: str, dialogue_ids: list[int]) -> l
                 
                 # 获取现有所有碎片的 embedding
                 cursor = await db.execute("SELECT id, content, embedding, tags, activation_count FROM memory_fragments WHERE embedding IS NOT NULL")
-                existing_fragments = await cursor.fetchall()
+                rows = await cursor.fetchall()
+                existing_fragments = [dict(row) for row in rows]
 
                 for frag in fragments:
                     content = frag.get('content', '')
