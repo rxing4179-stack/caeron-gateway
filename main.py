@@ -296,6 +296,7 @@ async def _handle_chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="无效的 JSON 请求体")
 
     model = body.get('model', '')
+
     is_stream = body.get('stream', False)
     logger.info(f"收到请求: model={model}, stream={is_stream}")
     
