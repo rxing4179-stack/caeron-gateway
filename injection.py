@@ -211,7 +211,7 @@ class InjectionEngine:
                     if user_emb:
                         import math
                         # Step 1: 碎片召回
-                        cursor = await db.execute("SELECT id, source_dialogue_id, content, tier, embedding, activation_count FROM memory_fragments WHERE is_active = 1 AND embedding IS NOT NULL")
+                        cursor = await db.execute("SELECT id, source_dialogue_id, content, tier, embedding, activation_count, created_at FROM memory_fragments WHERE is_active = 1 AND embedding IS NOT NULL")
                         fragments_rows = await cursor.fetchall()
                         
                         scored_fragments = []
@@ -240,11 +240,11 @@ class InjectionEngine:
                                 await db.commit()
                         
                         # Step 2 & 3: 独立原文召回及碎片原文溯源
-                        cursor = await db.execute("SELECT id, content, embedding FROM memories WHERE embedding IS NOT NULL")
+                        cursor = await db.execute("SELECT id, content, embedding, created_at FROM memories WHERE embedding IS NOT NULL")
                         memories_rows = await cursor.fetchall()
                         
-                        # 预先整理出 source_dialogue_id 对应的原文内容
-                        memories_dict = {row['id']: row['content'] for row in memories_rows}
+                        # 预先整理出 source_dialogue_id 对应的原文内容和时间
+                        memories_dict = {row['id']: {'content': row['content'], 'created_at': row['created_at']} for row in memories_rows}
                         
                         for sim, frag in top_fragments:
                             src_id = frag.get('source_dialogue_id')
@@ -271,31 +271,36 @@ class InjectionEngine:
                         # 组装
                         if top_fragments or top_memories:
                             if top_fragments:
-                                parts.append("【相关记忆碎片（按语义相关度召回）】")
+                                parts.append("【脑海中闪回的旧日记忆碎片（按语义相关度召回）】")
+                                parts.append("（注意：以下信息发生于过去的日期，请勿将其与当前正在发生的事情混淆）")
                                 for i, (sim, frag) in enumerate(top_fragments):
                                     frag_content = frag['content']
                                     src_id = frag.get('source_dialogue_id')
+                                    created_at = frag.get('created_at', '过去')
                                     
-                                    parts.append(f"[碎片记忆] {frag_content}")
+                                    parts.append(f"[旧记忆碎片 - 记录于 {created_at}] {frag_content}")
                                     
                                     # 仅给排名前 2 的碎片附加原文语境
                                     if i < 2 and src_id is not None and src_id in memories_dict:
                                         from utils import smart_truncate_dialogue
-                                        src_text = memories_dict[src_id]
-                                        trunc_text = smart_truncate_dialogue(src_text, 200).replace('\n', ' ')
-                                        parts.append(f"[原文语境] （来源：轮次 #{src_id}）{trunc_text}")
+                                        src_mem = memories_dict[src_id]
+                                        trunc_text = smart_truncate_dialogue(src_mem['content'], 200).replace('\n', ' ')
+                                        src_date = src_mem.get('created_at', '过去')
+                                        parts.append(f"[当时情境 - 发生于 {src_date}] （来源：轮次 #{src_id}）{trunc_text}")
                                         
                                 parts.append("") # 空行分隔
                                 
                             if top_memories:
-                                parts.append("【相关历史对话（按语义相关度召回）】")
+                                parts.append("【脑海中闪回的旧日历史对话（按语义相关度召回）】")
+                                parts.append("（注意：以下为过去的历史对话，并非当下正在发生）")
                                 from utils import smart_truncate_dialogue
                                 for sim, mem in top_memories:
                                     mem_content = mem['content']
+                                    created_at = mem.get('created_at', '过去')
                                     trunc_mem = smart_truncate_dialogue(mem_content, 200)
                                     # 将独立记忆的换行也替换掉，防止系统 prompt 太长太散
                                     trunc_mem = trunc_mem.replace('\n', '  ')
-                                    parts.append(f"- (相关度: {sim:.2f}) {trunc_mem}")
+                                    parts.append(f"- [旧对话 - 发生于 {created_at}] (相关度: {sim:.2f}) {trunc_mem}")
                                     
                             tag_counts['semantic_recall'] = len(top_fragments) + len(top_memories)
                             has_any_summaries = True
