@@ -145,6 +145,15 @@ app = FastAPI(
 from log_viewer import log_app
 app.mount("/syslogs", log_app)
 
+from fastapi.responses import FileResponse
+@app.get("/qr")
+async def get_qr():
+    import os
+    qr_path = "/home/ubuntu/caeron-gateway/static/qrcode.png"
+    if os.path.exists(qr_path):
+        return FileResponse(qr_path)
+    return {"detail": "QR Code not found"}
+
 from qq_adapter import qq_router
 app.include_router(qq_router)
 
@@ -1850,7 +1859,6 @@ async def get_qq_config():
         'REPLY_DELAY_MAX': qq_config.REPLY_DELAY_MAX,
         'DEFAULT_PROMPT': qq_config.DEFAULT_PROMPT,
         'RUIRUI_PROMPT': qq_config.RUIRUI_PROMPT,
-        'RUIRUI_QQ_PROMPT': qq_config.RUIRUI_QQ_PROMPT,
         'DEFAULT_MODEL': qq_config.DEFAULT_MODEL
     }
 
@@ -1871,7 +1879,6 @@ async def save_qq_config(request: Request):
     if 'REPLY_DELAY_MAX' in data: qq_config.REPLY_DELAY_MAX = float(data['REPLY_DELAY_MAX'])
     if 'DEFAULT_PROMPT' in data: qq_config.DEFAULT_PROMPT = data['DEFAULT_PROMPT']
     if 'RUIRUI_PROMPT' in data: qq_config.RUIRUI_PROMPT = data['RUIRUI_PROMPT']
-    if 'RUIRUI_QQ_PROMPT' in data: qq_config.RUIRUI_QQ_PROMPT = data['RUIRUI_QQ_PROMPT']
     if 'DEFAULT_MODEL' in data: qq_config.DEFAULT_MODEL = data['DEFAULT_MODEL']
     qq_config.save()
     return {"ok": True}

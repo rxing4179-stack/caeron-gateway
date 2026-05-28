@@ -371,23 +371,23 @@ async def store_unified_message(source: str, source_context: str, role: str, con
     if role == 'tool':
         return  # 忽略工具返回结果，避免污染跨端上下文，也防止组装历史时引起 API 校验报错
         
-    # 提取纯文本并处理图片
     text_content = content
+    char_count = 0
     if isinstance(content, list):
-        text_parts = []
         image_count = 0
         for block in content:
             if isinstance(block, dict):
                 if block.get('type') == 'text':
-                    text_parts.append(block.get('text', ''))
+                    char_count += len(block.get('text', ''))
                 elif block.get('type') == 'image_url':
                     image_count += 1
+                    char_count += 500  # 图片固定算 500 个字符
         if image_count > 0:
             metadata['images'] = image_count
-            text_parts.append(f"[发送了 {image_count} 张图片]")
-        text_content = '\n'.join(text_parts)
+        text_content = json.dumps(content, ensure_ascii=False)
+    else:
+        char_count = len(text_content) if text_content else 0
     
-    char_count = len(text_content)
     meta_str = json.dumps(metadata, ensure_ascii=False) if metadata else None
     
     db = await get_db()
@@ -444,6 +444,22 @@ async def get_unified_history(char_limit: int = 15000) -> list:
             if '<attachment' in content or content.startswith('<system>'):
                 prefix = ""
                 
+            if content.startswith('[') and '"type"' in content:
+                try:
+                    import json
+                    content_obj = json.loads(content)
+                    if isinstance(content_obj, list):
+                        if prefix:
+                            if content_obj and content_obj[0].get("type") == "text":
+                                content_obj[0]["text"] = prefix + content_obj[0]["text"]
+                            else:
+                                content_obj.insert(0, {"type": "text", "text": prefix})
+                        history.append({'role': role, 'content': content_obj})
+                        total_chars += row['char_count']
+                        continue
+                except:
+                    pass
+
             tagged_content = f"{prefix}{content}"
             history.append({'role': role, 'content': tagged_content})
             total_chars += row['char_count']
