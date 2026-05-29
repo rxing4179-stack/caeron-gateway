@@ -131,10 +131,11 @@ qq_router = APIRouter()
 
 # ==================== thinking 标签过滤 ====================
 def strip_thinking(text: str) -> str:
-    """移除 <thinking>...</thinking> 标签及其内容"""
+    """移除 <thinking>...</thinking> 或 <think>...</think> 标签及其内容"""
     if not text:
         return text
-    return re.sub(r'<thinking>[\s\S]*?</thinking>', '', text).strip()
+    # 匹配 <thinking> 或 <think>，直到遇到闭合标签，或者一直匹配到字符串末尾（防止被 max_tokens 截断时没有闭合标签）
+    return re.sub(r'<(?:thinking|think)>[\s\S]*?(?:</(?:thinking|think)>|$)', '', text).strip()
 
 # 全局状态
 class QQState:
