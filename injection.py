@@ -481,6 +481,16 @@ class InjectionEngine:
                         status_lines.append(f"| {key} | {updated_at_str} | - | 解析异常 |")
                 status_lines.append("</current_status>\n")
 
+            # === 听歌状态注入 ===
+            try:
+                from music_status import get_music_status
+                music_text = get_music_status()
+                if music_text:
+                    status_lines.append(music_text)
+                    status_lines.append("")
+            except Exception as e:
+                logger.warning(f"[记忆注入] 读取听歌状态失败: {e}")
+
             # 组装总结文本
             summary_lines = []
             if has_any_summaries:

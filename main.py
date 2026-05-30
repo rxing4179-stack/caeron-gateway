@@ -118,6 +118,14 @@ async def lifespan(app: FastAPI):
 
     # 启动定时总结任务（日总/周总/月总）
     summary_cron_task = asyncio.create_task(_summary_cron_loop())
+
+    # 启动网易云听歌状态监控
+    try:
+        from music_status import start_music_watcher
+        await start_music_watcher()
+        logger.info("网易云听歌状态监控已启动")
+    except Exception as e:
+        logger.warning(f"网易云听歌状态监控启动失败（非致命）: {e}")
     
     logger.info("Caeron Gateway 启动完成，等待请求...")
 
@@ -2081,6 +2089,119 @@ async def snake_game():
     if os.path.exists(html_path):
         return FileResponse(html_path, media_type="text/html")
     return HTMLResponse("<h1>游戏文件未找到</h1>", status_code=404)
+
+# ==================== 网易云听歌状态 ====================
+
+@app.get("/api/music/status")
+async def get_music_status_api():
+    """获取当前听歌状态"""
+    try:
+        from music_status import get_music_status, get_watcher, STATUS_FILE
+        import json
+        watcher = get_watcher()
+        status_text = get_music_status()
+        
+        song_info = None
+        if os.path.exists(STATUS_FILE):
+            try:
+                with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                    song_info = json.load(f)
+            except Exception:
+                pass
+                
+        return {
+            "success": True,
+            "status_text": status_text,
+            "song_info": song_info,
+            "total_seconds": watcher.total_together_seconds,
+            "has_cookie": bool(watcher.cookie),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/music/control")
+async def control_music_api(request: Request):
+    """前端调用控制一起听播放"""
+    try:
+        data = await request.json()
+        action = data.get("action")
+        if not action:
+            return {"success": False, "error": "缺少 action 参数"}
+            
+        from music_status import get_watcher
+        watcher = get_watcher()
+        success = await watcher.control_music(action)
+        return {"success": success}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/api/music/qr/generate")
+async def music_qr_generate():
+    """生成网易云登录二维码"""
+    try:
+        from music_status import qr_login_step1, qr_login_step2
+        key = await qr_login_step1()
+        if not key:
+            return {"success": False, "error": "获取二维码 key 失败"}
+        qrimg = await qr_login_step2(key)
+        return {"success": True, "key": key, "qrimg": qrimg}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/music/login")
+async def music_login_page():
+    """网易云扫码登录页面"""
+    html = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>网易云登录</title>
+<style>
+body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#1a1a2e;color:#fff}
+.card{text-align:center;background:#16213e;padding:2rem;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,.3)}
+#qr{width:256px;height:256px;margin:1rem auto;border-radius:8px;background:#fff;padding:8px}
+#status{margin-top:1rem;font-size:1.1rem}
+.ok{color:#4ade80}.wait{color:#fbbf24}.err{color:#f87171}
+</style></head><body>
+<div class="card">
+<h2>🎵 网易云音乐登录</h2>
+<p>用<b>沈栖挂机号</b>的网易云APP扫码</p>
+<div id="qr"><img id="qrimg" width="256" height="256"></div>
+<div id="status" class="wait">正在生成二维码...</div>
+<button onclick="gen()" style="margin-top:1rem;padding:.5rem 1.5rem;border:none;border-radius:8px;background:#e94560;color:#fff;cursor:pointer;font-size:1rem">刷新二维码</button>
+</div>
+<script>
+let key='';
+async function gen(){
+  document.getElementById('status').textContent='正在生成二维码...';
+  document.getElementById('status').className='wait';
+  const r=await fetch('/api/music/qr/generate');const d=await r.json();
+  if(d.success){key=d.key;document.getElementById('qrimg').src=d.qrimg;
+  document.getElementById('status').textContent='请用网易云APP扫码';document.getElementById('status').className='wait';poll()}
+  else{document.getElementById('status').textContent='生成失败: '+d.error;document.getElementById('status').className='err'}}
+async function poll(){if(!key)return;
+  const r=await fetch('/api/music/qr/check?key='+key);const d=await r.json();
+  if(d.code===803){document.getElementById('status').textContent='✅ 登录成功！页面将自动关闭...';document.getElementById('status').className='ok';return}
+  if(d.code===800){document.getElementById('status').textContent='二维码已过期，请点击刷新';document.getElementById('status').className='err';return}
+  if(d.code===802){document.getElementById('status').textContent='已扫码，请在手机上确认...';document.getElementById('status').className='wait'}
+  else{document.getElementById('status').textContent='等待扫码...';document.getElementById('status').className='wait'}
+  setTimeout(poll,2000)}
+gen();
+</script></body></html>"""
+    return HTMLResponse(html)
+
+@app.get("/api/music/qr/check")
+async def music_qr_check(key: str):
+    """检查二维码扫码状态"""
+    try:
+        from music_status import qr_login_step3, get_watcher
+        code, result = await qr_login_step3(key)
+        if code == 803:
+            # 登录成功，保存 cookie
+            watcher = get_watcher()
+            watcher._save_cookie(result)
+            return {"success": True, "code": 803, "message": "登录成功！"}
+        return {"success": True, "code": code, "message": result}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 # ==================== 启动入口 ====================
 
