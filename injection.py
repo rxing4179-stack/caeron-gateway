@@ -481,7 +481,7 @@ class InjectionEngine:
                         status_lines.append(f"| {key} | {updated_at_str} | - | 解析异常 |")
                 status_lines.append("</current_status>\n")
 
-            # === 听歌状态注入 ===
+            # === 状态注入 ===
             try:
                 from music_status import get_music_status
                 music_text = get_music_status()
@@ -489,7 +489,16 @@ class InjectionEngine:
                     status_lines.append(music_text)
                     status_lines.append("")
             except Exception as e:
-                logger.warning(f"[记忆注入] 读取听歌状态失败: {e}")
+                logger.warning(f"[注入] 获取网易云状态失败: {e}")
+
+            try:
+                from health_status import get_health_status
+                health_text = get_health_status()
+                if health_text:
+                    status_lines.append(health_text)
+                    status_lines.append("")
+            except Exception as e:
+                logger.warning(f"[注入] 获取小米健康状态失败: {e}")
 
             # 组装总结文本
             summary_lines = []

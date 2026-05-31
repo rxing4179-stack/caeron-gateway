@@ -109,7 +109,7 @@ async def lifespan(app: FastAPI):
             'unhealthy_since = NULL, fail_count = 0 WHERE is_enabled = 1'
         )
         await db.commit()
-        logger.info("����������������重置所有供应商健康状态")
+        logger.info("重置所有供应商健康状态")
     finally:
         await db.close()
 
@@ -126,6 +126,14 @@ async def lifespan(app: FastAPI):
         logger.info("网易云听歌状态监控已启动")
     except Exception as e:
         logger.warning(f"网易云听歌状态监控启动失败（非致命）: {e}")
+        
+    # 启动健康状态监控
+    try:
+        from health_status import start_health_watcher
+        await start_health_watcher()
+        logger.info("小米健康状态监控已启动")
+    except Exception as e:
+        logger.warning(f"小米健康状态监控启动失败（非致命）: {e}")
     
     logger.info("Caeron Gateway 启动完成，等待请求...")
 
@@ -551,40 +559,17 @@ async def _handle_chat_completions(request: Request):
     else:
         conversation_id = generate_conversation_id(raw_messages)
 
-    # === Reroll 消息清理 (Reroll Cleanup) ===
-    if raw_messages:
-        dropped_count = 0
-        dropped_texts = []
-        # Step 1: 移除末尾连续的废弃回复（Reroll 必然是针对最后一条 user 消息重新生成）
-        while raw_messages and raw_messages[-1].get('role') != 'user' and raw_messages[-1].get('role') != 'system':
-            dropped = raw_messages.pop()
-            dropped_count += 1
-            if dropped.get('role') == 'assistant' and dropped.get('content'):
-                dropped_texts.append(dropped.get('content'))
-            logger.info(f"[REROLL_CLEANUP] 移除末尾废弃消息: role={dropped.get('role')}")
-            
-        if dropped_count > 0 and explicit_source == 'operit':
-            # 必须同步等待清理，否则内存注入会提前触发，导致刚被废弃的回复作为记忆碎片又被注入！
-            import message_store
-            await message_store.cleanup_db_for_reroll(conversation_id, dropped_texts)
-            
-        # Step 2: 压缩中间的历史连续 assistant 消息，只保留连续段的最后一条
-        cleaned_history = []
-        for msg in raw_messages:
-            if msg.get('role') == 'assistant':
-                if cleaned_history and cleaned_history[-1].get('role') == 'assistant':
-                    # 发现连续的 assistant 消息，说明前面的是早期的 Reroll 废案
-                    cleaned_history[-1] = msg
-                else:
-                    cleaned_history.append(msg)
-            else:
-                cleaned_history.append(msg)
-        
-        body['messages'] = cleaned_history
-        raw_messages = cleaned_history
-    
+    # 异步存储，不阻塞主流程（存储失败不影响请求转发）
+    unified_history = []
+    if not tech_mode and request.headers.get('x-skip-rules', '').lower() != 'true':
+        import message_store
+        unified_history = await message_store.get_unified_history(char_limit=15000)
+
     # 异步存储，不阻塞主流程（存储失败不影响请求转发）
     stored_count = 0
+    was_rerolled = False
+    current_turn = []
+    
     _is_qq = request.headers.get('x-skip-rules', '').lower() == 'true'
     try:
         await ensure_conversation(conversation_id, model=model)
@@ -598,7 +583,7 @@ async def _handle_chat_completions(request: Request):
                     last_user = msg
                     break
             if last_user:
-                stored_count = await store_incoming_messages(conversation_id, [last_user])
+                stored_count, was_rerolled, current_turn = await store_incoming_messages(conversation_id, [last_user])
         else:
             if tech_mode:
                 import message_store
@@ -611,7 +596,14 @@ async def _handle_chat_completions(request: Request):
                 if last_user:
                     await message_store.store_unified_message('operit', 'main', 'user', last_user.get('content', ''))
             else:
-                stored_count = await store_incoming_messages(conversation_id, raw_messages)
+                stored_count, was_rerolled, current_turn = await store_incoming_messages(conversation_id, raw_messages)
+                
+                # 如果检测到 Reroll（Operit删除了历史消息），之前的 unified_history 已经过期
+                # 需要重新拉取，并排除刚刚存入的 current_turn
+                if was_rerolled:
+                    logger.info(f"[REROLL] 检测到历史截断，重新拉取统一历史...")
+                    unified_history = await message_store.get_unified_history(char_limit=15000, exclude_count=stored_count)
+                    
     except Exception as e:
         logger.error(f"消息存储管道异常（不影响转发）: {e}")
     
@@ -844,36 +836,64 @@ async def _handle_chat_completions(request: Request):
         # 1. 提取所有 system 消息（包含刚刚 injection_engine 注入的提示词和记忆总结）
         sys_msgs = [m for m in body.get('messages', []) if m.get('role') == 'system']
         
-        # 2. 找到本轮对话的起点（最后一条 user 消息）
-        messages_without_sys = [m for m in body.get('messages', []) if m.get('role') != 'system']
-        last_user_idx = len(messages_without_sys) - 1
-        
-        while last_user_idx >= 0 and messages_without_sys[last_user_idx].get('role') != 'user':
-            last_user_idx -= 1
+        # 2. current_turn 已经由 store_incoming_messages 提取出来了。
+        # 如果因为某些异常导致 current_turn 为空，回退为最后一条 user 消息
+        if not current_turn:
+            messages_without_sys = [m for m in body.get('messages', []) if m.get('role') != 'system']
+            last_user = None
+            for m in reversed(messages_without_sys):
+                if m.get('role') == 'user':
+                    last_user = m
+                    break
+            current_turn = [last_user] if last_user else messages_without_sys[-1:]
             
-        if last_user_idx != -1:
-            # 往前找，把紧挨着的 user_wrapped_system (<system>...</system>) 规则也包含进 current_turn
-            start_idx = last_user_idx
-            while start_idx > 0:
-                prev_msg = messages_without_sys[start_idx - 1]
-                if prev_msg.get('role') == 'user':
-                    content = prev_msg.get('content', '')
-                    if isinstance(content, str) and content.strip().startswith('<system>') and content.strip().endswith('</system>'):
-                        start_idx -= 1
-                        continue
-                break
-            current_turn = messages_without_sys[start_idx:]
-        else:
-            current_turn = messages_without_sys
-            
-        # 3. 拉取统一历史
-        import message_store
-        unified_history = await message_store.get_unified_history(char_limit=15000)
-        
-        # 4. 组装新的 messages 数组 (system + unified_history + current_turn)
-        # 注意：这里我们允许 unified_history 的最后一条可能和 current_turn 第一条重合，模型可以理解这点冗余。
+        # 3. 组装新的 messages 数组 (system + unified_history + current_turn)
         body['messages'] = sys_msgs + unified_history + current_turn
-        logger.info(f"[UNIFIED] 已替换 Operit 历史为跨端统一历史，包含 {len(unified_history)} 条记录")
+        logger.info(f"[UNIFIED] 已替换 Operit 历史为跨端统一历史，包含 {len(unified_history)} 条历史和 {len(current_turn)} 条当前轮")
+
+    # === Bug 1.5 修复：防止 AI 工具调用陷入死循环 (Ghost Wall) ===
+    _final_msgs = body.get('messages', [])
+    
+    # 检测逻辑：往回倒推，统计遇到 user 之前，有多少个包含 tool_calls 或 XML <tool_call 的 assistant 消息
+    consecutive_tool_turns = 0
+    last_tool_idx = -1
+    
+    for i in range(len(_final_msgs) - 1, -1, -1):
+        role = _final_msgs[i].get('role')
+        content = _final_msgs[i].get('content', '')
+        
+        # 兼容 OpenAI 的 role: tool 以及 Claude 的 user + <tool_result
+        is_tool_result = (role == 'tool') or (role == 'user' and isinstance(content, str) and '<tool_result' in content)
+        
+        if role == 'user' and not is_tool_result:
+            break  # 遇到上一轮真正的用户发言就停止
+        elif is_tool_result:
+            if last_tool_idx == -1:
+                last_tool_idx = i
+        elif role == 'assistant':
+            has_tool_call = _final_msgs[i].get('tool_calls') or (isinstance(content, str) and '<tool_call' in content)
+            if has_tool_call:
+                consecutive_tool_turns += 1
+                
+    if consecutive_tool_turns >= 3:
+        logger.warning(f"[TOOL_LOOP] 检测到连续 {consecutive_tool_turns} 次工具调用，强制中断死循环！")
+        if 'tools' in body:
+            del body['tools']
+        _final_msgs.append({
+            "role": "system",
+            "content": "【系统强制中断】你已经连续多次调用工具且未能得出最终回复。请立即停止调用任何工具，直接根据已有信息用中文回复用户！"
+        })
+        body['messages'] = _final_msgs
+
+    # === 根源治理：强化工具调用的边界感知 ===
+    if last_tool_idx != -1:
+        original_content = _final_msgs[last_tool_idx].get('content', '')
+        if isinstance(original_content, str):
+            patch = "\n\n[System Action Required: 此工具已执行。请评估是否需要继续调用其他工具（如还需要操作），若无须进一步调用，请直接以中文文字回复用户。]"
+            if "[System Action Required" not in original_content:
+                # 注意：如果是 XML 格式，补丁需要放在闭合标签后，但直接追加在末尾通常也是可以被识别的
+                _final_msgs[last_tool_idx]['content'] = original_content + patch
+                body['messages'] = _final_msgs
 
     # 打印最终发送给 API 的 context
     final_msg_count = len(body['messages'])
@@ -2101,13 +2121,7 @@ async def get_music_status_api():
         watcher = get_watcher()
         status_text = get_music_status()
         
-        song_info = None
-        if os.path.exists(STATUS_FILE):
-            try:
-                with open(STATUS_FILE, "r", encoding="utf-8") as f:
-                    song_info = json.load(f)
-            except Exception:
-                pass
+        song_info = watcher.get_current_song_info()
                 
         return {
             "success": True,
@@ -2119,18 +2133,127 @@ async def get_music_status_api():
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+@app.get("/api/health/status")
+async def get_health_status_api():
+    """获取小米健康状态调试接口"""
+    try:
+        from health_status import get_health_status, get_watcher
+        watcher = get_watcher()
+        status_text = get_health_status()
+        
+        return {
+            "success": True,
+            "status_text": status_text,
+            "data": watcher.data,
+            "has_token": bool(watcher.token)
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/api/")
+@app.get("/api")
+async def ha_api_root():
+    """兼容 Home Assistant 测试连接"""
+    return {"message": "API running."}
+
+@app.post("/api/health/realtime")
+@app.post("/api/health/webhook")
+async def health_webhook_api(request: Request):
+    """供Tasker或Notify app主动推送健康数据的Webhook"""
+    try:
+        data = await request.json()
+        logger.info(f"[Webhook] 收到外部健康数据: {data}")
+        from health_status import get_watcher
+        watcher = get_watcher()
+        
+        # 允许外部覆盖本地数据
+        if "heart_rate" in data: watcher.data["heart_rate"] = data["heart_rate"]
+        if "steps" in data: watcher.data["steps"] = data["steps"]
+        if "spo2" in data: watcher.data["spo2"] = data["spo2"]
+        if "calories" in data: watcher.data["calories"] = data["calories"]
+        if "sleep" in data: watcher.data["sleep"] = data["sleep"]
+        if "band_battery" in data: watcher.data["battery"] = data["band_battery"]
+        
+        # MacroDroid 纯文本通知解析兼容
+        if "text" in data or "title" in data or "raw_text" in data:
+            import re
+            full_text = str(data.get("title", "")) + " " + str(data.get("text", "")) + " " + str(data.get("raw_text", ""))
+            
+            # 解析心率 (包含 emoji)
+            hr_match = re.search(r'(心率|bpm|❤️|♥️|❤)[\s:]*(\d+)', full_text, re.IGNORECASE)
+            if hr_match: watcher.data["heart_rate"] = int(hr_match.group(2))
+            
+            # 解析步数 (包含 emoji)
+            steps_match = re.search(r'(步数|走了|步|🔵|●|⚫)[\s:]*(\d+)', full_text)
+            if steps_match: watcher.data["steps"] = int(steps_match.group(2))
+            
+            # 解析电量
+            bat_match = re.search(r'(电量|电池|🔋|🪫)[\s:]*(\d+)', full_text)
+            if bat_match: watcher.data["battery"] = int(bat_match.group(2))
+            
+            # 记录原始内容供排查
+            watcher.data["last_notification"] = full_text
+        
+        from datetime import datetime
+        watcher.data["last_update"] = datetime.now().strftime("%H:%M")
+        watcher.data["status"] = "webhook_sync"
+        watcher._save_cache()
+        
+        return {"success": True, "message": "Health data updated via webhook"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/webhook/{webhook_id}")
+async def ha_webhook_api(webhook_id: str, request: Request):
+    """兼容 Home Assistant Webhook 格式"""
+    return await health_webhook_api(request)
+
+@app.post("/api/states/{entity_id}")
+async def ha_states_api(entity_id: str, request: Request):
+    """兼容 Home Assistant REST API 格式"""
+    try:
+        data = await request.json()
+        logger.info(f"[HA_REST] 收到实体 {entity_id} 更新: {data}")
+        from health_status import get_watcher
+        watcher = get_watcher()
+        
+        state = data.get("state")
+        if "heart_rate" in entity_id or "hr" in entity_id:
+            watcher.data["heart_rate"] = int(float(state))
+        elif "steps" in entity_id:
+            watcher.data["steps"] = int(float(state))
+        elif "calories" in entity_id:
+            watcher.data["calories"] = int(float(state))
+        elif "sleep" in entity_id:
+            if "sleep" not in watcher.data or not isinstance(watcher.data["sleep"], dict):
+                watcher.data["sleep"] = {}
+            if "deep" in entity_id: watcher.data["sleep"]["deep"] = state
+            elif "light" in entity_id: watcher.data["sleep"]["light"] = state
+            elif "rem" in entity_id: watcher.data["sleep"]["rem"] = state
+            else: watcher.data["sleep"]["total"] = state
+        
+        from datetime import datetime
+        watcher.data["last_update"] = datetime.now().strftime("%H:%M")
+        watcher.data["status"] = "webhook_sync"
+        watcher._save_cache()
+        return {"entity_id": entity_id, "state": state}
+    except Exception as e:
+        logger.error(f"[HA_REST] 解析失败: {e}")
+        return {"success": False}
+
 @app.post("/api/music/control")
 async def control_music_api(request: Request):
     """前端调用控制一起听播放"""
     try:
         data = await request.json()
         action = data.get("action")
+        progress = data.get("progress")
         if not action:
             return {"success": False, "error": "缺少 action 参数"}
             
         from music_status import get_watcher
         watcher = get_watcher()
-        success = await watcher.control_music(action)
+        success = await watcher.control_music(action, progress=progress)
         return {"success": success}
     except Exception as e:
         return {"success": False, "error": str(e)}

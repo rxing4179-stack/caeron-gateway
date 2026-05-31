@@ -778,8 +778,8 @@ Line: ' + line + ', Col: ' + col + '
                                 </div>
                             </div>
                             <!-- 进度条 -->
-                            <div class="w-full bg-[#aecfd1]/50 rounded-full h-1.5 mt-3 relative overflow-hidden">
-                                <div class="bg-gradient-to-r from-[#4199a0] to-[#77b5b4] h-1.5 rounded-full transition-all duration-1000 ease-linear" :style="{ width: getProgressPercent() + '%' }"></div>
+                            <div class="w-full bg-[#aecfd1]/50 rounded-full h-2 mt-3 relative overflow-hidden cursor-pointer" @click="seekMusic">
+                                <div class="bg-gradient-to-r from-[#4199a0] to-[#77b5b4] h-2 rounded-full" :style="{ width: getProgressPercent() + '%' }"></div>
                             </div>
                             <!-- 控制按钮 -->
                             <div class="flex justify-center items-center gap-8 mt-4 mb-2">
@@ -1636,12 +1636,19 @@ Line: ' + line + ', Col: ' + col + '
                     return `${m}分钟`;
                 };
 
+                const currentTick = ref(Date.now());
+                let rAF = null;
+                const updateTick = () => {
+                    currentTick.value = Date.now();
+                    rAF = requestAnimationFrame(updateTick);
+                };
+
                 const getProgressPercent = () => {
                     if (listenTogetherData.duration <= 0) return 0;
                     let p = listenTogetherData.progress;
                     if (listenTogetherData.status === '播放中') {
-                        // 估算：加上距离上一次拉取经过的时间
-                        p += (Date.now() - listenTogetherData.last_update_local);
+                        // 使用响应式的 currentTick 确保 UI 平滑更新
+                        p += (currentTick.value - listenTogetherData.last_update_local);
                     }
                     return Math.min(100, Math.max(0, (p / listenTogetherData.duration) * 100));
                 };
@@ -1664,7 +1671,7 @@ Line: ' + line + ', Col: ' + col + '
                     input.click();
                 };
 
-                const controlMusic = async (action) => {
+                const controlMusic = async (action, progress = null) => {
                     loading.musicControl = true;
                     // 乐观更新，让UI立即响应
                     const prevStatus = listenTogetherData.status;
@@ -1674,7 +1681,7 @@ Line: ' + line + ', Col: ' + col + '
                         const res = await fetch('/api/music/control', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ action })
+                            body: JSON.stringify({ action, progress })
                         });
                         const data = await res.json();
                         if (data.success) {
@@ -1692,6 +1699,20 @@ Line: ' + line + ', Col: ' + col + '
                     }
                 };
 
+                const seekMusic = async (e) => {
+                    if (listenTogetherData.duration <= 0) return;
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+                    const percent = x / rect.width;
+                    const newProgress = Math.floor(percent * listenTogetherData.duration);
+                    
+                    // 乐观更新
+                    listenTogetherData.progress = newProgress;
+                    listenTogetherData.last_update_local = Date.now();
+                    
+                    await controlMusic('seek', newProgress);
+                };
+
                 // 在挂载和卸载时处理轮询
                 onMounted(() => {
                     fetchListenTogether();
@@ -1701,17 +1722,7 @@ Line: ' + line + ', Col: ' + col + '
                         }
                     }, 3000); // 缩短为3秒轮询
                     
-                    // 专门为进度条加一个本地定时器，实现平滑移动
-                    setInterval(() => {
-                        if (listenTogetherData.status === '播放中') {
-                            // 强行更新组件
-                            listenTogetherData.progress += 1000;
-                            if (listenTogetherData.progress > listenTogetherData.duration) {
-                                listenTogetherData.progress = listenTogetherData.duration;
-                            }
-                            listenTogetherData.last_update_local = Date.now();
-                        }
-                    }, 1000);
+                    updateTick();
                 });
                 // 召回状态
                 const recallInputText = ref('');
@@ -2897,7 +2908,7 @@ Line: ' + line + ', Col: ' + col + '
                     parseModels, openAddProviderModal, editProvider,
                     saveProvider, deleteProvider, testProvider,
                     openAddRuleModal, editRule, saveRule, deleteRule,
-                    listenTogetherData, customAvatars, triggerAvatarUpload, formatListenTime, getProgressPercent, fetchListenTogether, controlMusic,
+                    listenTogetherData, customAvatars, triggerAvatarUpload, formatListenTime, getProgressPercent, fetchListenTogether, controlMusic, seekMusic,
                     showModelModal, availableModels, modelSearchText, selectedModels, filteredModels, isAllModelsSelected, toggleAllModels, fetchUpstreamModels, confirmModelSelection,
                     conversations, windows, viewMode, fetchConversations, fetchWindows, toggleWindow, toggleConversation, deleteConversation, formatTime,
                     showWindowModal, showAssignModal, editingWindow, windowForm, manualWindows,

@@ -163,26 +163,68 @@ async def ensure_conversation(conversation_id: str, model: str = None, provider_
         await db.close()
 
 
-async def store_incoming_messages(conversation_id: str, messages: list):
+async def _delete_excess_messages(db, conversation_id: str, delete_from_index: int):
+    # 查出要删除的 messages
+    cursor = await db.execute('''
+        SELECT id, role, content FROM messages 
+        WHERE conversation_id = ? AND message_index > ?
+    ''', (conversation_id, delete_from_index))
+    excess_msgs = await cursor.fetchall()
+    
+    if not excess_msgs:
+        return
+        
+    # 删 messages
+    await db.execute('''
+        DELETE FROM messages 
+        WHERE conversation_id = ? AND message_index > ?
+    ''', (conversation_id, delete_from_index))
+    
+    deleted_count = len(excess_msgs)
+    logger.info(f"[REROLL_DB_CLEANUP] 对话 {conversation_id[:8]} 删除了 {deleted_count} 条废弃记录 (index > {delete_from_index})")
+    
+    # 删 unified_messages 中的对应 assistant 记录
+    deleted_assistant_count = sum(1 for m in excess_msgs if m['role'] == 'assistant')
+    if deleted_assistant_count > 0:
+        await db.execute('''
+            DELETE FROM unified_messages 
+            WHERE id IN (
+                SELECT id FROM unified_messages 
+                WHERE source = 'operit' AND role = 'assistant'
+                ORDER BY id DESC LIMIT ?
+            )
+        ''', (deleted_assistant_count,))
+        
+    # 级联清理 memories 和 memory_fragments
+    dropped_texts = [m['content'] for m in excess_msgs if m['content']]
+    for text in dropped_texts:
+        if text.strip():
+            cursor = await db.execute("SELECT id FROM memories WHERE content LIKE ?", ('%' + text.strip() + '%',))
+            mem_rows = await cursor.fetchall()
+            mem_ids = [str(r['id']) for r in mem_rows]
+            
+            if mem_ids:
+                ids_str = ",".join(mem_ids)
+                await db.execute(f"DELETE FROM memory_fragments WHERE source_dialogue_id IN ({ids_str})")
+                await db.execute(f"DELETE FROM memories WHERE id IN ({ids_str})")
+                logger.info(f"[REROLL_DB_CLEANUP] 删除了 {len(mem_ids)} 条 memories 及其关联碎片")
+
+async def store_incoming_messages(conversation_id: str, messages: list) -> tuple[int, bool, list]:
     """
     增量存储入站消息（兼容Operit滑动窗口）
-    
-    策略：
-    1. 取数据库中该对话最后一条消息的内容哈希
-    2. 在入站消息数组中找到这条消息的位置
-    3. 存储该位置之后的所有新消息
-    
-    这比旧的"按计数"方案更健壮：即使Operit截断了开头的旧消息，
-    只要最后一条已存消息还在上下文里，就能正确找到增量边界。
+    返回 (新增条数, 是否触发了reroll, 新增消息列表)
     """
-    chat_messages = [m for m in messages if m.get('role') in ('user', 'assistant')]
+    chat_messages = [m for m in messages if m.get('role') in ('user', 'assistant', 'tool')]
     
     if not chat_messages:
-        return 0
+        return 0, False, []
+        
+    was_rerolled = False
+    new_messages = []
     
     db = await get_db()
     try:
-        # 取数据库中最后一条消息的内容哈希和index
+        # 获取当前对话的最大序号
         cursor = await db.execute(
             '''SELECT content, message_index FROM messages 
                WHERE conversation_id = ? 
@@ -218,7 +260,6 @@ async def store_incoming_messages(conversation_id: str, messages: list):
                     h = hashlib.md5(c.encode('utf-8')).hexdigest()[:16]
                     incoming_user_hashes[h] = i  # 同哈希保留最后出现的位置
             
-            # 从最新的锚点开始尝试匹配
             match_pos = -1
             matched_db_index = -1
             for anchor in anchor_candidates:
@@ -230,24 +271,44 @@ async def store_incoming_messages(conversation_id: str, messages: list):
                     break
             
             if match_pos >= 0:
-                # 找到锚点：存储锚点之后的所有消息（跳过锚点本身和它之前已存的）
-                new_messages = chat_messages[match_pos + 1:]
-                # 新消息的起始index = 锚点的db_index + 1 + 锚点后已存的assistant消息数
-                # 简化：直接从last_index+1开始，确保不重叠
+                already_stored_count = last_index - matched_db_index
+                incoming_after_anchor = len(chat_messages) - 1 - match_pos
+                
+                # ==== 检测历史截断 / Reroll ====
+                # 如果数据库里在 anchor 之后的消息比 Operit 发来的要多，
+                # 说明 Operit 删除了（重置/撤回了）历史消息，必须触发清理！
+                if incoming_after_anchor < already_stored_count:
+                    delete_from_index = matched_db_index + incoming_after_anchor
+                    await _delete_excess_messages(db, conversation_id, delete_from_index)
+                    last_index = delete_from_index
+                    already_stored_count = incoming_after_anchor
+                    was_rerolled = True
+                
+                # 新消息从锚点位置 + 1 + 已经存过的数量 开始截取
+                slice_start = match_pos + 1 + already_stored_count
+                
+                if slice_start > len(chat_messages):
+                    slice_start = len(chat_messages)
+                    
+                new_messages = chat_messages[slice_start:]
+                
                 start_index = last_index + 1
-                logger.info(f"[STORE] 锚点匹配成功 pos={match_pos}, db_idx={matched_db_index}, "
+                logger.info(f"[STORE] 锚点匹配成功 pos={match_pos}, db_idx={matched_db_index}, 跳过 {already_stored_count} 条已存消息, "
                            f"新增{len(new_messages)}条 (对话: {conversation_id[:8]}...)")
             else:
                 # 没找到匹配 — 所有锚点都被Operit滑掉了
-                # 存储最后一条user消息（确保不丢失）
-                last_user = None
-                for msg in reversed(chat_messages):
-                    if msg.get('role') == 'user':
-                        last_user = msg
-                        break
-                new_messages = [last_user] if last_user else chat_messages[-1:]
+                # 截取最后一条user消息及之后的所有消息（确保不丢失tool_result等）
+                last_user_idx = len(chat_messages) - 1
+                while last_user_idx >= 0 and chat_messages[last_user_idx].get('role') != 'user':
+                    last_user_idx -= 1
+                
+                if last_user_idx != -1:
+                    new_messages = chat_messages[last_user_idx:]
+                else:
+                    new_messages = chat_messages[-1:]
+                    
                 start_index = last_index + 1
-                logger.warning(f"[STORE] 未找到锚点，存储最新user消息 (对话: {conversation_id[:8]}...)")
+                logger.warning(f"[STORE] 未找到锚点，存储最新user及后续消息 {len(new_messages)} 条 (对话: {conversation_id[:8]}...)")
         
         if not new_messages:
             return 0
@@ -284,7 +345,7 @@ async def store_incoming_messages(conversation_id: str, messages: list):
         logger.info(f"存储 {stored} 条入站消息 (对话: {conversation_id[:8]}...)")
     except Exception as e:
         logger.error(f"消息存档异常: {e}")
-        return 0
+        return 0, False, []
     finally:
         await db.close()
 
@@ -292,68 +353,8 @@ async def store_incoming_messages(conversation_id: str, messages: list):
     for msg in unified_to_save:
         await store_unified_message('operit', 'main', msg['role'], msg.get('content', ''))
 
-    return stored
+    return stored, was_rerolled, new_messages
 
-async def cleanup_db_for_reroll(conversation_id: str, dropped_texts: list = None):
-    """
-    Reroll 清理逻辑：
-    删除数据库中该对话最后一条 user 消息之后的所有消息（即废弃的 assistant 回复）。
-    """
-    db = await get_db()
-    try:
-        # 1. 找到最后一条 user 消息的 index
-        cursor = await db.execute('''
-            SELECT message_index FROM messages 
-            WHERE conversation_id = ? AND role = 'user' 
-            ORDER BY message_index DESC LIMIT 1
-        ''', (conversation_id,))
-        row = await cursor.fetchone()
-        if not row:
-            return
-            
-        last_user_idx = row['message_index']
-        
-        # 2. 删除该 user 之后的所有消息 (实际上就是之前被 Reroll 废弃的 assistant 回复)
-        cursor = await db.execute('''
-            DELETE FROM messages 
-            WHERE conversation_id = ? AND message_index > ?
-        ''', (conversation_id, last_user_idx))
-        deleted_count = cursor.rowcount
-        
-        if deleted_count > 0:
-            logger.info(f"[REROLL_DB_CLEANUP] 对话 {conversation_id[:8]} 删除了 {deleted_count} 条废弃记录")
-            # 同步删除 unified_messages 中的同等数量的 operit assistant 记录
-            await db.execute('''
-                DELETE FROM unified_messages 
-                WHERE id IN (
-                    SELECT id FROM unified_messages 
-                    WHERE source = 'operit' AND role = 'assistant'
-                    ORDER BY id DESC LIMIT ?
-                )
-            ''', (deleted_count,))
-            
-        # 3. 级联清理 memories 和 memory_fragments
-        if dropped_texts:
-            for text in dropped_texts:
-                if text.strip():
-                    # 匹配 memories 表中包含该废弃回复的记录
-                    cursor = await db.execute("SELECT id FROM memories WHERE content LIKE ?", ('%' + text.strip() + '%',))
-                    mem_rows = await cursor.fetchall()
-                    mem_ids = [str(r['id']) for r in mem_rows]
-                    
-                    if mem_ids:
-                        ids_str = ",".join(mem_ids)
-                        # 先删 fragments
-                        await db.execute(f"DELETE FROM memory_fragments WHERE source_dialogue_id IN ({ids_str})")
-                        # 再删 memories
-                        await db.execute(f"DELETE FROM memories WHERE id IN ({ids_str})")
-                        logger.info(f"[REROLL_DB_CLEANUP] 删除了 {len(mem_ids)} 条 memories 及其关联碎片")
-
-        await db.commit()
-    except Exception as e:
-        logger.error(f"Reroll 清理数据库异常: {e}")
-    finally:
-        await db.close()
 
 # ==================== 统一跨端上下文存储 ====================
 
@@ -402,9 +403,10 @@ async def store_unified_message(source: str, source_context: str, role: str, con
     finally:
         await db.close()
 
-async def get_unified_history(char_limit: int = 15000) -> list:
+async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0) -> list:
     """
-    拉取统一的跨端历史记录，并打上来源标签
+    获取统一的历史记录，按字符数限制（从新到旧截断）
+    exclude_count: 排除最新的N条记录（用于在存入新消息后，重新拉取时不包含新消息）
     """
     db = await get_db()
     try:
@@ -414,6 +416,10 @@ async def get_unified_history(char_limit: int = 15000) -> list:
             ORDER BY timestamp DESC
         ''')
         rows = await cursor.fetchall()
+        
+        if exclude_count > 0:
+            rows = rows[exclude_count:]
+
         
         history = []
         total_chars = 0

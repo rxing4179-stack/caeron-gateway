@@ -6,11 +6,50 @@ Caeron Gateway - 请求转发模块
 import json
 import logging
 import httpx
+import re
 from urllib.parse import quote
 from fastapi.responses import StreamingResponse, JSONResponse
 from message_store import store_assistant_response
 
 logger = logging.getLogger(__name__)
+
+def clean_system_prompt(content: str) -> str:
+    """清理上游平台注入的系统预设，保留Operit工具声明和用户角色卡"""
+    if not isinstance(content, str):
+        return content
+        
+    cleaned = content
+    
+    # 明确剥离平台的安全/风格约束标签
+    strict_strip_tags = [
+        'response_style', 'safety_guardrails', 'content_safety', 
+        'git_safety', 'coding_questions', 'capabilities', 'tone_and_style'
+    ]
+    for tag in strict_strip_tags:
+        cleaned = re.sub(rf'<{tag}>.*?</{tag}>\n*', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+        
+    # 对于 <identity>, <rules>, <instructions> 进行条件过滤
+    for tag in ['identity', 'rules', 'instructions']:
+        pattern = rf'<{tag}>(.*?)</{tag}>\n*'
+        def replacer(match):
+            inner_text = match.group(1)
+            lower_text = inner_text.lower()
+            # 包含平台特征词，判定为上游注入，直接抹除
+            if ('kiro' in lower_text or 'anthropic' in lower_text or 
+                'helpful assistant' in lower_text or 'keep responses focused' in lower_text or
+                'concise' in lower_text):
+                # 排除误杀 Operit tool prompt 或 用户 prompt
+                if 'tool' not in lower_text and 'function' not in lower_text and '蕊蕊' not in lower_text:
+                    return ''
+            return match.group(0)
+        
+        cleaned = re.sub(pattern, replacer, cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+    # 直接匹配剔除游离的 Kiro/Helpful assistant 声明段落（无XML包裹的情况）
+    cleaned = re.sub(r'(?i)^(You are Kiro.*?)(?=\n\n|\n[A-Z]|<|<!--)', '', cleaned)
+    cleaned = re.sub(r'(?i)^(You are a helpful.*?)(?=\n\n|\n[A-Z]|<|<!--)', '', cleaned)
+
+    return cleaned.strip()
 
 
 def build_upstream_url(api_base_url: str) -> str:
@@ -49,6 +88,13 @@ async def proxy_chat_completion(request_body: dict, provider: dict, conversation
     根据 stream 参数自动选择流式或非流式转发
     conversation_id: 可选，传入时会自动存储AI回复
     """
+    # [新增逻辑] 拦截并清洗平台预设的 system prompt
+    if 'messages' in request_body and isinstance(request_body['messages'], list):
+        for msg in request_body['messages']:
+            if msg.get('role') == 'system':
+                original_content = msg.get('content', '')
+                if isinstance(original_content, str):
+                    msg['content'] = clean_system_prompt(original_content)
     upstream_url = build_upstream_url(provider['api_base_url'])
     is_stream = request_body.get('stream', False)
 

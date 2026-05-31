@@ -139,7 +139,21 @@ class ListenTogetherWatcher:
         except Exception:
             return ""
 
-    async def control_music(self, action: str):
+    async def fetch_hot_comments(self, song_id) -> list:
+        try:
+            data = await self._api_get("/comment/music", {"id": song_id, "limit": 3})
+            comments = []
+            if data.get("hotComments") and len(data["hotComments"]) > 0:
+                comments = [c.get("content", "") for c in data["hotComments"][:3]]
+            elif data.get("comments") and len(data["comments"]) > 0:
+                comments = [c.get("content", "") for c in data["comments"][:3]]
+            return comments
+        except Exception as e:
+            logger.error(f"[Music] 获取评论失败: {e}")
+            return []
+
+
+    async def control_music(self, action: str, progress: int = None):
         """盲测：尝试发送控制指令"""
         if not self.cookie or not self.current_room_id:
             logger.warning("[Music] 无法控制：未登录或未在房间内")
@@ -148,18 +162,49 @@ class ListenTogetherWatcher:
         try:
             command_type = action.upper()
             
+            # 使用传入的 progress，或者动态推算当前的真实进度
+            current_prog = getattr(self, 'current_progress', 0)
+            if progress is not None:
+                current_prog = progress
+            else:
+                if getattr(self, 'current_play_status', '') == "PLAY" and hasattr(self, 'last_update_time'):
+                    current_prog += int((time.time() - self.last_update_time) * 1000)
+                
             params = {
                 "roomId": self.current_room_id,
                 "commandType": command_type,
-                "playStatus": command_type if command_type in ("PLAY", "PAUSE") else "PLAY",
-                "progress": getattr(self, 'current_progress', 0)
+                "playStatus": "PLAY" if command_type == "SEEK" else (command_type if command_type in ("PLAY", "PAUSE") else "PLAY"),
+                "progress": current_prog
             }
-            if command_type in ("PLAY", "PAUSE"):
+            if command_type in ("PLAY", "PAUSE", "SEEK"):
                 params["targetSongId"] = self.current_song_id
 
             res = await self._api_get("/listentogether/play/command", params)
             logger.info(f"[Music] 控制播放 {action} 返回: {res}")
             
+            if res.get("code") == 200:
+                # 乐观更新本地状态，防止前端立刻轮询时读到旧数据导致跳回
+                self.last_update_time = time.time()
+                if command_type == "SEEK" and progress is not None:
+                    self.current_progress = progress
+                    self.last_recorded_progress = progress
+                elif command_type in ("PLAY", "PAUSE"):
+                    self.current_play_status = command_type
+                    self.last_recorded_status = command_type
+                
+                if os.path.exists(STATUS_FILE):
+                    try:
+                        with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                            output = json.load(f)
+                        if command_type == "SEEK" and progress is not None:
+                            output["progress"] = progress
+                        elif command_type in ("PLAY", "PAUSE"):
+                            output["status"] = "播放中" if command_type == "PLAY" else "已暂停"
+                        with open(STATUS_FILE, "w", encoding="utf-8") as f:
+                            json.dump(output, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        logger.error(f"[Music] 乐观更新状态文件失败: {e}")
+
             return res.get("code") == 200
         except Exception as e:
             logger.error(f"[Music] 控制异常: {e}")
@@ -192,21 +237,31 @@ class ListenTogetherWatcher:
                 self.total_together_seconds += POLL_INTERVAL
                 self._save_duration()
             
-            # 检查是否有变化（切歌或播放/暂停状态改变）
-            if song_id != self.current_song_id or play_status != self.current_play_status:
+            expected_progress = getattr(self, 'last_recorded_progress', progress)
+            if getattr(self, 'last_recorded_status', '') == "PLAY":
+                expected_progress += POLL_INTERVAL * 1000
+            
+            # 判断是否发生进度跳变（超过3秒）
+            is_seek = abs(progress - expected_progress) > 3000
+            self.last_recorded_progress = progress
+            self.last_recorded_status = play_status
+            
+            # 检查是否有变化（切歌或播放/暂停状态改变，或者进度跳变）
+            if song_id != self.current_song_id or play_status != self.current_play_status or is_seek:
                 is_new_song = (song_id != self.current_song_id)
                 self.current_song_id = song_id
                 self.current_play_status = play_status
                 self.last_update_time = time.time()
                 
                 status_zh = "播放中" if play_status == "PLAY" else "已暂停"
-                logger.info(f"[Music] 状态更新: 歌曲ID={song_id}, 状态={status_zh}")
+                logger.info(f"[Music] 状态更新: 歌曲ID={song_id}, 状态={status_zh}, 进度={progress}")
                 
                 # 如果是切歌，拉取详情
                 if is_new_song and song_id:
                     logger.info(f"[Music] 检测到切歌: 拉取 {song_id} 详情...")
                     detail = await self.fetch_song_detail(song_id)
                     lyric = await self.fetch_lyric(song_id)
+                    hot_comments = await self.fetch_hot_comments(song_id)
                     
                     # 写入文件供 injection.py 提取
                     output = {
@@ -219,6 +274,7 @@ class ListenTogetherWatcher:
                         "progress": progress,
                         "status": status_zh,
                         "lyric": lyric,
+                        "hot_comments": hot_comments,
                         "update_time": time.strftime("%Y-%m-%d %H:%M:%S")
                     }
                     
@@ -226,7 +282,7 @@ class ListenTogetherWatcher:
                         json.dump(output, f, ensure_ascii=False, indent=2)
                     logger.info(f"[Music] 状态文件已更新: {detail.get('name')}")
                 else:
-                    # 只是播放/暂停状态改变，更新文件中的状态字段
+                    # 只是播放/暂停状态改变或进度跳变，更新文件中的状态字段
                     if os.path.exists(STATUS_FILE):
                         with open(STATUS_FILE, "r", encoding="utf-8") as f:
                             output = json.load(f)
@@ -235,9 +291,26 @@ class ListenTogetherWatcher:
                         output["update_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
                         with open(STATUS_FILE, "w", encoding="utf-8") as f:
                             json.dump(output, f, ensure_ascii=False, indent=2)
-                        logger.info(f"[Music] 状态文件已更新(播放状态): {status_zh}")
+                        logger.info(f"[Music] 状态文件已更新(播放状态/进度): {status_zh}")
         except Exception as e:
             logger.error(f"[Music] poll 异常: {e}")
+
+    def get_current_song_info(self):
+        """为API提供实时估算的歌曲状态"""
+        if not self.current_song_id or not os.path.exists(STATUS_FILE):
+            return None
+        try:
+            with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                output = json.load(f)
+            
+            prog = output.get("progress", 0)
+            if output.get("status") == "播放中" and hasattr(self, 'last_update_time'):
+                prog += int((time.time() - self.last_update_time) * 1000)
+            
+            output["progress"] = prog
+            return output
+        except Exception:
+            return None
 
     async def loop(self):
         self.is_running = True
@@ -297,6 +370,12 @@ def get_music_status() -> str:
             f"专辑: {album}\n"
             f"歌词预览:\n{lyric_preview}"
         )
+        
+        hot_comments = data.get("hot_comments", [])
+        if hot_comments:
+            comments_text = "\n".join([f"- {c}" for c in hot_comments])
+            text += f"\n【网易云热评 (用于感受歌曲氛围和情感)】\n{comments_text}"
+            
         return text
     except Exception as e:
         logger.error(f"[Music] 读取状态失败: {e}")

@@ -1,0 +1,15 @@
+{
+  "heart_rate": 72,
+  "steps": 3521,
+  "spo2": 98,
+  "calories": 206,
+  "sleep": {
+    "total": "7h12m",
+    "deep": "2h30m",
+    "light": "3h42m",
+    "rem": "1h00m"
+  },
+  "last_update": "02:58",
+  "status": "auth_expired",
+  "last_notification": "  "
+}
