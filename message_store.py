@@ -196,10 +196,12 @@ async def _delete_excess_messages(db, conversation_id: str, delete_from_index: i
         ''', (deleted_assistant_count,))
         
     # 级联清理 memories 和 memory_fragments
-    dropped_texts = [m['content'] for m in excess_msgs if m['content']]
+    from utils import clean_chat_text
+    dropped_texts = [m['content'] for m in excess_msgs if m['role'] == 'assistant' and m['content']]
     for text in dropped_texts:
-        if text.strip():
-            cursor = await db.execute("SELECT id FROM memories WHERE content LIKE ?", ('%' + text.strip() + '%',))
+        cleaned_ast = clean_chat_text(text).strip()
+        if cleaned_ast:
+            cursor = await db.execute("SELECT id FROM memories WHERE category='dialogue' AND content LIKE ?", ('%' + cleaned_ast + '%',))
             mem_rows = await cursor.fetchall()
             mem_ids = [str(r['id']) for r in mem_rows]
             
@@ -271,30 +273,56 @@ async def store_incoming_messages(conversation_id: str, messages: list) -> tuple
                     break
             
             if match_pos >= 0:
-                already_stored_count = last_index - matched_db_index
-                incoming_after_anchor = len(chat_messages) - 1 - match_pos
+                # 1. 获取 DB 中在 anchor 之后的所有消息
+                cursor3 = await db.execute(
+                    '''SELECT id, role, content, message_index FROM messages 
+                       WHERE conversation_id = ? AND message_index > ?
+                       ORDER BY message_index ASC''',
+                    (conversation_id, matched_db_index)
+                )
+                db_after_anchor = await cursor3.fetchall()
                 
-                # ==== 检测历史截断 / Reroll ====
-                # 如果数据库里在 anchor 之后的消息比 Operit 发来的要多，
-                # 说明 Operit 删除了（重置/撤回了）历史消息，必须触发清理！
-                if incoming_after_anchor < already_stored_count:
-                    delete_from_index = matched_db_index + incoming_after_anchor
+                # 2. 准备 incoming 中在 anchor 之后的所有消息
+                incoming_after_anchor_msgs = chat_messages[match_pos + 1:]
+                
+                # 3. 逐个对比，找到分歧点
+                divergence_offset = 0
+                max_compare = min(len(db_after_anchor), len(incoming_after_anchor_msgs))
+                for i in range(max_compare):
+                    db_msg = db_after_anchor[i]
+                    inc_msg = incoming_after_anchor_msgs[i]
+                    
+                    if db_msg['role'] != inc_msg.get('role'):
+                        break
+                        
+                    inc_content = inc_msg.get('content', '')
+                    if isinstance(inc_content, list):
+                        inc_content = json.dumps(inc_content, ensure_ascii=False)
+                    
+                    db_hash = hashlib.md5((db_msg['content'] or '').encode('utf-8')).hexdigest()[:16]
+                    inc_hash = hashlib.md5(inc_content.encode('utf-8')).hexdigest()[:16]
+                    
+                    if db_hash != inc_hash:
+                        break
+                    
+                    divergence_offset += 1
+                
+                # ==== 检测历史截断 / Reroll / 回滚 / 编辑 ====
+                # 如果 DB 中在分歧点之后还有消息，说明发生了截断、重置、或消息被编辑，必须删除这些过期的记录
+                if divergence_offset < len(db_after_anchor):
+                    first_invalid_db_index = db_after_anchor[divergence_offset]['message_index']
+                    delete_from_index = first_invalid_db_index - 1
                     await _delete_excess_messages(db, conversation_id, delete_from_index)
                     last_index = delete_from_index
-                    already_stored_count = incoming_after_anchor
                     was_rerolled = True
                 
-                # 新消息从锚点位置 + 1 + 已经存过的数量 开始截取
-                slice_start = match_pos + 1 + already_stored_count
-                
-                if slice_start > len(chat_messages):
-                    slice_start = len(chat_messages)
-                    
+                # 新消息从 分歧点 开始截取并存入数据库
+                slice_start = match_pos + 1 + divergence_offset
                 new_messages = chat_messages[slice_start:]
                 
                 start_index = last_index + 1
-                logger.info(f"[STORE] 锚点匹配成功 pos={match_pos}, db_idx={matched_db_index}, 跳过 {already_stored_count} 条已存消息, "
-                           f"新增{len(new_messages)}条 (对话: {conversation_id[:8]}...)")
+                logger.info(f"[STORE] 锚点匹配成功 pos={match_pos}, db_idx={matched_db_index}, 发现相同消息 {divergence_offset} 条, "
+                           f"新增 {len(new_messages)} 条 (对话: {conversation_id[:8]}...)")
             else:
                 # 没找到匹配 — 所有锚点都被Operit滑掉了
                 # 截取最后一条user消息及之后的所有消息（确保不丢失tool_result等）
@@ -492,17 +520,14 @@ async def store_assistant_response(conversation_id: str, content: str, source: s
     if not content or not content.strip():
         return
     
-    # === 新增：统一历史桥接 ===
-    # 如果是 Operit 来源，则在此处保存 assistant 回复到 unified_messages。
-    # QQ 来源已经在 qq_adapter.py 中自行保存了，这里避免重复保存。
-    if source != 'qq':
-        await store_unified_message(source, source_context, 'assistant', content)
-        
     if skip_messages_table:
+        if source != 'qq':
+            await store_unified_message(source, source_context, 'assistant', content)
         return
         
     now_bj = now_cst().strftime('%Y-%m-%d %H:%M:%S')
     db = await get_db()
+    is_reroll = False
     try:
         # 检查最后一条消息是否是assistant（重roll场景）
         cursor = await db.execute(
@@ -514,6 +539,7 @@ async def store_assistant_response(conversation_id: str, content: str, source: s
         last_msg = await cursor.fetchone()
         
         if last_msg and last_msg['role'] == 'assistant':
+            is_reroll = True
             # 重roll：覆盖最后一条assistant消息
             await db.execute(
                 '''UPDATE messages SET content = ?, created_at = ?
@@ -521,6 +547,29 @@ async def store_assistant_response(conversation_id: str, content: str, source: s
                 (content, now_bj, last_msg['id'])
             )
             logger.info(f"覆盖AI回复(重roll) (对话: {conversation_id[:8]}..., {len(content)} 字符)")
+            
+            if source != 'qq':
+                # 删除旧的 unified_messages 记录
+                await db.execute('''
+                    DELETE FROM unified_messages 
+                    WHERE id IN (
+                        SELECT id FROM unified_messages 
+                        WHERE source = ? AND role = 'assistant'
+                        ORDER BY id DESC LIMIT 1
+                    )
+                ''', (source,))
+                
+            # 删除旧的 memory 记录和 memory_fragments
+            await db.execute('''
+                DELETE FROM memory_fragments WHERE source_dialogue_id IN (
+                    SELECT id FROM memories WHERE category = 'dialogue' ORDER BY id DESC LIMIT 1
+                )
+            ''')
+            await db.execute('''
+                DELETE FROM memories WHERE id IN (
+                    SELECT id FROM memories WHERE category = 'dialogue' ORDER BY id DESC LIMIT 1
+                )
+            ''')
         else:
             # 正常新增
             next_index = (last_msg['message_index'] + 1) if last_msg else 0
@@ -547,6 +596,11 @@ async def store_assistant_response(conversation_id: str, content: str, source: s
         logger.error(f"存储AI回复失败: {e}")
     finally:
         await db.close()
+
+    # === 新增：统一历史桥接 ===
+    # 在所有数据库清理工作（重roll的删除）完成后，再保存新的 unified_message
+    if source != 'qq':
+        await store_unified_message(source, source_context, 'assistant', content)
 
 async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_content: str):
     """后台任务：把对话对存入 memories 表，并生成 embedding"""

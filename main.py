@@ -816,24 +816,11 @@ async def _handle_chat_completions(request: Request):
     # 检查是否为 QQ 来源（跳过规则注入，但保留记忆注入）
     skip_rules = request.headers.get('x-skip-rules', '').lower() == 'true'
     
-    if skip_rules:
-        # QQ 来源：跳过 injection_rules（Operit人格提示词），但注入记忆/摘要（跨端桥接）
-        # QQ 始终以日常模式运行，不受技术模式影响
-        injection_engine = InjectionEngine()
-        body['messages'] = await injection_engine.inject_memory_only(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
-        logger.info(f"[QQ_INJECT] QQ来源: 跳过规则注入，执行记忆注入（跨端桥接）")
-    elif tech_mode:
-        # Operit 技术模式：跳过所有注入
-        logger.info(f"[TECH_MODE] 技术模式启用，跳过注入引擎，保留原始 {len(body.get('messages', []))} 条消息")
-    else:
-        # Operit 日常模式：完整注入（规则 + 记忆）
-        injection_engine = InjectionEngine()
-        body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
-
     # === 新增：统一跨端上下文构建 (仅 Operit 日常模式) ===
     # 技术模式下必须完全透传 Operit 的原始历史，绝不能用统一历史覆盖！
+    # 必须在 InjectionEngine 注入规则之前完成，否则会把注入的 user_wrapped_system 规则覆盖掉！
     if not skip_rules and not tech_mode:
-        # 1. 提取所有 system 消息（包含刚刚 injection_engine 注入的提示词和记忆总结）
+        # 1. 提取所有 system 消息（此时为 Operit 原始请求的 system）
         sys_msgs = [m for m in body.get('messages', []) if m.get('role') == 'system']
         
         # 2. current_turn 已经由 store_incoming_messages 提取出来了。
@@ -850,6 +837,20 @@ async def _handle_chat_completions(request: Request):
         # 3. 组装新的 messages 数组 (system + unified_history + current_turn)
         body['messages'] = sys_msgs + unified_history + current_turn
         logger.info(f"[UNIFIED] 已替换 Operit 历史为跨端统一历史，包含 {len(unified_history)} 条历史和 {len(current_turn)} 条当前轮")
+
+    if skip_rules:
+        # QQ 来源：跳过 injection_rules（Operit人格提示词），但注入记忆/摘要（跨端桥接）
+        # QQ 始终以日常模式运行，不受技术模式影响
+        injection_engine = InjectionEngine()
+        body['messages'] = await injection_engine.inject_memory_only(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
+        logger.info(f"[QQ_INJECT] QQ来源: 跳过规则注入，执行记忆注入（跨端桥接）")
+    elif tech_mode:
+        # Operit 技术模式：跳过所有注入
+        logger.info(f"[TECH_MODE] 技术模式启用，跳过注入引擎，保留原始 {len(body.get('messages', []))} 条消息")
+    else:
+        # Operit 日常模式：完整注入（规则 + 记忆）
+        injection_engine = InjectionEngine()
+        body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
 
     # === Bug 1.5 修复：防止 AI 工具调用陷入死循环 (Ghost Wall) ===
     _final_msgs = body.get('messages', [])

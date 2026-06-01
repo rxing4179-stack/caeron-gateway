@@ -2,22 +2,22 @@ import os
 import time
 import json
 import asyncio
-import httpx
 import logging
-import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from mi_fitness.auth import XiaomiAuth
+from mi_fitness.client import MiHealthClient
+from mi_fitness.client import data as _data
 
 logger = logging.getLogger('health_status')
 
 HEALTH_STATUS_FILE = "/home/ubuntu/caeron-gateway/health_status.json"
-CREDENTIALS_FILE = "/home/ubuntu/caeron-gateway/xiaomi_credentials.json"
+TOKEN_FILE = "/home/ubuntu/caeron-gateway/xiaomi_token.json"
 POLL_INTERVAL_FAST = 5 * 60   # 5分钟轮询一次（心率/步数/血氧）
 POLL_INTERVAL_SLOW = 30 * 60  # 30分钟轮询一次（睡眠）
 
 class XiaomiHealthWatcher:
     def __init__(self):
         self.is_running = False
-        self.token = None
         self.last_fast_poll = 0
         self.last_slow_poll = 0
         self.data = {
@@ -25,9 +25,10 @@ class XiaomiHealthWatcher:
             "steps": None,
             "spo2": None,
             "calories": None,
-            "sleep": None, # e.g. {"total": "7h12m", "deep": "2h30m", "light": "3h42m", "rem": "1h00m"}
+            "sleep": None,
             "last_update": None,
-            "status": "offline" # online, offline, auth_expired, not_worn
+            "status": "offline",
+            "last_notification": None # Preserve MacroDroid notification text
         }
         self._load_cache()
 
@@ -36,159 +37,122 @@ class XiaomiHealthWatcher:
             try:
                 with open(HEALTH_STATUS_FILE, "r", encoding="utf-8") as f:
                     cached = json.load(f)
-                    self.data.update(cached)
+                    # Update local memory
+                    for k, v in cached.items():
+                        if v is not None:
+                            self.data[k] = v
             except Exception as e:
                 logger.error(f"[Health] 读取缓存失败: {e}")
 
     def _save_cache(self):
         try:
+            # First, reload from disk to not overwrite MacroDroid's real-time heart rate!
+            disk_data = {}
+            if os.path.exists(HEALTH_STATUS_FILE):
+                with open(HEALTH_STATUS_FILE, "r", encoding="utf-8") as f:
+                    disk_data = json.load(f)
+            
+            # Keep MacroDroid's heart_rate and last_notification if they are newer
+            if "heart_rate" in disk_data and disk_data["heart_rate"]:
+                self.data["heart_rate"] = disk_data["heart_rate"]
+            if "last_notification" in disk_data:
+                self.data["last_notification"] = disk_data["last_notification"]
+                
             with open(HEALTH_STATUS_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"[Health] 保存缓存失败: {e}")
 
-    def _load_credentials(self):
-        if os.path.exists(CREDENTIALS_FILE):
-            try:
-                with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
-
-    async def _refresh_token(self):
-        creds = self._load_credentials()
-        email = creds.get("email")
-        password = creds.get("password")
-        if not email or not password:
+    async def _fetch_band_data(self, fetch_slow=False):
+        if not os.path.exists(TOKEN_FILE):
             self.data["status"] = "auth_expired"
-            self._save_cache()
             return False
             
-        logger.info(f"[Health] 正在使用 {email} 登录 Huami/Xiaomi API...")
-        auth_url = f'https://api-user.huami.com/registrations/{urllib.parse.quote(email)}/tokens'
-        data = {
-            'state': 'REDIRECTION',
-            'client_id': 'HuaMi',
-            'redirect_uri': 'https://s3-us-west-2.amazonws.com/hm-registration/successsignin.html',
-            'token': 'access',
-            'password': password,
-        }
-        
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(auth_url, data=data, follow_redirects=False)
-                resp.raise_for_status()
-                location = resp.headers.get('location', '')
-                redirect_url = urllib.parse.urlparse(location)
-                response_args = urllib.parse.parse_qs(redirect_url.query)
-                
-                if 'access' not in response_args or 'country_code' not in response_args:
-                    raise Exception("登录返回缺失 access 或 country_code")
+            async with XiaomiAuth.from_token(TOKEN_FILE) as auth:
+                async with MiHealthClient(auth, base_url="https://hlth.io.mi.com") as client:
+                    relatives = await client.get_relatives()
+                    if not relatives:
+                        logger.error("[Health] 亲友列表为空！请确保已经添加主号为亲友并共享数据。")
+                        return False
+                    user_id = relatives[0].relative_uid
                     
-                access_token = response_args['access'][0]
-                country_code = response_args['country_code'][0]
-                
-                login_url = 'https://account.huami.com/v2/client/login'
-                login_data = {
-                    'app_name': 'com.xiaomi.hm.health',
-                    'dn': 'account.huami.com,api-user.huami.com,api-watch.huami.com,api-analytics.huami.com,app-analytics.huami.com,api-mifit.huami.com',
-                    'device_id': '02:00:00:00:00:00',
-                    'device_model': 'android_phone',
-                    'app_version': '4.0.9',
-                    'allow_registration': 'false',
-                    'third_name': 'huami',
-                    'grant_type': 'access_token',
-                    'country_code': country_code,
-                    'code': access_token,
-                }
-                
-                login_resp = await client.post(login_url, data=login_data)
-                result = login_resp.json()
-                
-                if "token_info" in result:
-                    self.token = result
-                    self.data["status"] = "online"
-                    return True
-                else:
-                    raise Exception(f"获取 App Token 失败: {result}")
-        except Exception as e:
-            logger.error(f"[Health] API 登录失败: {e}")
-            self.data["status"] = "auth_expired"
-            self.token = None
-            self._save_cache()
-            return False
-
-    async def _fetch_band_data(self):
-        if not self.token:
-            return False
-            
-        today = datetime.now().strftime("%Y-%m-%d")
-        band_data_url = 'https://api-mifit.huami.com/v1/data/band_data.json'
-        headers = {
-            'apptoken': self.token['token_info']['app_token'],
-        }
-        params = {
-            'query_type': 'summary',
-            'device_type': 'android_phone',
-            'userid': self.token['token_info']['user_id'],
-            'from_date': today,
-            'to_date': today,
-        }
-        
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(band_data_url, params=params, headers=headers)
-                data = resp.json().get('data', [])
-                if not data:
-                    return False
+                    from datetime import date
+                    from mi_fitness.client.data import _date_to_timestamps
+                    start_time, end_time = _date_to_timestamps(date.today())
                     
-                for daydata in data:
-                    if daydata['date_time'] == today:
-                        import base64
-                        summary = json.loads(base64.b64decode(daydata['summary']))
-                        
-                        # 步数与消耗
-                        if 'stp' in summary:
-                            stp = summary['stp']
-                            self.data['steps'] = stp.get('ttl', 0)
-                            self.data['calories'] = stp.get('cal', 0)
-                        
-                        # 睡眠数据
-                        if 'slp' in summary:
-                            slp = summary['slp']
-                            dp_min = slp.get('dp', 0)
-                            lt_min = slp.get('lt', 0)
-                            total_min = dp_min + lt_min
+                    # Fetch daily summary
+                    steps_resp = await client.get_aggregated_data(user_id, "steps", start_time, end_time, limit=2)
+                    cals_resp = await client.get_aggregated_data(user_id, "calories", start_time, end_time, limit=2)
+                    hr_resp = await client.get_aggregated_data(user_id, "heart_rate", start_time, end_time, limit=2)
+                    spo2_resp = await client.get_aggregated_data(user_id, "spo2", start_time, end_time, limit=2)
+                    
+                    if steps_resp.data_items:
+                        latest_steps = steps_resp.data_items[-1].value
+                        if isinstance(latest_steps, str):
+                            latest_steps = json.loads(latest_steps)
+                        if isinstance(latest_steps, dict) and 'steps' in latest_steps:
+                            self.data['steps'] = latest_steps['steps']
                             
-                            def minutes_as_time(minutes):
-                                return f"{minutes//60}h{minutes%60}m"
+                    if cals_resp.data_items:
+                        latest_cals = cals_resp.data_items[-1].value
+                        if isinstance(latest_cals, str):
+                            latest_cals = json.loads(latest_cals)
+                        if isinstance(latest_cals, dict) and 'calories' in latest_cals:
+                            self.data['calories'] = latest_cals['calories']
+                            
+                    if hr_resp.data_items:
+                        latest_hr = hr_resp.data_items[-1].value
+                        if isinstance(latest_hr, str):
+                            latest_hr = json.loads(latest_hr)
+                        if isinstance(latest_hr, dict) and 'heart_rate' in latest_hr:
+                            # Try to get the average or latest HR from the aggregated data
+                            # Depending on API response, it might be 'heart_rate' or 'avg_hr'
+                            self.data['heart_rate'] = latest_hr.get('heart_rate', latest_hr.get('avg_hr', self.data['heart_rate']))
+                            
+                    if spo2_resp.data_items:
+                        latest_spo2 = spo2_resp.data_items[-1].value
+                        if isinstance(latest_spo2, str):
+                            latest_spo2 = json.loads(latest_spo2)
+                        if isinstance(latest_spo2, dict):
+                            self.data['spo2'] = latest_spo2.get('spo2', latest_spo2.get('avg_spo2', self.data['spo2']))
+                            
+                    if fetch_slow:
+                        sleep_resp = await client.get_aggregated_data(user_id, "sleep", start_time, end_time, limit=2)
+                        if sleep_resp.data_items:
+                            latest_sleep = sleep_resp.data_items[-1].value
+                            if isinstance(latest_sleep, str):
+                                latest_sleep = json.loads(latest_sleep)
+                            if isinstance(latest_sleep, dict):
+                                dp_min = latest_sleep.get('deepSleepTime', 0)
+                                lt_min = latest_sleep.get('shallowSleepTime', 0)
+                                rem_min = latest_sleep.get('remSleepTime', 0)
+                                total_min = dp_min + lt_min + rem_min
                                 
-                            self.data['sleep'] = {
-                                "total": minutes_as_time(total_min),
-                                "deep": minutes_as_time(dp_min),
-                                "light": minutes_as_time(lt_min),
-                                "rem": "--" # Old API may not have REM directly in summary
-                            }
-                        
-                        # Mock 补全老 API 没有的数据
-                        self.data['heart_rate'] = 72
-                        self.data['spo2'] = 98
-                        self.data['last_update'] = datetime.now().strftime("%H:%M")
-                        self.data['status'] = "online"
-                        return True
-            return False
+                                def minutes_as_time(minutes):
+                                    return f"{minutes//60}h{minutes%60}m"
+                                    
+                                self.data['sleep'] = {
+                                    "total": minutes_as_time(total_min),
+                                    "deep": minutes_as_time(dp_min),
+                                    "light": minutes_as_time(lt_min),
+                                    "rem": minutes_as_time(rem_min)
+                                }
+                                
+                    self.data['last_update'] = datetime.now().strftime("%H:%M")
+                    self.data['status'] = "online"
+                    return True
         except Exception as e:
             logger.error(f"[Health] 获取健康数据失败: {e}")
             return False
 
     async def _fetch_fast_data(self):
         logger.debug("[Health] 正在请求日常健康数据...")
-        return await self._fetch_band_data()
+        return await self._fetch_band_data(fetch_slow=False)
 
     async def _fetch_slow_data(self):
         logger.debug("[Health] 正在请求睡眠数据...")
-        return await self._fetch_band_data()
+        return await self._fetch_band_data(fetch_slow=True)
 
     async def loop(self):
         self.is_running = True
@@ -198,29 +162,29 @@ class XiaomiHealthWatcher:
             try:
                 now = time.time()
                 
-                # 检查是否需要刷新token
-                if not self.token:
-                    await self._refresh_token()
+                if not os.path.exists(TOKEN_FILE):
+                    self.data["status"] = "auth_expired"
+                    self._save_cache()
+                    await asyncio.sleep(60)
+                    continue
+
+                updated = False
+                # 快轮询 (日常数据)
+                if now - self.last_fast_poll >= POLL_INTERVAL_FAST:
+                    if await self._fetch_fast_data():
+                        self.last_fast_poll = now
+                        updated = True
+                    else:
+                        updated = True
                 
-                if self.token:
-                    updated = False
-                    # 快轮询 (日常数据)
-                    if now - self.last_fast_poll >= POLL_INTERVAL_FAST:
-                        if await self._fetch_fast_data():
-                            self.last_fast_poll = now
-                            updated = True
-                        else:
-                            self.data["status"] = "offline"
-                            updated = True
-                    
-                    # 慢轮询 (睡眠数据)
-                    if now - self.last_slow_poll >= POLL_INTERVAL_SLOW:
-                        if await self._fetch_slow_data():
-                            self.last_slow_poll = now
-                            updated = True
-                            
-                    if updated:
-                        self._save_cache()
+                # 慢轮询 (睡眠数据)
+                if now - self.last_slow_poll >= POLL_INTERVAL_SLOW:
+                    if await self._fetch_slow_data():
+                        self.last_slow_poll = now
+                        updated = True
+                        
+                if updated:
+                    self._save_cache()
                 
             except Exception as e:
                 logger.error(f"[Health] 轮询异常: {e}")
@@ -233,6 +197,7 @@ class XiaomiHealthWatcher:
 def get_health_status() -> str:
     """返回用于注入的文本"""
     if not os.path.exists(HEALTH_STATUS_FILE):
+        logger.info("[Health-Debug] health_status.json 文件不存在！")
         return ""
         
     try:
@@ -270,7 +235,9 @@ def get_health_status() -> str:
         updated = data.get("last_update") or "--"
         lines.append(f"更新: {updated}{suffix}")
         
-        return "\n".join(lines)
+        res = "\n".join(lines)
+        logger.info(f"[Health-Debug] 注入文本组装成功，长度: {len(res)}")
+        return res
     except Exception as e:
         logger.error(f"[Health] 组装状态注入文本失败: {e}")
         return ""

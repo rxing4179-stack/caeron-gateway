@@ -14,42 +14,46 @@ from message_store import store_assistant_response
 logger = logging.getLogger(__name__)
 
 def clean_system_prompt(content: str) -> str:
-    """清理上游平台注入的系统预设，保留Operit工具声明和用户角色卡"""
+    """清理上游平台注入的系统预设，采用白名单策略保护用户角色卡，剥离其余注入"""
     if not isinstance(content, str):
         return content
+
+    # 1. 白名单保护提取
+    user_prompt = ""
+    if "<!-- user_prompt_start -->" in content:
+        parts = content.split("<!-- user_prompt_start -->", 1)
+        before_user = parts[0]
+        after_start = parts[1]
         
-    cleaned = content
-    
-    # 明确剥离平台的安全/风格约束标签
+        if "<!-- user_prompt_end -->" in after_start:
+            subparts = after_start.split("<!-- user_prompt_end -->", 1)
+            user_prompt = "<!-- user_prompt_start -->" + subparts[0] + "<!-- user_prompt_end -->"
+            rest_content = before_user + "\n" + subparts[1]
+        else:
+            user_prompt = "<!-- user_prompt_start -->" + after_start
+            rest_content = before_user
+    else:
+        rest_content = content
+        
+    # 2. 对其余部分（非白名单部分）进行无情清洗
     strict_strip_tags = [
-        'response_style', 'safety_guardrails', 'content_safety', 
-        'git_safety', 'coding_questions', 'capabilities', 'tone_and_style'
+        'identity', 'capabilities', 'response_style', 'rules', 
+        'safety_guardrails', 'content_safety', 'coding_questions', 
+        'git_safety', 'tone_and_style', 'instructions', 'system_prompt'
     ]
     for tag in strict_strip_tags:
-        cleaned = re.sub(rf'<{tag}>.*?</{tag}>\n*', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+        rest_content = re.sub(rf'<{tag}>.*?</{tag}>\n*', '', rest_content, flags=re.DOTALL | re.IGNORECASE)
         
-    # 对于 <identity>, <rules>, <instructions> 进行条件过滤
-    for tag in ['identity', 'rules', 'instructions']:
-        pattern = rf'<{tag}>(.*?)</{tag}>\n*'
-        def replacer(match):
-            inner_text = match.group(1)
-            lower_text = inner_text.lower()
-            # 包含平台特征词，判定为上游注入，直接抹除
-            if ('kiro' in lower_text or 'anthropic' in lower_text or 
-                'helpful assistant' in lower_text or 'keep responses focused' in lower_text or
-                'concise' in lower_text):
-                # 排除误杀 Operit tool prompt 或 用户 prompt
-                if 'tool' not in lower_text and 'function' not in lower_text and '蕊蕊' not in lower_text:
-                    return ''
-            return match.group(0)
+    rest_content = re.sub(r'(?i)(You are Kiro.*?)(\n\n|$)', '', rest_content, flags=re.DOTALL)
+    rest_content = re.sub(r'(?i)(You are a helpful.*?)(\n\n|$)', '', rest_content, flags=re.DOTALL)
+
+    # 3. 重新拼接：如果有白名单用户prompt，就拼在一起；否则就返回清洗后的全量文本
+    if user_prompt:
+        final_content = rest_content.strip() + "\n\n" + user_prompt.strip()
+    else:
+        final_content = rest_content.strip()
         
-        cleaned = re.sub(pattern, replacer, cleaned, flags=re.DOTALL | re.IGNORECASE)
-
-    # 直接匹配剔除游离的 Kiro/Helpful assistant 声明段落（无XML包裹的情况）
-    cleaned = re.sub(r'(?i)^(You are Kiro.*?)(?=\n\n|\n[A-Z]|<|<!--)', '', cleaned)
-    cleaned = re.sub(r'(?i)^(You are a helpful.*?)(?=\n\n|\n[A-Z]|<|<!--)', '', cleaned)
-
-    return cleaned.strip()
+    return final_content.strip()
 
 
 def build_upstream_url(api_base_url: str) -> str:
@@ -123,6 +127,13 @@ async def proxy_chat_completion(request_body: dict, provider: dict, conversation
         preview = content_str[:80]
         logger.info(f"[DEBUG-TOKEN] msg[{i}] role={role} chars={clen} content={preview}")
     logger.info(f"[DEBUG-TOKEN] 各角色字符数合计: {role_totals}")
+
+    # 将最终发送给大模型的包持久化下来以供调试
+    try:
+        with open("/home/ubuntu/caeron-gateway/last_request.json", "w", encoding="utf-8") as f:
+            json.dump(request_body, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"[DEBUG-TOKEN] 写入 last_request.json 失败: {e}")
 
     if is_stream:
         return await _proxy_stream(upstream_url, headers, request_body, timeout, provider, conversation_id, source, skip_messages_table)

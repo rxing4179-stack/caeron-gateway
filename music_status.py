@@ -336,27 +336,43 @@ async def start_music_watcher():
 
 def get_music_status() -> str:
     """供 injection.py 调用的接口，格式化输出当前听歌状态"""
+    
+    # 获取累计一起听时长
+    base_seconds = 6139 * 3600 + 20 * 60
+    total_secs = base_seconds
+    if os.path.exists(DURATION_FILE):
+        try:
+            with open(DURATION_FILE, "r") as f:
+                d_data = json.load(f)
+                stored_seconds = d_data.get("total_seconds", 0)
+                if stored_seconds < base_seconds:
+                    total_secs = base_seconds + stored_seconds
+                else:
+                    total_secs = stored_seconds
+        except Exception:
+            pass
+            
+    hours = total_secs // 3600
+    minutes = (total_secs % 3600) // 60
+    together_str = f"已累计和蕊蕊一起听{hours}小时{minutes}分钟"
+
     if not os.path.exists(STATUS_FILE):
-        return ""
+        return f"【网易云 一起听】\n状态: 离线\n{together_str}，现在不在听歌。"
+
     try:
         with open(STATUS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             
-        # 如果距离上次更新超过 30 分钟，可能是不准了，忽略
-        # （注：一起听如果暂停很久可能不会有更新，但这里我们相信状态）
-        
         name = data.get("name", "Unknown")
         artists = data.get("artists", "Unknown")
         album = data.get("album", "Unknown")
         status = data.get("status", "播放中")
         
-        # 暂停时停止向大模型注入，省token
         if status == "已暂停":
-            return ""
+            return f"【网易云 一起听】\n状态: 已暂停\n{together_str}，现在不在听歌。"
             
         lyric_full = data.get("lyric", "")
         
-        # 截取歌词防止太长爆 token
         lyric_lines = [line for line in lyric_full.split('\n') if line.strip() and ']' in line]
         lyric_preview = "\n".join(lyric_lines[:20]) # 取前20行
         if len(lyric_lines) > 20:
@@ -365,7 +381,8 @@ def get_music_status() -> str:
         text = (
             f"【网易云 一起听】\n"
             f"状态: {status}\n"
-            f"歌曲: {name}\n"
+            f"{together_str}\n"
+            f"正在播放: {name}\n"
             f"歌手: {artists}\n"
             f"专辑: {album}\n"
             f"歌词预览:\n{lyric_preview}"
@@ -379,7 +396,7 @@ def get_music_status() -> str:
         return text
     except Exception as e:
         logger.error(f"[Music] 读取状态失败: {e}")
-        return ""
+        return f"【网易云 一起听】\n{together_str}，现在不在听歌。"
 
 # ========== 以下是扫码登录功能 ==========
 
