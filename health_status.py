@@ -80,6 +80,7 @@ class XiaomiHealthWatcher:
                     from datetime import date
                     from mi_fitness.client.data import _date_to_timestamps
                     start_time, end_time = _date_to_timestamps(date.today())
+                    has_new_data = False
                     
                     # Fetch daily summary
                     steps_resp = await client.get_aggregated_data(user_id, "steps", start_time, end_time, limit=2)
@@ -93,6 +94,7 @@ class XiaomiHealthWatcher:
                             latest_steps = json.loads(latest_steps)
                         if isinstance(latest_steps, dict) and 'steps' in latest_steps:
                             self.data['steps'] = latest_steps['steps']
+                            has_new_data = True
                             
                     if cals_resp.data_items:
                         latest_cals = cals_resp.data_items[-1].value
@@ -100,6 +102,7 @@ class XiaomiHealthWatcher:
                             latest_cals = json.loads(latest_cals)
                         if isinstance(latest_cals, dict) and 'calories' in latest_cals:
                             self.data['calories'] = latest_cals['calories']
+                            has_new_data = True
                             
                     if hr_resp.data_items:
                         latest_hr = hr_resp.data_items[-1].value
@@ -109,6 +112,7 @@ class XiaomiHealthWatcher:
                             # Try to get the average or latest HR from the aggregated data
                             # Depending on API response, it might be 'heart_rate' or 'avg_hr'
                             self.data['heart_rate'] = latest_hr.get('heart_rate', latest_hr.get('avg_hr', self.data['heart_rate']))
+                            has_new_data = True
                             
                     if spo2_resp.data_items:
                         latest_spo2 = spo2_resp.data_items[-1].value
@@ -116,6 +120,7 @@ class XiaomiHealthWatcher:
                             latest_spo2 = json.loads(latest_spo2)
                         if isinstance(latest_spo2, dict):
                             self.data['spo2'] = latest_spo2.get('spo2', latest_spo2.get('avg_spo2', self.data['spo2']))
+                            has_new_data = True
                             
                     if fetch_slow:
                         sleep_resp = await client.get_aggregated_data(user_id, "sleep", start_time, end_time, limit=2)
@@ -138,8 +143,10 @@ class XiaomiHealthWatcher:
                                     "light": minutes_as_time(lt_min),
                                     "rem": minutes_as_time(rem_min)
                                 }
+                                has_new_data = True
                                 
-                    self.data['last_update'] = datetime.now().strftime("%H:%M")
+                    if has_new_data:
+                        self.data['last_update'] = datetime.now().strftime("%H:%M")
                     self.data['status'] = "online"
                     return True
         except Exception as e:

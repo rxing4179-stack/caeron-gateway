@@ -483,6 +483,14 @@ async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0) -
                     import json
                     content_obj = json.loads(content)
                     if isinstance(content_obj, list):
+                        # 核心修复：清理历史记录中的巨大 base64 图片，防止 token 爆炸
+                        for block in content_obj:
+                            if isinstance(block, dict) and block.get("type") == "image_url":
+                                block["type"] = "text"
+                                block["text"] = "[图片]"
+                                if "image_url" in block:
+                                    del block["image_url"]
+
                         if prefix:
                             if content_obj and content_obj[0].get("type") == "text":
                                 content_obj[0]["text"] = prefix + content_obj[0]["text"]

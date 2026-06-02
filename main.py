@@ -127,13 +127,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"网易云听歌状态监控启动失败（非致命）: {e}")
         
-    # 启动健康状态监控
-    try:
-        from health_status import start_health_watcher
-        await start_health_watcher()
-        logger.info("小米健康状态监控已启动")
-    except Exception as e:
-        logger.warning(f"小米健康状态监控启动失败（非致命）: {e}")
+    # [已禁用] 小米健康状态监控 - API被小米改参数拦截，等待修复
+    # try:
+    #     from health_status import start_health_watcher
+    #     await start_health_watcher()
+    #     logger.info("小米健康状态监控已启动")
+    # except Exception as e:
+    #     logger.warning(f"小米健康状态监控启动失败（非致命）: {e}")
     
     logger.info("Caeron Gateway 启动完成，等待请求...")
 
@@ -342,7 +342,7 @@ async def _handle_chat_completions(request: Request):
     }
 
     # === 总结请求拦截器 ===
-    # 检测Operit的总结请求并拦截，阻止其消耗上游token
+    # 检测Operit的总结请求���拦截，阻止其消耗上游token
     SUMMARY_FINGERPRINTS = [
         '你是负责生成对话摘要的AI助手',
         '对话摘要',
@@ -1941,7 +1941,7 @@ async def set_tech_mode(request: Request):
                 db = await get_db()
                 try:
                     await db.execute(
-                        "INSERT INTO config (key, value, description) VALUES ('_msg_counter', '0', '轮总触发计数器') "
+                        "INSERT INTO config (key, value, description) VALUES ('_msg_counter', '0', '���总触发计数器') "
                         "ON CONFLICT(key) DO UPDATE SET value = '0'"
                     )
                     await db.commit()
@@ -2219,12 +2219,16 @@ async def ha_states_api(entity_id: str, request: Request):
         watcher = get_watcher()
         
         state = data.get("state")
+        has_update = False
         if "heart_rate" in entity_id or "hr" in entity_id:
             watcher.data["heart_rate"] = int(float(state))
+            has_update = True
         elif "steps" in entity_id:
             watcher.data["steps"] = int(float(state))
+            has_update = True
         elif "calories" in entity_id:
             watcher.data["calories"] = int(float(state))
+            has_update = True
         elif "sleep" in entity_id:
             if "sleep" not in watcher.data or not isinstance(watcher.data["sleep"], dict):
                 watcher.data["sleep"] = {}
@@ -2232,12 +2236,17 @@ async def ha_states_api(entity_id: str, request: Request):
             elif "light" in entity_id: watcher.data["sleep"]["light"] = state
             elif "rem" in entity_id: watcher.data["sleep"]["rem"] = state
             else: watcher.data["sleep"]["total"] = state
+            has_update = True
+            
+        if has_update:
+            from datetime import datetime
+            watcher.data["last_update"] = datetime.now().strftime("%H:%M")
         
-        from datetime import datetime
-        watcher.data["last_update"] = datetime.now().strftime("%H:%M")
         watcher.data["status"] = "webhook_sync"
         watcher._save_cache()
-        return {"entity_id": entity_id, "state": state}
+        
+        return {"success": True, "message": "HA state processed"}
+
     except Exception as e:
         logger.error(f"[HA_REST] 解析失败: {e}")
         return {"success": False}

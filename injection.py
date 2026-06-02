@@ -452,14 +452,15 @@ class InjectionEngine:
             except Exception as e:
                 logger.warning(f"[注入] 获取网易云状态失败: {e}")
 
-            try:
-                from health_status import get_health_status
-                health_text = get_health_status()
-                if health_text:
-                    status_lines.append(health_text)
-                    status_lines.append("")
-            except Exception as e:
-                logger.warning(f"[注入] 获取小米健康状态失败: {e}")
+            # [已禁用] 小米健康数据注入 - API被小米改参数拦截，等待修复
+            # try:
+            #     from health_status import get_health_status
+            #     health_text = get_health_status()
+            #     if health_text:
+            #         status_lines.append(health_text)
+            #         status_lines.append("")
+            # except Exception as e:
+            #     logger.warning(f"[注入] 获取小米健康状态失败: {e}")
 
             # 组装总结文本
             summary_lines = []
