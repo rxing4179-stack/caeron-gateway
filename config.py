@@ -20,6 +20,13 @@ DEFAULT_CONFIG = {
     'embedding_model': ('BAAI/bge-large-zh-v1.5', '嵌入模型'),
     'embedding_api_key': ('', '嵌入 API Key'),
     'summary_model': ('', '用于生成总结的模型（留空则用主模型）'),
+    'gateway_master_switch': ('1', '网关总开关（0为关闭，变为纯代理）'),
+    'feature_injection': ('1', '提示词注入功能（含时间天气等）'),
+    'feature_memory': ('1', '记忆存取功能（生成、检索记忆）'),
+    'feature_summary': ('1', '对话总结功能（轮总、日总等）'),
+    'feature_qq': ('1', 'QQ桥接功能'),
+    'feature_health': ('1', '小米运动健康数据获取'),
+    'feature_music': ('1', '网易云音乐状态获取'),
 }
 
 
@@ -42,10 +49,10 @@ async def set_config(key: str, value: str, description: str = None) -> None:
     try:
         await db.execute('''
             INSERT INTO config (key, value, description, updated_at) 
-            VALUES (?, ?, ?, datetime('now', '+8 hours')))
+            VALUES (?, ?, ?, datetime('now', '+8 hours'))
             ON CONFLICT(key) DO UPDATE SET 
                 value = excluded.value, 
-                updated_at = datetime('now', '+8 hours'))
+                updated_at = datetime('now', '+8 hours')
         ''', (key, value, description))
         await db.commit()
     finally:

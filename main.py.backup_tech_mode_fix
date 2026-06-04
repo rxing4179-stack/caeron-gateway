@@ -336,19 +336,6 @@ async def _handle_chat_completions(request: Request):
                 last_user_msg = "[图片/文件等多模态内容]"
             break
             
-    # 动态获取各个功能开关
-    from config import get_config as _get_config
-    gateway_master = await _get_config('gateway_master_switch', '1') == '1'
-    feature_summary = await _get_config('feature_summary', '1') == '1'
-    feature_memory = await _get_config('feature_memory', '1') == '1'
-    feature_injection = await _get_config('feature_injection', '1') == '1'
-    
-    # 传递给下文
-    request.state.gateway_master = gateway_master
-    request.state.feature_summary = feature_summary
-    request.state.feature_memory = feature_memory
-    request.state.feature_injection = feature_injection
-
     request.state.log_info = {
         'msg': last_user_msg,
         'is_stream': is_stream
@@ -377,7 +364,7 @@ async def _handle_chat_completions(request: Request):
                     is_summary_request = True
                     logger.info(f"[SUMMARY_INTERCEPT] 指纹命中: '{fp}' in system消息前300字符")
                     break
-            if is_summary_request and gateway_master and feature_summary:
+            if is_summary_request:
                 break
     
     # 额外检测：仅当消息数<=3 且 最后一条user消息很短（Operit自动总结的特征）
@@ -402,7 +389,6 @@ async def _handle_chat_completions(request: Request):
         for i, msg in enumerate(body.get('messages', [])):
             if msg.get('role') == 'system':
                 preview = str(msg.get('content', ''))[:200]
-                logger.info(f"[SUMMARY_DEBUG] system msg[{i}] preview: {preview}")
     
     
     if is_summary_request:
@@ -532,37 +518,6 @@ async def _handle_chat_completions(request: Request):
     # 在injection之前，对原始消息做存档
     raw_messages = body.get('messages', [])
     
-    # === DEBUG: 图片/附件结构探针 ===
-    # 用于排查截图类图片无法被模型解析的问题
-    for _dbg_idx, _dbg_msg in enumerate(raw_messages):
-        if _dbg_msg.get('role') != 'user':
-            continue
-        _dbg_content = _dbg_msg.get('content')
-        if isinstance(_dbg_content, list):
-            # 多模态消息：逐 block 检查
-            for _blk_idx, _blk in enumerate(_dbg_content):
-                if not isinstance(_blk, dict):
-                    continue
-                _blk_type = _blk.get('type', '?')
-                if _blk_type == 'image_url':
-                    # inline 图片
-                    _img_url = _blk.get('image_url', {})
-                    _url_str = str(_img_url.get('url', ''))[:120]
-                    logger.info(f"[IMG_DEBUG] msg[{_dbg_idx}] block[{_blk_idx}] type=image_url, url_preview={_url_str}")
-                elif _blk_type == 'text':
-                    _txt = _blk.get('text', '')
-                    # 检查文本中是否嵌入了 attachment 标签
-                    if '<attachment' in _txt or 'octet-stream' in _txt or 'cleanOnExit' in _txt:
-                        logger.info(f"[IMG_DEBUG] msg[{_dbg_idx}] block[{_blk_idx}] type=text, contains_attachment_tag! content_preview={_txt[:500]}")
-                else:
-                    # 未知类型的 block
-                    logger.info(f"[IMG_DEBUG] msg[{_dbg_idx}] block[{_blk_idx}] type={_blk_type}, keys={list(_blk.keys())}, preview={json.dumps(_blk, ensure_ascii=False)[:500]}")
-        elif isinstance(_dbg_content, str):
-            # 纯文本消息：检查是否包含 attachment 标签
-            if '<attachment' in _dbg_content or 'octet-stream' in _dbg_content or 'cleanOnExit' in _dbg_content:
-                logger.info(f"[IMG_DEBUG] msg[{_dbg_idx}] type=str, contains_attachment! content_preview={_dbg_content[:800]}")
-    # === END DEBUG ===
-    
     # 允许通过 Header 显式指定 session_id 和 source
     explicit_session_id = request.headers.get('x-session-id')
     explicit_source = request.headers.get('x-source', 'operit')
@@ -574,7 +529,7 @@ async def _handle_chat_completions(request: Request):
 
     # 异步存储，不阻塞主流程（存储失败不影响请求转发）
     unified_history = []
-    if gateway_master and feature_memory and not tech_mode and request.headers.get('x-skip-rules', '').lower() != 'true':
+    if not tech_mode and request.headers.get('x-skip-rules', '').lower() != 'true':
         import message_store
         unified_history = await message_store.get_unified_history(char_limit=15000)
 
@@ -673,7 +628,7 @@ async def _handle_chat_completions(request: Request):
     # === End Step 2.8 ===
 
     # === Step 3: 预处理 — 清理上下文膨胀源 ===
-    # 技术模式下仍然清理网关自身注入的残留（A/B类），但跳过C类（保留原始上下文��
+    # 技术模式下仍然清理网关自身注入的残留（A/B类），但跳过C类（保留原始上下文）
     # Operit会保留上一轮网关注入的内容，如果不清理，每轮都会翻倍。
     # 需要清理三类残留：
     #   A. user_wrapped_system 消息 (role=user, <system>...</system>)

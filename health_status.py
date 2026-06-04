@@ -165,8 +165,15 @@ class XiaomiHealthWatcher:
         self.is_running = True
         logger.info("[Health] 小米健康数据轮询服务已启动")
         
+        from config import get_config
         while self.is_running:
             try:
+                master_switch = await get_config('gateway_master_switch', '1')
+                health_switch = await get_config('feature_health', '1')
+                if master_switch == '0' or health_switch == '0':
+                    await asyncio.sleep(60)
+                    continue
+                    
                 now = time.time()
                 
                 if not os.path.exists(TOKEN_FILE):

@@ -133,6 +133,7 @@ Line: ' + line + ', Col: ' + col + '
 
         <nav class="flex overflow-x-auto hide-scrollbar border-b border-[#aecfd1] bg-white px-2">
             <button @click="currentTab = 'providers'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'providers', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'providers'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">供应商管理</button>
+                        <button @click="currentTab = 'toggles'; fetchFeatureToggles()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'toggles', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'toggles'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">功能开关</button>
             <button @click="currentTab = 'rules'" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'rules', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'rules'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">提示词注入</button>
             <button @click="currentTab = 'conversations'; fetchCalendar()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'conversations', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'conversations'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">对话记录</button>
             <button @click="currentTab = 'memory'; fetchSummaries(); fetchSummaryStats(); fetchSummaryConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'memory', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'memory'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">记忆总览</button>
@@ -213,6 +214,42 @@ Line: ' + line + ', Col: ' + col + '
                             <!-- 错误信息 -->
                             <div v-if="!provider.is_healthy && provider.last_error" class="mt-2 p-2 bg-red-900/20 text-red-400 rounded border border-red-900/30 font-mono text-[10px] break-all">
                                 {{ provider.last_error }}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            
+            <!-- 功能开关 -->
+            <section v-show="currentTab === 'toggles'">
+                <div class="mb-4">
+                    <h2 class="text-lg font-semibold text-[#2c3e50]">功能开关</h2>
+                </div>
+
+                <!-- 网关总开关 (单独大卡片) -->
+                <div class="mb-6 bg-white rounded-xl p-5 border border-[#aecfd1] shadow-sm flex items-center justify-between">
+                    <div>
+                        <h3 class="font-bold text-lg text-[#2c3e50]">网关总开关</h3>
+                        <p class="text-sm text-[#77b5b4] mt-1">关闭后，网关将退化为纯粹的反向代理，不提供任何提示词注入、记忆或对话总结功能。</p>
+                    </div>
+                    <div class="flex items-center">
+                        <div @click="toggleFeature('gateway_master_switch', !featureToggles.gateway_master_switch)" class="relative w-14 h-7 rounded-full transition-colors duration-300 cursor-pointer" :class="featureToggles.gateway_master_switch ? 'bg-emerald-500' : 'bg-slate-300'">
+                            <div class="absolute top-1 w-5 h-5 rounded-full bg-white shadow-md transition-all duration-300" :class="featureToggles.gateway_master_switch ? 'left-8' : 'left-1'"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 子功能开关列表 -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div v-for="item in featureToggleItems" :key="item.key" class="bg-white rounded-xl p-4 border border-[#aecfd1]/50 shadow-sm flex items-center justify-between" :class="{'opacity-50': !featureToggles.gateway_master_switch}">
+                        <div class="pr-4">
+                            <h4 class="font-medium text-[#2c3e50]">{{ item.name }}</h4>
+                            <p class="text-xs text-[#77b5b4] mt-1">{{ item.desc }}</p>
+                        </div>
+                        <div class="flex items-center shrink-0">
+                            <div @click="featureToggles.gateway_master_switch && toggleFeature(item.key, !featureToggles[item.key])" class="relative w-11 h-6 rounded-full transition-colors duration-300" :class="[!featureToggles.gateway_master_switch ? 'cursor-not-allowed bg-slate-200' : 'cursor-pointer', featureToggles[item.key] ? 'bg-[#4199a0]' : 'bg-slate-300']">
+                                <div class="absolute top-0.5 w-5 h-5 rounded-full bg-white shadow-md transition-all duration-300" :class="featureToggles[item.key] ? 'left-[22px]' : 'left-0.5'"></div>
                             </div>
                         </div>
                     </div>
@@ -1576,6 +1613,56 @@ Line: ' + line + ', Col: ' + col + '
                     musicControl: false
                 });
 
+                
+                const featureToggles = reactive({
+                    gateway_master_switch: true,
+                    feature_injection: true,
+                    feature_memory: true,
+                    feature_summary: true,
+                    feature_qq: true,
+                    feature_health: true,
+                    feature_music: true
+                });
+
+                const featureToggleItems = [
+                    { key: 'feature_injection', name: '提示词注入', desc: '包含时间、天气、系统设定的动态注入' },
+                    { key: 'feature_memory', name: '记忆存取', desc: '长短期记忆的自动提取与召回' },
+                    { key: 'feature_summary', name: '对话总结', desc: '按固定条数或时间周期生成聊天记录总结' },
+                    { key: 'feature_qq', name: 'QQ 桥接', desc: '处理通过 NapCat 转发的 QQ 消息' },
+                    { key: 'feature_health', name: '健康状态', desc: '小米运动健康手环数据轮询' },
+                    { key: 'feature_music', name: '音乐状态', desc: '网易云一起听播放状态检测' }
+                ];
+
+                const fetchFeatureToggles = async () => {
+                    try {
+                        const res = await fetch('/admin/api/config');
+                        const data = await res.json();
+                        data.forEach(item => {
+                            if (featureToggles[item.key] !== undefined) {
+                                featureToggles[item.key] = item.value === '1';
+                            }
+                        });
+                    } catch (e) {
+                        showToast('无法获取功能开关配置', 'error');
+                    }
+                };
+
+                const toggleFeature = async (key, val) => {
+                    featureToggles[key] = val; // 乐观更新
+                    try {
+                        const res = await fetch('/admin/api/config/' + key, {
+                            method: 'PUT',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ value: val ? '1' : '0' })
+                        });
+                        if (!res.ok) throw new Error('API Error');
+                        showToast('配置已保存');
+                    } catch (e) {
+                        featureToggles[key] = !val; // 恢复
+                        showToast('保存失败', 'error');
+                    }
+                };
+
                 // 记忆总览状态
                 const summaries = ref([]);
                 const summaryStats = ref({});
@@ -2898,6 +2985,7 @@ Line: ' + line + ', Col: ' + col + '
                 const showAlert = (msg) => { window.alert(msg); };
 
                 return {
+                                        featureToggles, featureToggleItems, fetchFeatureToggles, toggleFeature,
                     currentTab,
                     providers, rules, loading,
                     fragments, fragmentsLoading, fetchFragments, toggleFragment,

@@ -6,7 +6,6 @@ Caeron Gateway - 提示词注入引擎
 import json
 import copy
 from datetime import datetime
-from utils import now_cst, today_cst_str, timedelta
 import logging
 from database import get_db
 
@@ -133,6 +132,12 @@ class InjectionEngine:
                 insert_idx = max(0, len(injected_messages) - depth)
                 injected_messages.insert(insert_idx, {'role': msg_role, 'content': msg_content})
                 
+        # ==================== 网易云状态注入 ====================
+        try:
+            await self._inject_music_status(injected_messages)
+        except Exception as e:
+            logger.error(f"音乐状态注入异常（不影响请求）: {e}")
+
         # ==================== 轮总注入 ====================
         # 根据当前对话的窗口归属，注入对应分类的当天所有活跃轮总
         try:
@@ -150,351 +155,230 @@ class InjectionEngine:
 
     async def inject_memory_only(self, messages: list[dict], request_info: dict = None) -> list[dict]:
         """
-        仅记忆注入模式（QQ 跨端桥接用）
-        跳过 injection_rules 中的规则（Operit人格提示词等），
-        只执行记忆注入（轮总/日总/语义召回/状态便签/裁剪逻辑）
+        仅记忆注入模式：跳过所有提示词规则，只注入轮总/记忆摘要。
+        用于 QQ 来源的跨端桥接场景。
         """
         injected_messages = copy.deepcopy(messages)
         if not request_info:
             request_info = {}
-        
-        logger.info(f"[记忆注入-QQ] 仅记忆模式启动, 消息数={len(injected_messages)}")
-        
+
+        logger.info(f"[MEMORY_ONLY] 仅记忆注入模式启动, 消息数={len(injected_messages)}")
+
+        # 只注入轮总/记忆，跳过所有 injection_rules
         try:
             await self._inject_round_summaries(injected_messages, request_info)
         except Exception as e:
-            logger.error(f"[记忆注入-QQ] 记忆注入异常（不影响请求）: {e}")
-        
-        logger.info(f"[记忆注入-QQ] 完成: 原始={len(messages)}, 注入后={len(injected_messages)}")
+            logger.error(f"[MEMORY_ONLY] 轮总注入异常（不影响请求）: {e}")
+
+        logger.info(f"[MEMORY_ONLY] 完成: 原始={len(messages)}, 注入后={len(injected_messages)}")
         return injected_messages
 
-    async def _inject_round_summaries(self, messages: list[dict], request_info: dict):
-        """多级记忆注入：月总+周总+日总+轮总，按活跃状态自动切换，并裁剪已被总结覆盖的原始消息"""
-        # 1. 检查是否已经注入过总结，防止重复
-        for m in messages:
-            if m.get('role') == 'system' and '<context_summaries>' in m.get('content', ''):
-                logger.warning("[记忆注入] 检测到已存在注入的总结，跳过本次注入以防重复")
-                return
+    async def inject_tech_mode(self, messages: list[dict], request_info: dict = None, identity_rule_ids: list = None) -> list[dict]:
+        """
+        技术模式注入：只注入核心身份规则（最高优先/旧记忆/背景信息），跳过文风/互动/轮总
+        """
+        if identity_rule_ids is None:
+            identity_rule_ids = [2, 7, 8]
+
+        injected_messages = copy.deepcopy(messages)
+        if not request_info:
+            request_info = {}
 
         db = await get_db()
         try:
-            parts = []
-            tag_counts = {}
-            has_any_summaries = False
-            today = today_cst_str()
-            
-            # --- 新增：语义召回逻辑 (Semantic Recall) ---
-            semantic_success = False
-            try:
-                # 1. 获取用户最新一条消息
-                last_user_msg = None
-                for m in reversed(messages):
-                    if m.get('role') == 'user':
-                        c = m.get('content', '')
-                        if isinstance(c, list):
-                            import json
-                            try:
-                                c = '\n'.join([i.get('text', '') for i in c if i.get('type') == 'text'])
-                            except: pass
-                        import re
-                        # 剔除 Operit 自动附加的设备状态等 <attachment> 标签，避免污染语义向量
-                        c = re.sub(r'<attachment.*?>.*?</attachment>', '', c, flags=re.DOTALL)
-                        c = c.strip()
-                        if c:
-                            last_user_msg = c
-                            break
-                
-                if last_user_msg:
-                    from embedding import get_embedding, cosine_similarity
-                    import json
-                    user_emb = await get_embedding(last_user_msg)
-                    if user_emb:
-                        import math
-                        # Step 1: 碎片召回
-                        cursor = await db.execute("SELECT id, source_dialogue_id, content, tier, embedding, activation_count, created_at FROM memory_fragments WHERE is_active = 1 AND embedding IS NOT NULL")
-                        fragments_rows = await cursor.fetchall()
-                        
-                        scored_fragments = []
-                        for row in fragments_rows:
-                            try:
-                                frag_emb = json.loads(row['embedding'])
-                                sim = cosine_similarity(user_emb, frag_emb)
-                                if sim > 0.5:
-                                    act_count = row.get('activation_count', 0)
-                                    final_score = sim * (1 + math.log1p(act_count) * 0.1)
-                                    scored_fragments.append((final_score, dict(row)))
-                            except Exception:
-                                pass
-                        
-                        top_fragments = []
-                        used_source_ids = set()
-                        if scored_fragments:
-                            scored_fragments.sort(key=lambda x: x[0], reverse=True)
-                            top_fragments = scored_fragments[:5]
-                            
-                            # 增加 activation_count
-                            frag_ids = [str(f[1]['id']) for f in top_fragments]
-                            if frag_ids:
-                                ids_str = ",".join(frag_ids)
-                                await db.execute(f"UPDATE memory_fragments SET activation_count = activation_count + 1 WHERE id IN ({ids_str})")
-                                await db.commit()
-                        
-                        # Step 2 & 3: 独立原文召回及碎片原文溯源
-                        cursor = await db.execute("SELECT id, content, embedding, created_at FROM memories WHERE embedding IS NOT NULL")
-                        memories_rows = await cursor.fetchall()
-                        
-                        # 预先整理出 source_dialogue_id 对应的原文内容和时间
-                        memories_dict = {row['id']: {'content': row['content'], 'created_at': row['created_at']} for row in memories_rows}
-                        
-                        for sim, frag in top_fragments:
-                            src_id = frag.get('source_dialogue_id')
-                            if src_id is not None:
-                                used_source_ids.add(src_id)
-                                
-                        scored_memories = []
-                        for row in memories_rows:
-                            if row['id'] in used_source_ids:
-                                continue # 去重
-                            try:
-                                mem_emb = json.loads(row['embedding'])
-                                sim = cosine_similarity(user_emb, mem_emb)
-                                if sim > 0.5:
-                                    scored_memories.append((sim, dict(row)))
-                            except Exception:
-                                pass
-                                
-                        top_memories = []
-                        if scored_memories:
-                            scored_memories.sort(key=lambda x: x[0], reverse=True)
-                            top_memories = scored_memories[:3]
-                            
-                        # 组装
-                        if top_fragments or top_memories:
-                            if top_fragments:
-                                parts.append("【脑海中闪回的旧日记忆碎片（按语义相关度召回）】")
-                                parts.append("（注意：以下信息发生于过去的日期，请勿将其与当前正在发生的事情混淆）")
-                                for i, (sim, frag) in enumerate(top_fragments):
-                                    frag_content = frag['content']
-                                    src_id = frag.get('source_dialogue_id')
-                                    created_at = frag.get('created_at', '过去')
-                                    
-                                    parts.append(f"[旧记忆碎片 - 记录于 {created_at}] {frag_content}")
-                                    
-                                    # 仅给排名前 2 的碎片附加原文语境
-                                    if i < 2 and src_id is not None and src_id in memories_dict:
-                                        from utils import smart_truncate_dialogue
-                                        src_mem = memories_dict[src_id]
-                                        trunc_text = smart_truncate_dialogue(src_mem['content'], 200).replace('\n', ' ')
-                                        src_date = src_mem.get('created_at', '过去')
-                                        parts.append(f"[当时情境 - 发生于 {src_date}] （来源：轮次 #{src_id}）{trunc_text}")
-                                        
-                                parts.append("") # 空行分隔
-                                
-                            if top_memories:
-                                parts.append("【脑海中闪回的旧日历史对话（按语义相关度召回）】")
-                                parts.append("（注意：以下为过去的历史对话，并非当下正在发生）")
-                                from utils import smart_truncate_dialogue
-                                for sim, mem in top_memories:
-                                    mem_content = mem['content']
-                                    created_at = mem.get('created_at', '过去')
-                                    trunc_mem = smart_truncate_dialogue(mem_content, 200)
-                                    # 将独立记忆的换行也替换掉，防止系统 prompt 太长太散
-                                    trunc_mem = trunc_mem.replace('\n', '  ')
-                                    parts.append(f"- [旧对话 - 发生于 {created_at}] (相关度: {sim:.2f}) {trunc_mem}")
-                                    
-                            tag_counts['semantic_recall'] = len(top_fragments) + len(top_memories)
-                            has_any_summaries = True
-                            semantic_success = True
-                            logger.info(f"[记忆注入] 语义召回成功: 碎片 {len(top_fragments)} 条，原文 {len(top_memories)} 条")
-            except Exception as e:
-                logger.error(f"[记忆注入] 语义召回失败，将回退到时间排序: {e}")
-
-            # 2. 月总：只取最新 2 条
+            placeholders = ','.join('?' * len(identity_rule_ids))
             cursor = await db.execute(
-                "SELECT content, created_at FROM summaries WHERE tag = 'monthly' AND is_active = 1 ORDER BY created_at DESC LIMIT 2"
+                f'SELECT * FROM injection_rules WHERE is_enabled = 1 AND id IN ({placeholders}) ORDER BY priority ASC',
+                identity_rule_ids
             )
-            rows = list(reversed(await cursor.fetchall()))
-            tag_counts['monthly'] = len(rows)
-            if rows:
-                has_any_summaries = True
-            for r in rows:
-                r = dict(r)
-                parts.append(f"- [月总] [{r['created_at']}] {r['content']}")
+            rules = [dict(row) for row in await cursor.fetchall()]
+        finally:
+            await db.close()
 
-            # 3. 周总：只取最新 1 条
+        logger.info(f"[TECH_MODE_INJECT] 加载 {len(rules)} 条身份规则")
+
+        for rule in rules:
+            content_text = self._replace_variables(rule['content'])
+            position = rule['position']
+            role = rule['role']
+
+            if role == 'user_wrapped_system':
+                msg_role = 'user'
+                msg_content = f"<system>\n{content_text}\n</system>"
+            else:
+                msg_role = 'system'
+                msg_content = content_text
+
+            if position == 'system_append':
+                system_msgs = [m for m in injected_messages if m.get('role') == 'system']
+                if system_msgs:
+                    system_msgs[-1]['content'] = f"{system_msgs[-1]['content']}\n\n{msg_content}"
+                else:
+                    injected_messages.insert(0, {'role': msg_role, 'content': msg_content})
+            elif position == 'before_latest':
+                insert_idx = len(injected_messages)
+                for i in range(len(injected_messages) - 1, -1, -1):
+                    if injected_messages[i].get('role') == 'user':
+                        insert_idx = i
+                        break
+                injected_messages.insert(insert_idx, {'role': msg_role, 'content': msg_content})
+            else:
+                injected_messages.insert(0, {'role': msg_role, 'content': msg_content})
+
+        logger.info(f"[TECH_MODE_INJECT] 完成: 原始={len(messages)}, 注入后={len(injected_messages)}")
+        return injected_messages
+
+    async def _inject_music_status(self, messages: list[dict]):
+        """注入网易云一起听状态"""
+        import os
+        import json
+        from datetime import datetime
+        
+        status_file = "/home/ubuntu/caeron-gateway/music_status.json"
+        if not os.path.exists(status_file):
+            return
+            
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                music_data = json.load(f)
+            
+            # 检查更新时间，只注入最近5分钟内的状态
+            update_time_str = music_data.get("update_time", "")
+            if update_time_str:
+                update_time = datetime.strptime(update_time_str, "%Y-%m-%d %H:%M:%S")
+                if (datetime.now() - update_time).total_seconds() > 300:
+                    return
+            
+            # 构建注入内容
+            name = music_data.get("name", "未知歌曲")
+            artists = music_data.get("artists", "未知歌手")
+            album = music_data.get("album", "未知专辑")
+            status = music_data.get("status", "未知状态")
+            progress_ms = music_data.get("progress", 0)
+            duration_ms = music_data.get("duration", 0)
+            
+            progress_min = progress_ms // 60000
+            progress_sec = (progress_ms % 60000) // 1000
+            duration_min = duration_ms // 60000
+            duration_sec = (duration_ms % 60000) // 1000
+            
+            lines = [
+                "<music_status>",
+                f"蕊蕊正在网易云一起听：",
+                f"歌曲：{name}",
+                f"歌手：{artists}",
+                f"专辑：{album}",
+                f"状态：{status}",
+                f"进度：{progress_min:02d}:{progress_sec:02d} / {duration_min:02d}:{duration_sec:02d}",
+            ]
+            
+            # 可选：添加歌词片段（如果有）
+            lyric = music_data.get("lyric", "")
+            if lyric:
+                lyric_lines = [l.strip() for l in lyric.split("\n") if l.strip() and not l.strip().startswith("[")]
+                if lyric_lines:
+                    lines.append(f"歌词片段：{lyric_lines[0]}")
+            
+            lines.append("</music_status>")
+            music_text = "\n".join(lines)
+            
+            # 注入位置：before_latest（最后一条user消息之前）
+            insert_idx = len(messages)
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get('role') == 'user':
+                    insert_idx = i
+                    break
+            messages.insert(insert_idx, {'role': 'system', 'content': music_text})
+            
+            logger.info(f"[音乐注入] 注入网易云状态: {name} - {artists}")
+            
+        except Exception as e:
+            logger.error(f"[音乐注入] 读取music_status.json失败: {e}")
+
+    async def _inject_round_summaries(self, messages: list[dict], request_info: dict):
+        """多级记忆注入：月总+周总+日总+轮总，按活跃状态自动切换，并裁剪已被总结覆盖的原始消息"""
+        db = await get_db()
+        try:
+            parts = []
+            has_round_summaries = False
+
+            # 月总：所有活跃的（长期记忆）
             cursor = await db.execute(
-                "SELECT content, created_at FROM summaries WHERE tag = 'weekly' AND is_active = 1 ORDER BY created_at DESC LIMIT 1"
+                "SELECT content, created_at FROM summaries WHERE tag = 'monthly' AND is_active = 1 ORDER BY created_at ASC"
             )
             rows = await cursor.fetchall()
-            tag_counts['weekly'] = len(rows)
-            latest_weekly_time = None
             if rows:
-                has_any_summaries = True
-                latest_weekly_time = dict(rows[0])['created_at']
+                for r in rows:
+                    r = dict(r)
+                    parts.append(f"- [月总] [{r['created_at']}] {r['content']}")
+
+            # 周总：所有活跃的（月末归档后由月总替代）
+            cursor = await db.execute(
+                "SELECT content, created_at FROM summaries WHERE tag = 'weekly' AND is_active = 1 ORDER BY created_at ASC"
+            )
+            rows = await cursor.fetchall()
+            if rows:
                 for r in rows:
                     r = dict(r)
                     parts.append(f"- [周总] [{r['created_at']}] {r['content']}")
 
-            # 4. 日总：取最新周总之后的日总，上限 7 条；无周总取最近 3 天
-            MAX_DAILY_INJECT = 7
-            if latest_weekly_time:
-                cursor = await db.execute(
-                    """SELECT content, created_at FROM summaries
-                       WHERE tag = 'daily' AND is_active = 1
-                       AND created_at > ?
-                       ORDER BY created_at ASC
-                       LIMIT ?""",
-                    (latest_weekly_time, MAX_DAILY_INJECT)
-                )
-            else:
-                cursor = await db.execute(
-                    """SELECT content, created_at FROM summaries
-                       WHERE tag = 'daily' AND is_active = 1
-                       ORDER BY created_at DESC
-                       LIMIT 3"""
-                )
-            rows = await cursor.fetchall()
-            if not latest_weekly_time:
-                rows = list(reversed(rows))
-            tag_counts['daily'] = len(rows)
-            if rows:
-                has_any_summaries = True
-            for r in rows:
-                r = dict(r)
-                parts.append(f"- [日总] [{r['created_at']}] {r['content']}")
-
-            # 5. 轮总总：查当天 + 昨天的（防止跨零点遗漏）
-            from datetime import timedelta as td
-            yesterday = (now_cst() - td(days=1)).strftime('%Y-%m-%d')
+            # 日总：所有活跃的（周末归档后由周总替代）
             cursor = await db.execute(
-                """SELECT content, created_at FROM summaries
-                   WHERE tag = 'round_rollup' AND is_active = 1
-                   AND date(created_at) IN (?, ?)
-                   ORDER BY created_at DESC LIMIT 8""",
-                (today, yesterday)
+                "SELECT content, created_at FROM summaries WHERE tag = 'daily' AND is_active = 1 ORDER BY created_at ASC"
             )
-            rollup_rows = list(reversed(await cursor.fetchall()))
-            tag_counts['round_rollup'] = len(rollup_rows)
-            if rollup_rows:
-                has_any_summaries = True
-                for idx, r in enumerate(rollup_rows, 1):
+            rows = await cursor.fetchall()
+            if rows:
+                for r in rows:
                     r = dict(r)
-                    parts.append(f"- [轮总总 #{idx}/{len(rollup_rows)}] [{r['created_at']}] {r['content']}")
-            
-            # 6. 轮总：查当天 + 昨天的（防止跨零点遗漏），最多 8 条
-            MAX_ROUND_INJECT = 8
+                    parts.append(f"- [日总] [{r['created_at']}] {r['content']}")
+
+            # 轮总：当天所��活跃的（日末归档后由日总替代��
+            today = datetime.now().strftime('%Y-%m-%d')
             cursor = await db.execute(
                 """SELECT content, created_at FROM summaries
                    WHERE tag = 'round' AND is_active = 1
-                   AND date(created_at) IN (?, ?)
-                   ORDER BY created_at DESC
-                   LIMIT ?""",
-                (today, yesterday, MAX_ROUND_INJECT)
+                   AND date(created_at, '+8 hours') = ?
+                   ORDER BY created_at ASC""",
+                (today,)
             )
-            rows = list(reversed(await cursor.fetchall()))
-            tag_counts['round'] = len(rows)
+            rows = await cursor.fetchall()
             if rows:
-                has_any_summaries = True
                 total = len(rows)
                 for idx, r in enumerate(rows, 1):
                     r = dict(r)
                     parts.append(f"- [轮总 #{idx}/{total}] [{r['created_at']}] {r['content']}")
 
-            # 读取当前消息计数器
-            unsummarized_count = 0
-            cursor = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")
-            row = await cursor.fetchone()
-            unsummarized_count = int(row['value']) if row else 0
-
-            logger.info(f"[记忆注入] 注入汇总统计: {tag_counts}, 待总结消息数: {unsummarized_count}")
-
-            # === 裁剪已被总结覆盖的原始消息 ===
-            # 关键修复：只要有任何活跃总结，就执行裁剪（不再依赖 has_round_summaries）
-            if has_any_summaries:
-                # 分离system消息和对话消息
-                system_indices = []
-                dialog_indices = []
-                for i, m in enumerate(messages):
-                    if m.get('role') == 'system':
-                        system_indices.append(i)
-                    else:
-                        dialog_indices.append(i)
-                
-                # 保留最后 unsummarized_count + buffer 条对话消息
-                buffer = 8
-                keep_count = max(unsummarized_count + buffer, 10)  # 至少保留10条对话
-                
-                logger.info(f"[记忆裁剪-入口] 当前对话总数:{len(dialog_indices)}, 待总结数:{unsummarized_count}, 保留阈值:{keep_count}")
-                
-                if len(dialog_indices) > keep_count:
-                    trimmed_count = len(dialog_indices) - keep_count
-                    keep_indices = set(system_indices + dialog_indices[-keep_count:])
-                    
-                    new_messages = [messages[i] for i in sorted(keep_indices)]
-                    messages.clear()
-                    messages.extend(new_messages)
-                    
-                    logger.info(f"[记忆裁剪-出口] 裁掉 {trimmed_count} 条已总结旧消息，保留 {len(dialog_indices[-keep_count:])} 条对话 + {len(system_indices)} 条system")
-                else:
-                    logger.info(f"[记忆裁剪-出口] 对话 {len(dialog_indices)} 条 <= 保留阈值 {keep_count}，不裁剪")
-
-            # === 获取状态便签 ===
-            # (已移除 database status logic)
-            status_lines = []
-
-            # === 状态注入 ===
-            try:
-                from music_status import get_music_status
-                music_text = get_music_status()
-                if music_text:
-                    status_lines.append(music_text)
-                    status_lines.append("")
-            except Exception as e:
-                logger.warning(f"[注入] 获取网易云状态失败: {e}")
-
-            # [已禁用] 小米健康数据注入 - API被小米改参数拦截，等待修复
-            # try:
-            #     from health_status import get_health_status
-            #     health_text = get_health_status()
-            #     if health_text:
-            #         status_lines.append(health_text)
-            #         status_lines.append("")
-            # except Exception as e:
-            #     logger.warning(f"[注入] 获取小米健康状态失败: {e}")
-
-            # 组装总结文本
-            summary_lines = []
-            if has_any_summaries:
-                summary_lines.append("<context_summaries>")
-                summary_lines.append(f"以下是今天（{today_cst_str()}）的对话记忆摘要，供你参考当前上下文：")
-                summary_lines.extend(parts)
-                summary_lines.append("</context_summaries>")
-
-            summary_text = "\n".join(status_lines + summary_lines)
-            
-            if not summary_text.strip():
-                return
-
-            # 注入位置：在最后一个system消息之后
-            insert_idx = 0
-            for i, m in enumerate(messages):
-                if m.get('role') == 'system':
-                    insert_idx = i + 1
-            messages.insert(insert_idx, {'role': 'system', 'content': summary_text})
-
-            logger.info(f"[记忆注入] 注入 {len(parts)} 条多级总结")
-
         finally:
             await db.close()
 
+        if not parts:
+            logger.info(f"[记忆注入] 无任何活跃总结，跳过")
+            return
+
+        lines = ["<context_summaries>"]
+        lines.append(f"以下是今天（{datetime.now().strftime('%Y-%m-%d')}）的对话记忆摘要，供你参考当前上下文：")
+        lines.extend(parts)
+        lines.append("</context_summaries>")
+
+        summary_text = "\n".join(lines)
+
+        # 注入位置：在最后一个system消息之后（dialog_start位置）
+        insert_idx = 0
+        for i, m in enumerate(messages):
+            if m.get('role') == 'system':
+                insert_idx = i + 1
+        messages.insert(insert_idx, {'role': 'system', 'content': summary_text})
+
+        logger.info(f"[记忆注入] 注入 {len(parts)} 条多级总结")
+
     def _replace_variables(self, text: str) -> str:
         """替换文本中的预设变量"""
-        now = now_cst()
+        now = datetime.now()
         replacements = {
             '{cur_datetime}': now.strftime('%Y-%m-%d %H:%M:%S'),
             '{cur_date}': now.strftime('%Y-%m-%d'),
             '{cur_time}': now.strftime('%H:%M:%S'),
-            '{cur_weekday}': ['一', '二', '三', '四', '五', '六', '日'][now.weekday()],
+            '{cur_weekday}': ['一', '二', '三', '四', '五', '六', '��'][now.weekday()],
             '{user_name}': '蕊蕊',
             '{assistant_name}': '沈栖'
         }

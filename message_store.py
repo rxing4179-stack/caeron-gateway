@@ -431,7 +431,45 @@ async def store_unified_message(source: str, source_context: str, role: str, con
     finally:
         await db.close()
 
-async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0) -> list:
+def _is_technical_content(content: str) -> bool:
+    """检测消息是否包含技术内容（代码、命令、文件路径等）"""
+    if not isinstance(content, str):
+        return False
+    
+    # 检测代码块标记
+    if '```' in content or '~~~' in content:
+        return True
+    
+    # 检测文件路径
+    if '/home/' in content or '/usr/' in content or '/var/' in content or 'C:\\' in content:
+        return True
+    
+    # 检测常见编程语言关键词和代码模式
+    code_patterns = [
+        'def ', 'async def', 'class ', 'import ', 'from ', 'require(',
+        'function ', 'const ', 'let ', 'var ', '=>',
+        'async with', 'await ', '.py', '.js', '.ts', '.sh',
+        'if __name__', 'return ', 'self.', 'this.',
+        'SELECT ', 'INSERT ', 'UPDATE ', 'DELETE ', 'CREATE TABLE',
+        'git ', 'npm ', 'pip ', 'docker ', 'kubectl ',
+        'Exception', 'Error:', 'Traceback', 'at line',
+        'localhost:', '127.0.0.1', 'http://127',
+        '.execute(', '.query(', '.fetchall(', '.commit()'
+    ]
+    
+    content_lower = content.lower()
+    for pattern in code_patterns:
+        if pattern.lower() in content_lower:
+            return True
+    
+    # 检测Python/bash命令行输出特征
+    lines = content.split('\n')
+    if any(line.strip().startswith('$') or line.strip().startswith('>>>') for line in lines):
+        return True
+    
+    return False
+
+async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0, filter_technical: bool = False) -> list:
     """
     获取统一的历史记录，按字符数限制（从新到旧截断）
     exclude_count: 排除最新的N条记录（用于在存入新消息后，重新拉取时不包含新消息）
@@ -459,6 +497,28 @@ async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0) -
             source_context = row['source_context']
             role = row['role']
             content = row['content']
+            
+            # 【新增】过滤技术内容
+            if filter_technical:
+                # 对于字符串内容直接检测
+                if isinstance(content, str) and _is_technical_content(content):
+                    continue
+                # 对于多模态消息，检查其中的文本块
+                if content.startswith('[') and '"type"' in content:
+                    try:
+                        import json
+                        content_obj = json.loads(content)
+                        if isinstance(content_obj, list):
+                            has_technical = False
+                            for block in content_obj:
+                                if isinstance(block, dict) and block.get('type') == 'text':
+                                    if _is_technical_content(block.get('text', '')):
+                                        has_technical = True
+                                        break
+                            if has_technical:
+                                continue
+                    except:
+                        pass
             
             # 打标签
             prefix = ""

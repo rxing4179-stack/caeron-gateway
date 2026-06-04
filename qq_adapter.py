@@ -184,6 +184,7 @@ async def send_to_gateway(session_id: str, source: str, messages: list):
 
 async def send_qq_msg(target_type: str, target_id: int, content: str):
     if not qq_state.ws:
+        logger.error(f"[QQ] 发送消息失败: WebSocket 未连接 (目标: {target_type} {target_id})")
         return
     payload = {
         "action": "send_msg" if target_type == "private" else "send_group_msg",
@@ -199,8 +200,9 @@ async def send_qq_msg(target_type: str, target_id: int, content: str):
         
     try:
         await qq_state.ws.send_json(payload)
+        logger.info(f"[QQ] 发送消息成功: {target_type} {target_id} - {content[:30]}...")
     except Exception as e:
-        logger.error(f"发送QQ消息失败: {e}")
+        logger.error(f"[QQ] 发送消息异常: {e} (目标: {target_type} {target_id})")
 
 async def split_and_send(target_type: str, target_id: int, reply: str):
     """切分回复并添加随机延迟后发送"""
@@ -263,11 +265,19 @@ async def handle_generation(session_id: str, source: str, target_type: str, targ
     
     # 获取全局锁防并发冲突
     async with message_store.GATEWAY_SEND_LOCK:
-        # 2. 拉取统一历史
-        history = await message_store.get_unified_history(char_limit=15000)
+        # 2. 拉取统一历史（启用技术内容过滤）
+        history = await message_store.get_unified_history(char_limit=15000, filter_technical=True)
         
-        # 3. 组装发给大模型的上下文（包含系统提示词 + 统一历史，这里历史已经包含刚存入的 user_input）
+        # 3. 组装基础上下文
         messages = [{"role": "system", "content": system_prompt}] + history
+        
+        # 4. 注入轮总、记忆、音乐状态等后端打磨内容
+        from injection import InjectionEngine
+        engine = InjectionEngine()
+        messages = await engine.inject(
+            messages=messages,
+            request_info={"model": config.DEFAULT_MODEL, "source": "qq"}
+        )
         
         reply = await send_to_gateway(session_id, source, messages)
         
@@ -396,8 +406,15 @@ async def qq_ws_endpoint(websocket: WebSocket):
     logger.info("[QQ] NapCat WebSocket 已连接")
     
     try:
+        from config import get_config
         while True:
             data = await websocket.receive_json()
+            
+            master_switch = await get_config('gateway_master_switch', '1')
+            qq_switch = await get_config('feature_qq', '1')
+            if master_switch == '0' or qq_switch == '0':
+                continue
+                
             post_type = data.get("post_type")
             
             if post_type == "message":

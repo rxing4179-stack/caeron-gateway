@@ -111,8 +111,12 @@ async def proxy_chat_completion(request_body: dict, provider: dict, conversation
     timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
 
     logger.info(f"转发请求到 {provider['name']}: {upstream_url} (stream={is_stream})")
+
+    # [DEBUG-TOKEN] 转发调试日志
     body_str = json.dumps(request_body)
+    logger.info(f"[DEBUG-TOKEN] 转发请求体总字符数: {len(body_str)}")
     msgs = request_body.get('messages', [])
+    logger.info(f"[DEBUG-TOKEN] messages条数: {len(msgs)}")
     role_totals = {}
     for i, msg in enumerate(msgs):
         content = msg.get('content', '')
@@ -121,13 +125,15 @@ async def proxy_chat_completion(request_body: dict, provider: dict, conversation
         role = msg.get('role', '?')
         role_totals[role] = role_totals.get(role, 0) + clen
         preview = content_str[:80]
+        logger.info(f"[DEBUG-TOKEN] msg[{i}] role={role} chars={clen} content={preview}")
+    logger.info(f"[DEBUG-TOKEN] 各角色字符数合计: {role_totals}")
 
     # 将最终发送给大模型的包持久化下来以供调试
     try:
         with open("/home/ubuntu/caeron-gateway/last_request.json", "w", encoding="utf-8") as f:
             json.dump(request_body, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        pass
+        logger.error(f"[DEBUG-TOKEN] 写入 last_request.json 失败: {e}")
 
     if is_stream:
         return await _proxy_stream(upstream_url, headers, request_body, timeout, provider, conversation_id, source, skip_messages_table)

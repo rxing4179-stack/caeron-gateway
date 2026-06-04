@@ -24,26 +24,17 @@ class ListenTogetherWatcher:
         self.total_together_seconds = self._load_duration()
         self.is_running = False
         
-    def _load_duration(self):
-        base_seconds = 6139 * 3600 + 20 * 60 # 6139小时20分钟 = 22101600秒
-        if os.path.exists(DURATION_FILE):
-            try:
-                with open(DURATION_FILE, "r") as f:
-                    data = json.load(f)
-                    stored_seconds = data.get("total_seconds", 0)
-                    if stored_seconds < base_seconds:
-                        return base_seconds + stored_seconds
-                    return stored_seconds
-            except Exception as e:
-                logger.error(f"[Music] 读取时长失败: {e}")
-        return base_seconds
-
-    def _save_duration(self):
+    async def fetch_listen_duration(self) -> int:
+        """从网易云API获取真实听歌累计时长（秒）"""
         try:
-            with open(DURATION_FILE, "w") as f:
-                json.dump({"total_seconds": self.total_together_seconds}, f)
+            # 网易云API: /user/record?uid=xxx&type=0 (type=0为所有时间)
+            # 返回的数据中包含听歌时长统计
+            # 如果API不直接提供总时长，这里返回0，保持原有逻辑
+            # TODO: 需要确认网易云API是否提供此接口
+            return 0
         except Exception as e:
-            logger.error(f"[Music] 保存时长失败: {e}")
+            logger.error(f"[Music] 获取听歌时长失败: {e}")
+            return 0
 
     def _load_cookie(self):
         if os.path.exists(COOKIE_FILE):
@@ -233,10 +224,6 @@ class ListenTogetherWatcher:
             song_id, play_status, progress = current_info
             self.current_progress = progress
             
-            if play_status == "PLAY":
-                self.total_together_seconds += POLL_INTERVAL
-                self._save_duration()
-            
             expected_progress = getattr(self, 'last_recorded_progress', progress)
             if getattr(self, 'last_recorded_status', '') == "PLAY":
                 expected_progress += POLL_INTERVAL * 1000
@@ -315,9 +302,13 @@ class ListenTogetherWatcher:
     async def loop(self):
         self.is_running = True
         logger.info(f"[Music] 一起听实时监控启动 (间隔={POLL_INTERVAL}s)")
+        from config import get_config
         while self.is_running:
             try:
-                await self.poll()
+                music_switch = await get_config('feature_music', '1')
+                master_switch = await get_config('gateway_master_switch', '1')
+                if master_switch == '1' and music_switch == '1':
+                    await self.poll()
             except Exception as e:
                 logger.error(f"[Music] 轮询异常: {e}")
             await asyncio.sleep(POLL_INTERVAL)
@@ -337,24 +328,9 @@ async def start_music_watcher():
 def get_music_status() -> str:
     """供 injection.py 调用的接口，格式化输出当前听歌状态"""
     
-    # 获取累计一起听时长
-    base_seconds = 6139 * 3600 + 20 * 60
-    total_secs = base_seconds
-    if os.path.exists(DURATION_FILE):
-        try:
-            with open(DURATION_FILE, "r") as f:
-                d_data = json.load(f)
-                stored_seconds = d_data.get("total_seconds", 0)
-                if stored_seconds < base_seconds:
-                    total_secs = base_seconds + stored_seconds
-                else:
-                    total_secs = stored_seconds
-        except Exception:
-            pass
-            
-    hours = total_secs // 3600
-    minutes = (total_secs % 3600) // 60
-    together_str = f"已累计和蕊蕊一起听{hours}小时{minutes}分钟"
+    # 不再显示累计时长，因为需要从网易云API实时获取
+    # 如果需要显示时长，应该异步调用 fetch_listen_duration()
+    together_str = ""  # 暂时留空，等实现API获取后再填充
 
     if not os.path.exists(STATUS_FILE):
         return f"【网易云 一起听】\n状态: 离线\n{together_str}，现在不在听歌。"
@@ -379,7 +355,7 @@ def get_music_status() -> str:
             lyric_preview += "\n..."
             
         text = (
-            f"【网易云 一起听】\n"
+            f"【网易云 ��起听】\n"
             f"状态: {status}\n"
             f"{together_str}\n"
             f"正在播放: {name}\n"
@@ -391,7 +367,7 @@ def get_music_status() -> str:
         hot_comments = data.get("hot_comments", [])
         if hot_comments:
             comments_text = "\n".join([f"- {c}" for c in hot_comments])
-            text += f"\n【网易云热评 (用于感受歌曲氛围和情感)】\n{comments_text}"
+            text += f"\n【网易云热评 (用于感受歌���氛围和情感)】\n{comments_text}"
             
         return text
     except Exception as e:

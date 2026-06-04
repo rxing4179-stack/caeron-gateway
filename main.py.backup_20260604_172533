@@ -336,19 +336,6 @@ async def _handle_chat_completions(request: Request):
                 last_user_msg = "[图片/文件等多模态内容]"
             break
             
-    # 动态获取各个功能开关
-    from config import get_config as _get_config
-    gateway_master = await _get_config('gateway_master_switch', '1') == '1'
-    feature_summary = await _get_config('feature_summary', '1') == '1'
-    feature_memory = await _get_config('feature_memory', '1') == '1'
-    feature_injection = await _get_config('feature_injection', '1') == '1'
-    
-    # 传递给下文
-    request.state.gateway_master = gateway_master
-    request.state.feature_summary = feature_summary
-    request.state.feature_memory = feature_memory
-    request.state.feature_injection = feature_injection
-
     request.state.log_info = {
         'msg': last_user_msg,
         'is_stream': is_stream
@@ -377,7 +364,7 @@ async def _handle_chat_completions(request: Request):
                     is_summary_request = True
                     logger.info(f"[SUMMARY_INTERCEPT] 指纹命中: '{fp}' in system消息前300字符")
                     break
-            if is_summary_request and gateway_master and feature_summary:
+            if is_summary_request:
                 break
     
     # 额外检测：仅当消息数<=3 且 最后一条user消息很短（Operit自动总结的特征）
@@ -574,7 +561,7 @@ async def _handle_chat_completions(request: Request):
 
     # 异步存储，不阻塞主流程（存储失败不影响请求转发）
     unified_history = []
-    if gateway_master and feature_memory and not tech_mode and request.headers.get('x-skip-rules', '').lower() != 'true':
+    if not tech_mode and request.headers.get('x-skip-rules', '').lower() != 'true':
         import message_store
         unified_history = await message_store.get_unified_history(char_limit=15000)
 
@@ -673,7 +660,7 @@ async def _handle_chat_completions(request: Request):
     # === End Step 2.8 ===
 
     # === Step 3: 预处理 — 清理上下文膨胀源 ===
-    # 技术模式下仍然清理网关自身注入的残留（A/B类），但跳过C类（保留原始上下文��
+    # 技术模式下仍然清理网关自身注入的残留（A/B类），但跳过C类（保留原始上下文）
     # Operit会保留上一轮网关注入的内容，如果不清理，每轮都会翻倍。
     # 需要清理三类残留：
     #   A. user_wrapped_system 消息 (role=user, <system>...</system>)
