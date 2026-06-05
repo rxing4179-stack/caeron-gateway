@@ -218,40 +218,56 @@ class MultiLevelSummarizer:
         return await self._get_latest_active_round_summary()
     
     async def _get_global_messages(self, since_summary: bool = True) -> list:
-        """从messages表按全局时间线拉取最近消息"""
+        """从messages表+unified_messages表(operit来源)合并拉取，覆盖技术模式期间的对话"""
         db = await get_db()
         try:
-            time_filter = ""
-            params = []
-            
+            time_val = None
             if since_summary:
                 cursor = await db.execute(
-                    """SELECT created_at FROM summaries 
-                       WHERE tag = 'round' 
-                       ORDER BY created_at DESC LIMIT 1"""
+                    "SELECT created_at FROM summaries WHERE tag = 'round' ORDER BY created_at DESC LIMIT 1"
                 )
                 row = await cursor.fetchone()
                 if row:
-                    time_filter = "WHERE m.created_at > ?"
-                    params.append(row["created_at"])
-            
-            query = f"""
-                SELECT m.role, m.content, m.created_at, m.conversation_id,
-                       c.model
-                FROM messages m
-                LEFT JOIN conversations c ON m.conversation_id = c.conversation_id
-                {time_filter}
-                ORDER BY m.created_at ASC
-                LIMIT ?
-            """
-            params.append(self.max_context_messages)
-            
-            cursor = await db.execute(query, params)
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+                    time_val = row["created_at"]
+
+            # 查 messages 表
+            if time_val:
+                cursor = await db.execute(
+                    "SELECT role, content, created_at FROM messages WHERE created_at > ? ORDER BY created_at ASC",
+                    (time_val,)
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT role, content, created_at FROM messages ORDER BY created_at ASC"
+                )
+            rows_msg = [dict(r) for r in await cursor.fetchall()]
+
+            # 查 unified_messages 表（仅 operit 来源，补充技术模式期间未进 messages 表的消息）
+            if time_val:
+                cursor = await db.execute(
+                    "SELECT role, content, timestamp as created_at FROM unified_messages WHERE source = 'operit' AND timestamp > ? ORDER BY timestamp ASC",
+                    (time_val,)
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT role, content, timestamp as created_at FROM unified_messages WHERE source = 'operit' ORDER BY timestamp ASC"
+                )
+            rows_unified = [dict(r) for r in await cursor.fetchall()]
+
+            # 合并去重（以时间前19字符+role+content前50字符为key），按时间排序
+            seen = set()
+            merged = []
+            for r in rows_msg + rows_unified:
+                key = (str(r.get("created_at", ""))[:19], r.get("role", ""), str(r.get("content", ""))[:50])
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(r)
+            merged.sort(key=lambda x: str(x.get("created_at", "")))
+
+            return merged[-self.max_context_messages:]
         finally:
             await db.close()
-    
+
     async def generate_global_summary(self) -> str:
         """生成轮总�����������������������������兼容旧接口名）"""
         return await self.generate_round_summary()

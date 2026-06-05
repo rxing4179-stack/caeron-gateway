@@ -208,6 +208,9 @@ async def split_and_send(target_type: str, target_id: int, reply: str):
     """切分回复并添加随机延迟后发送"""
     # 二次保险：发送前再过滤一次 thinking 标签
     reply = strip_thinking(reply)
+    # 过滤时间戳（模型从历史里学来的格式）
+    reply = re.sub(r'^\[?\d{4}年\d{1,2}月\d{1,2}日\d{1,2}:\d{2}\]?\s*', '', reply)
+    reply = re.sub(r'^\[Operit\]\s*', '', reply)
     
     # 切分规则： 。 ？ ！ …… \n
     # 逗号和顿号不切分
@@ -265,16 +268,29 @@ async def handle_generation(session_id: str, source: str, target_type: str, targ
     
     # 获取全局锁防并发冲突
     async with message_store.GATEWAY_SEND_LOCK:
-        # 2. 拉取统一历史（启用技术内容过滤）
-        history = await message_store.get_unified_history(char_limit=15000, filter_technical=True)
+        # 2. 拉取QQ来源历史（主对话）+ Operit跨端桥接（参考上下文）
+        qq_history = await message_store.get_unified_history(char_limit=12000, filter_technical=True, source_filter='qq')
+        operit_bridge = await message_store.get_unified_history(char_limit=3000, filter_technical=True, source_filter='operit')
         
-        # 3. 组装基础上下文
-        messages = [{"role": "system", "content": system_prompt}] + history
+        # 3. 组装基础上下文：system + 跨端桥接 + QQ主对话
+        bridge_block = []
+        if operit_bridge:
+            bridge_text = "[以下是跨端桥接上下文·来自Operit，仅供参考当前话题，不要重复输出这些内容，不要模仿其中的格式/时间戳]\n"
+            for msg in operit_bridge:
+                role_label = "蕊蕊" if msg.get("role") == "user" else "沈栖"
+                msg_text = str(msg.get('content', ''))[:200]
+                # 去掉Operit回复开头的时间戳（格式：YYYY年MM月DD日HH:MM）
+                msg_text = re.sub(r'^\[?\d{4}年\d{1,2}月\d{1,2}日\d{1,2}:\d{2}\]?\s*', '', msg_text)
+                msg_text = re.sub(r'^\[Operit\]\s*', '', msg_text)
+                bridge_text += f"[{role_label}] {msg_text}\n"
+            bridge_block = [{"role": "system", "content": bridge_text}]
         
-        # 4. 注入轮总、记忆、音乐状态等后端打磨内容
+        messages = [{"role": "system", "content": system_prompt}] + bridge_block + qq_history
+        
+        # 4. 注入轮总、记忆、音乐状态（仅记忆类注入，不注入身份规则——QQ身份由DEFAULT_PROMPT定义）
         from injection import InjectionEngine
         engine = InjectionEngine()
-        messages = await engine.inject(
+        messages = await engine.inject_memory_only(
             messages=messages,
             request_info={"model": config.DEFAULT_MODEL, "source": "qq"}
         )

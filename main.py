@@ -563,6 +563,24 @@ async def _handle_chat_completions(request: Request):
                 logger.info(f"[IMG_DEBUG] msg[{_dbg_idx}] type=str, contains_attachment! content_preview={_dbg_content[:800]}")
     # === END DEBUG ===
     
+    # === MIME 修正：修复 Operit 前端偶尔将图片标记为 application/octet-stream 的问题 ===
+    _mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.bmp': 'image/bmp', '.webp': 'image/webp'}
+    for _msg in body.get('messages', []):
+        _c = _msg.get('content', '')
+        if isinstance(_c, str) and 'application/octet-stream' in _c:
+            import re as _re
+            def _fix_mime(m):
+                tag = m.group(0)
+                fn_match = _re.search(r'filename="([^"]+)"', tag)
+                if fn_match:
+                    fn = fn_match.group(1).lower()
+                    for ext, mime in _mime_map.items():
+                        if fn.endswith(ext):
+                            return tag.replace('application/octet-stream', mime)
+                return tag
+            _msg['content'] = _re.sub(r'<attachment[^>]*application/octet-stream[^>]*>', _fix_mime, _c)
+    # === END MIME 修正 ===
+    
     # 允许通过 Header 显式指定 session_id 和 source
     explicit_session_id = request.headers.get('x-session-id')
     explicit_source = request.headers.get('x-source', 'operit')
@@ -608,6 +626,25 @@ async def _handle_chat_completions(request: Request):
                         break
                 if last_user:
                     await message_store.store_unified_message('operit', 'main', 'user', last_user.get('content', ''))
+                    # 技术模式下也递增计数器（让前端显示"已存X条待总结"），但不触发轮总
+                    try:
+                        db = await get_db()
+                        try:
+                            cursor = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")
+                            row = await cursor.fetchone()
+                            current_count = int(row['value']) if row else 0
+                            new_count = current_count + 1
+                            await db.execute(
+                                "INSERT INTO config (key, value, description) VALUES ('_msg_counter', ?, '轮总触发计数器') "
+                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                (str(new_count),)
+                            )
+                            await db.commit()
+                            logger.info(f"[TECH_MODE] 计数器递增: {current_count} -> {new_count} (不触发轮总)")
+                        finally:
+                            await db.close()
+                    except Exception as e:
+                        logger.error(f"[TECH_MODE] 计数器递增异常: {e}")
             else:
                 stored_count, was_rerolled, current_turn = await store_incoming_messages(conversation_id, raw_messages)
                 
@@ -754,7 +791,7 @@ async def _handle_chat_completions(request: Request):
     has_pending_strip_c = any(a == 'strip_c' for a in msg_actions)
     
     if has_pending_strip_c and not has_real_user_after_strip:
-        # 剥离总结残留会导致零真实用户消息 → 回退：将 strip_c 改为 keep
+        # 剥离总结残留会导致零真实用户消息 → 回���：将 strip_c 改为 keep
         logger.warning(f"[DEDUP] ⚠️ 剥离总结残留后将无真实用户消息，回退保留以防吞消息")
         msg_actions = ['keep' if a == 'strip_c' else a for a in msg_actions]
     
@@ -858,12 +895,14 @@ async def _handle_chat_completions(request: Request):
         body['messages'] = await injection_engine.inject_memory_only(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
         logger.info(f"[QQ_INJECT] QQ来源: 跳过规则注入，执行记忆注入（跨端桥接）")
     elif tech_mode:
-        # Operit 技术模式：跳过所有注入
-        logger.info(f"[TECH_MODE] 技术模式启用，跳过注入引擎，保留原始 {len(body.get('messages', []))} 条消息")
+        # Operit 技术模式：只注入核心身份规则（priority=0），跳过轮总/召回/网易云
+        injection_engine = InjectionEngine()
+        body['messages'] = await injection_engine.inject_tech_mode(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
+        logger.info(f"[TECH_MODE] 技术模式启用，注入核心身份规则（priority=0）")
     else:
         # Operit 日常模式：完整注入（规则 + 记忆）
         injection_engine = InjectionEngine()
-        body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
+        body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id, 'source': explicit_source})
 
     # === Bug 1.5 修复：防止 AI 工具调用陷入死循环 (Ghost Wall) ===
     _final_msgs = body.get('messages', [])
@@ -889,7 +928,7 @@ async def _handle_chat_completions(request: Request):
             if has_tool_call:
                 consecutive_tool_turns += 1
                 
-    if consecutive_tool_turns >= 3:
+    if consecutive_tool_turns >= 3 and not tech_mode:
         logger.warning(f"[TOOL_LOOP] 检测到连续 {consecutive_tool_turns} 次工具调用，强制中断死循环！")
         if 'tools' in body:
             del body['tools']
@@ -903,7 +942,7 @@ async def _handle_chat_completions(request: Request):
     if last_tool_idx != -1:
         original_content = _final_msgs[last_tool_idx].get('content', '')
         if isinstance(original_content, str):
-            patch = "\n\n[System Action Required: 此工具已执行。请评估是否需要继续调用其他工具（如还需要操作），若无须进一步调用，请直接以中文文字回复用户。]"
+            patch = "\n\n[System Action Required: 此工具已执行。请评估是否需要继续调用其他工具（如还需要操作），若无须进一���调用，请直接以中文文字回复用户。]"
             if "[System Action Required" not in original_content:
                 # 注意：如果是 XML 格式，补丁需要放在闭合标签后，但直接追加在末尾通常也是可以被识别的
                 _final_msgs[last_tool_idx]['content'] = original_content + patch

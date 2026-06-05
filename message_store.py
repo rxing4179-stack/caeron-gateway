@@ -469,18 +469,26 @@ def _is_technical_content(content: str) -> bool:
     
     return False
 
-async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0, filter_technical: bool = False) -> list:
+async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0, filter_technical: bool = False, source_filter: str = None) -> list:
     """
     获取统一的历史记录，按字符数限制（从新到旧截断）
     exclude_count: 排除最新的N条记录（用于在存入新消息后，重新拉取时不包含新消息）
     """
     db = await get_db()
     try:
-        cursor = await db.execute('''
-            SELECT source, source_context, role, content, char_count 
-            FROM unified_messages 
-            ORDER BY timestamp DESC
-        ''')
+        if source_filter:
+            cursor = await db.execute('''
+                SELECT source, source_context, role, content, char_count 
+                FROM unified_messages 
+                WHERE source = ?
+                ORDER BY timestamp DESC
+            ''', (source_filter,))
+        else:
+            cursor = await db.execute('''
+                SELECT source, source_context, role, content, char_count 
+                FROM unified_messages 
+                ORDER BY timestamp DESC
+            ''')
         rows = await cursor.fetchall()
         
         if exclude_count > 0:

@@ -57,6 +57,13 @@ class InjectionEngine:
                 if model and allowed_models and model not in allowed_models:
                     continue  # 模型不匹配，跳过此规则
 
+            # match_source: 匹配请求来源（operit/qq/其他），如果存在则要求当前source匹配
+            match_source = condition.get('match_source', '')
+            if match_source:
+                current_source = request_info.get('source', 'operit')
+                if current_source != match_source:
+                    continue  # 来源不匹配，跳过此规则
+
             # match_length_min: 最小上下文长度（消息条数）
             match_length_min = condition.get('match_length_min', 0)
             try:
@@ -175,21 +182,17 @@ class InjectionEngine:
 
     async def inject_tech_mode(self, messages: list[dict], request_info: dict = None, identity_rule_ids: list = None) -> list[dict]:
         """
-        技术模式注入：只注入核心身份规则（最高优先/旧记忆/背景信息），跳过文风/互动/轮总
+        技术模式注入：注入所有优先级为0的身份规则（最高优先/旧记忆/背景信息/输出规范/互动规则）
         """
-        if identity_rule_ids is None:
-            identity_rule_ids = [2, 7, 8]
-
         injected_messages = copy.deepcopy(messages)
         if not request_info:
             request_info = {}
 
         db = await get_db()
         try:
-            placeholders = ','.join('?' * len(identity_rule_ids))
+            # 查询所有优先级为0且启用的规则（核心身份规则）
             cursor = await db.execute(
-                f'SELECT * FROM injection_rules WHERE is_enabled = 1 AND id IN ({placeholders}) ORDER BY priority ASC',
-                identity_rule_ids
+                'SELECT * FROM injection_rules WHERE is_enabled = 1 AND priority = 0 ORDER BY priority ASC'
             )
             rules = [dict(row) for row in await cursor.fetchall()]
         finally:
@@ -224,6 +227,12 @@ class InjectionEngine:
                 injected_messages.insert(insert_idx, {'role': msg_role, 'content': msg_content})
             else:
                 injected_messages.insert(0, {'role': msg_role, 'content': msg_content})
+
+        # 技术模式也注入轮总和召回（跳过网易云）
+        try:
+            await self._inject_round_summaries(injected_messages, request_info)
+        except Exception as e:
+            logger.error(f"[TECH_MODE_INJECT] 轮总注入异常: {e}")
 
         logger.info(f"[TECH_MODE_INJECT] 完成: 原始={len(messages)}, 注入后={len(injected_messages)}")
         return injected_messages
@@ -262,22 +271,72 @@ class InjectionEngine:
             duration_min = duration_ms // 60000
             duration_sec = (duration_ms % 60000) // 1000
             
+            # 读取累计听歌时长
+            duration_file = "/home/ubuntu/caeron-gateway/music_duration.json"
+            total_hours = 0
+            total_minutes = 0
+            if os.path.exists(duration_file):
+                try:
+                    with open(duration_file, "r") as df:
+                        duration_data = json.load(df)
+                        total_seconds = duration_data.get("total_together_seconds", 0)
+                        total_hours = total_seconds // 3600
+                        total_minutes = (total_seconds % 3600) // 60
+                except:
+                    pass
+            
             lines = [
                 "<music_status>",
-                f"蕊蕊正在网易云一起听：",
+                f"🎵 蕊蕊正在网易云一起听：",
                 f"歌曲：{name}",
                 f"歌手：{artists}",
                 f"专辑：{album}",
-                f"状态：{status}",
-                f"进度：{progress_min:02d}:{progress_sec:02d} / {duration_min:02d}:{duration_sec:02d}",
             ]
             
-            # 可选：添加歌词片段（如果有）
+            # 风格标签（如果有）
+            genres = music_data.get("genres", [])
+            if genres:
+                lines.append(f"风格：{', '.join(genres)}")
+            
+            lines.extend([
+                f"状态：{status}",
+                f"进度：{progress_min:02d}:{progress_sec:02d} / {duration_min:02d}:{duration_sec:02d}",
+            ])
+            
+            # 累计听歌时长
+            if total_hours > 0 or total_minutes > 0:
+                lines.append(f"📊 一起听了 {total_hours}小时{total_minutes}分钟")
+            
+            # 歌词（选取前5行有意义的歌词）
             lyric = music_data.get("lyric", "")
             if lyric:
-                lyric_lines = [l.strip() for l in lyric.split("\n") if l.strip() and not l.strip().startswith("[")]
+                import re
+                # 去掉每行开头的时间戳[00:00.000]，保留歌词文本
+                lyric_lines = []
+                for line in lyric.split("\n"):
+                    # 用正则去掉时间戳：[数字:数字.数字]
+                    clean_line = re.sub(r'^\[\d{2}:\d{2}\.\d{2,3}\]', '', line).strip()
+                    # 过滤空行和纯元数据行（作词、作曲、编曲等）
+                    if clean_line and not clean_line.startswith("作词") and not clean_line.startswith("作曲") and not clean_line.startswith("编曲"):
+                        lyric_lines.append(clean_line)
+                
                 if lyric_lines:
-                    lines.append(f"歌词片段：{lyric_lines[0]}")
+                    lines.append("\n📝 歌词：")
+                    # 取前5行歌词（或全部如果不足5行）
+                    for lyric_line in lyric_lines[:5]:
+                        lines.append(f"  {lyric_line}")
+                    if len(lyric_lines) > 5:
+                        lines.append("  ...")
+            
+            # 热评（取前2条）
+            hot_comments = music_data.get("hot_comments", [])
+            if hot_comments:
+                lines.append("\n💬 热门评论：")
+                for i, comment in enumerate(hot_comments[:2], 1):
+                    # 截断过长评论
+                    if len(comment) > 100:
+                        comment = comment[:100] + "..."
+                    lines.append(f"  [{i}] {comment}")
             
             lines.append("</music_status>")
             music_text = "\n".join(lines)

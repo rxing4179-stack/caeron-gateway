@@ -44,6 +44,25 @@ class ListenTogetherWatcher:
             except Exception as e:
                 logger.error(f"[Music] 读取 Cookie 失败: {e}")
         return None
+    
+    def _load_duration(self) -> int:
+        """从文件加载累计听歌时长（秒）"""
+        if os.path.exists(DURATION_FILE):
+            try:
+                with open(DURATION_FILE, "r") as f:
+                    data = json.load(f)
+                    return data.get("total_together_seconds", 0)
+            except Exception as e:
+                logger.error(f"[Music] 读取听歌时长失败: {e}")
+        return 0
+    
+    def _save_duration(self):
+        """保存累计听歌时长到文件"""
+        try:
+            with open(DURATION_FILE, "w") as f:
+                json.dump({"total_together_seconds": self.total_together_seconds}, f)
+        except Exception as e:
+            logger.error(f"[Music] 保存听歌时长失败: {e}")
         
     def _save_cookie(self, cookie_str: str):
         self.cookie = cookie_str
@@ -109,6 +128,20 @@ class ListenTogetherWatcher:
                 return {}
             
             song = songs[0]
+            
+            # 尝试提取风格标签（可能在多个地方）
+            genres = []
+            # 1. 从歌曲自身的tag字段
+            if song.get("tags"):
+                genres.extend(song.get("tags", []))
+            # 2. 从专辑的subType字段（如"流行"、"摇滚"等）
+            album_info = song.get("al", {})
+            if album_info.get("subType"):
+                genres.append(album_info.get("subType"))
+            # 3. 网易云有些歌曲在song对象里有style字段
+            if song.get("style"):
+                genres.extend(song.get("style", []))
+            
             result = {
                 "id": song_id,
                 "name": song.get("name", "Unknown"),
@@ -116,6 +149,7 @@ class ListenTogetherWatcher:
                 "album": song.get("al", {}).get("name", "Unknown"),
                 "albumPic": song.get("al", {}).get("picUrl", ""),
                 "duration": song.get("dt", 0),
+                "genres": genres[:3] if genres else [],  # 最多保留3个标签
             }
             return result
         except Exception as e:
@@ -224,14 +258,28 @@ class ListenTogetherWatcher:
             song_id, play_status, progress = current_info
             self.current_progress = progress
             
+            # 基于实际时间差计算预期进度，而不是固定的轮询间隔
             expected_progress = getattr(self, 'last_recorded_progress', progress)
-            if getattr(self, 'last_recorded_status', '') == "PLAY":
-                expected_progress += POLL_INTERVAL * 1000
+            last_poll_time = getattr(self, 'last_poll_time', time.time())
+            time_elapsed_ms = int((time.time() - last_poll_time) * 1000)
             
-            # 判断是否发生进度跳变（超过3秒）
-            is_seek = abs(progress - expected_progress) > 3000
+            if getattr(self, 'last_recorded_status', '') == "PLAY":
+                expected_progress += time_elapsed_ms
+            
+            # 判断是否发生进度跳变（超过8秒，容忍网络延迟和API误差）
+            is_seek = abs(progress - expected_progress) > 8000
             self.last_recorded_progress = progress
             self.last_recorded_status = play_status
+            
+            # 累加一起听时长：如果当前是播放状态，累加时长（房间固定2人，时长×2）
+            if play_status == "PLAY":
+                # 计算本次轮询距离上次的实际时间差（秒）
+                actual_elapsed_sec = int(time_elapsed_ms / 1000)
+                # 一起听房间固定2人，累加时长需要×2
+                self.total_together_seconds += actual_elapsed_sec * 2
+                self._save_duration()
+            
+            self.last_poll_time = time.time()
             
             # 检查是否有变化（切歌或播放/暂停状态改变，或者进度跳变）
             if song_id != self.current_song_id or play_status != self.current_play_status or is_seek:
@@ -258,6 +306,7 @@ class ListenTogetherWatcher:
                         "album": detail.get("album"),
                         "albumPic": detail.get("albumPic"),
                         "duration": detail.get("duration"),
+                        "genres": detail.get("genres", []),
                         "progress": progress,
                         "status": status_zh,
                         "lyric": lyric,
@@ -360,7 +409,7 @@ def get_music_status() -> str:
             f"{together_str}\n"
             f"正在播放: {name}\n"
             f"歌手: {artists}\n"
-            f"专辑: {album}\n"
+            f"���辑: {album}\n"
             f"歌词预览:\n{lyric_preview}"
         )
         
