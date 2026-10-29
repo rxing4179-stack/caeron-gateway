@@ -6,6 +6,8 @@ import httpx
 import logging
 
 logger = logging.getLogger('music_status')
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 NETEASE_API_BASE = "http://127.0.0.1:3002"
 POLL_INTERVAL = 15  # 一起听模式可以更频繁轮询（15秒）

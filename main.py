@@ -40,6 +40,8 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger('caeron')
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 # 初始化供应商管理器（全局单例）
 provider_manager = ProviderManager()
@@ -663,7 +665,8 @@ async def _handle_chat_completions(request: Request):
     
     # === DEBUG: 图片/附件结构探针 ===
     # 用于排查截图类图片无法被模型解析的问题
-    for _dbg_idx, _dbg_msg in enumerate(raw_messages):
+    _dbg_start = max(0, len(raw_messages) - 5)
+    for _dbg_idx, _dbg_msg in enumerate(raw_messages[_dbg_start:], start=_dbg_start):
         if _dbg_msg.get('role') != 'user':
             continue
         _dbg_content = _dbg_msg.get('content')
@@ -694,7 +697,7 @@ async def _handle_chat_completions(request: Request):
     
     # === MIME 修正：修复 Operit 前端偶尔将图片标记为 application/octet-stream 的问题 ===
     _mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.bmp': 'image/bmp', '.webp': 'image/webp'}
-    for _msg in body.get('messages', []):
+    for _msg in body.get('messages', [])[-30:]:
         _c = _msg.get('content', '')
         if isinstance(_c, str) and 'application/octet-stream' in _c:
             import re as _re
@@ -994,7 +997,7 @@ async def _handle_chat_completions(request: Request):
 
     # === Bug 1 修复：清理幽灵省略号 ===
     # 客户端在仅发送图片/空消息时可能使用 "..." 或 "…" 占位，导致 AI 误解
-    for msg in body.get('messages', []):
+    for msg in body.get('messages', [])[-30:]:
         if msg.get('role') == 'user' and isinstance(msg.get('content'), str):
             c = msg['content']
             if c.startswith('...') or c.startswith('…'):
@@ -1005,9 +1008,10 @@ async def _handle_chat_completions(request: Request):
                     msg['content'] = c if c else ' '
 
     # === 天气数据注入与高精度替换 (Weather Injection & Optimization) ===
+    # 仅逆向扫描最近 10 条消息，找到最新一条带位置/天气附件的用户消息即刻处理并退出，避免遍历数千条历史消息
     try:
         from weather_service import get_weather_formatted, save_last_location, get_last_location
-        for msg in body.get('messages', []):
+        for msg in reversed(body.get('messages', [])[-10:]):
             if msg.get('role') == 'user' and isinstance(msg.get('content'), str) and '<attachment' in msg['content']:
                 c = msg['content']
                 if '【当前位置】' in c or '【当前天气】' in c:
@@ -1040,11 +1044,12 @@ async def _handle_chat_completions(request: Request):
                         pattern = r'【当前天气】[\s\S]*?(?=(【当前位置】|【当前时间】|【当前屏幕应用】|</attachment>))'
                         c_new = re.sub(pattern, fresh_weather_text + '\n\n', c)
                         msg['content'] = c_new
-                        logger.info(f"[WEATHER_INJECT] 成功替换 Operit 附件中的天气块为高精度实时天气: {lat}, {lon}")
+                        logger.info(f"[WEATHER_INJECT] 成功替换最新 Operit 附件中的天气块为高精度实时天气: {lat}, {lon}")
                     elif '</attachment>' in c:
                         c_new = c.replace('</attachment>', f'\n{fresh_weather_text}\n</attachment>')
                         msg['content'] = c_new
-                        logger.info(f"[WEATHER_INJECT] 在 Operit 附件中追加高精度实时天气")
+                        logger.info(f"[WEATHER_INJECT] 在最新 Operit 附件中追加高精度实时天气")
+                    break
     except Exception as e:
         logger.error(f"[WEATHER_INJECT] 天气注入优化处理异常: {e}")
 
