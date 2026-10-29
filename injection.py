@@ -297,6 +297,59 @@ class InjectionEngine:
                 return i
         return len(messages)
 
+    def _extract_last_user_msg(self, messages: list[dict]) -> str | None:
+        for m in reversed(messages):
+            if m.get('role') == 'user':
+                c = m.get('content', '')
+                if isinstance(c, list):
+                    try:
+                        c = '\n'.join([i.get('text', '') for i in c if i.get('type') == 'text'])
+                    except Exception:
+                        c = ''
+                if isinstance(c, str):
+                    c = re.sub(r'<attachment.*?>.*?</attachment>', '', c, flags=re.DOTALL).strip()
+                    if c:
+                        return c
+        return None
+
+    def _start_parallel_prefetch(self, messages: list[dict], request_info: dict):
+        """并行预启动耗时外部网络请求（实时天气 API 与语义向量 Embedding API），与本地 DB/文件读取并发执行"""
+        import asyncio
+        import random
+        source = str(request_info.get('source', '') if request_info else '')
+
+        # 1. 预启动天气异步获取（若上下文尚未包含天气块）
+        has_weather = any(
+            isinstance(m.get('content', ''), str) and ('【当前天气】' in m.get('content', '') or '<weather_status>' in m.get('content', ''))
+            for m in messages[-15:]
+        )
+        if not has_weather and '_weather_task' not in request_info:
+            try:
+                from weather_service import get_weather_formatted, get_last_location
+                last_loc = get_last_location()
+                lat = last_loc.get('lat', 29.867242)
+                lon = last_loc.get('lon', 107.752625)
+                if source.startswith('qq-group'):
+                    address = last_loc.get('address', '重庆市').split('/')[0].strip() if '/' in last_loc.get('address', '') else '重庆市'
+                else:
+                    address = last_loc.get('address', '重庆市')
+                request_info['_weather_task'] = asyncio.create_task(get_weather_formatted(lat, lon, address))
+            except Exception as e:
+                logger.debug(f"[PARALLEL_PREFETCH] 预启动天气任务异常: {e}")
+
+        # 2. 预启动语义召回 Embedding 异步请求（非群聊且存在有效用户文本）
+        if not (source.startswith('qq-group') or (source.startswith('qq-private') and not source.startswith('qq-ruirui'))):
+            if '_emb_task' not in request_info:
+                last_user_msg = self._extract_last_user_msg(messages)
+                if last_user_msg:
+                    try:
+                        from embedding import get_embedding
+                        is_q = (random.choice(['instructed', 'bare']) == 'instructed')
+                        request_info['_last_user_msg'] = last_user_msg
+                        request_info['_emb_task'] = asyncio.create_task(get_embedding(last_user_msg, is_query=is_q))
+                    except Exception as e:
+                        logger.debug(f"[PARALLEL_PREFETCH] 预启动 Embedding 任务异常: {e}")
+
     async def inject(self, messages: list[dict], request_info: dict = None) -> list[dict]:
         """
         核心注入方法
@@ -308,6 +361,9 @@ class InjectionEngine:
         injected_messages = copy.deepcopy(messages)
         if not request_info:
             request_info = {}
+
+        # 并行预启动外部网络请求（天气 + Embedding），使其与下方本地 SQLite 查询和状态读取同时进行
+        self._start_parallel_prefetch(injected_messages, request_info)
             
         # ==================== 跨端历史自动拼接与陈旧上文修剪（必须在规则注入前对原始对话执行！） ====================
         try:
@@ -607,7 +663,11 @@ class InjectionEngine:
             else:
                 address = last_loc.get('address', '重庆市')
 
-            weather_text = await get_weather_formatted(lat, lon, address)
+            weather_task = request_info.pop('_weather_task', None) if isinstance(request_info, dict) else None
+            if weather_task is not None:
+                weather_text = await weather_task
+            else:
+                weather_text = await get_weather_formatted(lat, lon, address)
             wrapped_text = f"<weather_status>\n{weather_text}\n</weather_status>"
 
             insert_idx = len(messages)
@@ -630,6 +690,7 @@ class InjectionEngine:
             request_info = {}
 
         logger.info(f"[MEMORY_ONLY] 仅记忆注入模式启动, 消息数={len(injected_messages)}")
+        self._start_parallel_prefetch(injected_messages, request_info)
 
         # 1. 网易云状态注入
         try:
@@ -1002,9 +1063,13 @@ class InjectionEngine:
                 if last_user_msg:
                     from embedding import get_embedding, cosine_similarity
                     import random
-                    embed_mode = random.choice(['instructed', 'bare'])
-                    is_q = (embed_mode == 'instructed')
-                    user_emb = await get_embedding(last_user_msg, is_query=is_q)
+                    emb_task = request_info.pop('_emb_task', None) if isinstance(request_info, dict) else None
+                    if emb_task is not None:
+                        user_emb = await emb_task
+                    else:
+                        embed_mode = random.choice(['instructed', 'bare'])
+                        is_q = (embed_mode == 'instructed')
+                        user_emb = await get_embedding(last_user_msg, is_query=is_q)
 
                     if user_emb:
                         # 碎片召回
