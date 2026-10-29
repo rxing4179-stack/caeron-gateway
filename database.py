@@ -17,8 +17,11 @@ async def get_db():
     """获取数据库连接"""
     db = await aiosqlite.connect(DB_PATH, timeout=20.0)
     db.row_factory = aiosqlite.Row
-    # 启用 WAL 模式提升并发性能
+    # 启用 WAL 模式与内存页缓存提升并发与检索性能
     await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA synchronous=NORMAL")
+    await db.execute("PRAGMA cache_size=-32000")
+    await db.execute("PRAGMA temp_store=MEMORY")
     return db
 
 
@@ -292,6 +295,11 @@ async def init_db():
         await db.execute('CREATE INDEX IF NOT EXISTS idx_memories_weight ON memories(weight DESC)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_memories_core ON memories(is_core)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_summaries_tag_active ON summaries(tag, is_active, created_at)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_fragments_active ON memory_fragments(is_active)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_fragments_dialogue ON memory_fragments(source_dialogue_id)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, message_index)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_rejected_at ON memory_rejected(rejected_at)')
 
         await db.commit()
         logger.info("数据库初始化完成")
