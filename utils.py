@@ -26,6 +26,8 @@ def clean_chat_text(text: str) -> str:
     
     # 1. 移除 <attachment> 标签及其内容
     text = re.sub(r'<attachment[^>]*>[\s\S]*?</attachment>', '', text)
+    # 移除天气与监控状态标签
+    text = re.sub(r'<(weather_status|monitor_status)>[\s\S]*?</\1>', '', text)
     
     # 2. 移除系统自动注入的元数据块
     text = re.sub(r'【当前(时间|天气|位置|屏幕应用)】[\s\S]*?(?=(【|$))', '', text)

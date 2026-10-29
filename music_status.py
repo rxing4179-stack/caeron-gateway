@@ -117,8 +117,11 @@ class ListenTogetherWatcher:
         song_id = play_command.get("targetSongId")
         play_status = play_command.get("playStatus") # "PLAY" or "PAUSE"
         progress = play_command.get("progress", 0)
+        server_seq = play_command.get("serverSeq", 0)  # 指令下发时的服务器时间戳(ms)
         
-        return True, (song_id, play_status, progress)
+        # playCommand.progress 是指令下发瞬间的快照，不会实时更新！
+        # 需要用 serverSeq 推算实时进度: estimated = progress + (now - serverSeq)
+        return True, (song_id, play_status, progress, server_seq)
 
     async def fetch_song_detail(self, song_id) -> dict:
         try:
@@ -245,59 +248,98 @@ class ListenTogetherWatcher:
             
             if in_room is False:
                 # 没在一起听，清空状态
-                if self.current_song_id is not None:
+                if self.current_song_id is not None or os.path.exists(STATUS_FILE):
                     logger.info("[Music] 退出一起听房间，清除状态")
                     self.current_song_id = None
+                    self.current_play_status = None
+                    self.current_progress = 0
+                    self.stagnant_polls = 0
                     if os.path.exists(STATUS_FILE):
-                        os.remove(STATUS_FILE)
+                        try:
+                            os.remove(STATUS_FILE)
+                        except Exception:
+                            pass
                 return
                 
             if not current_info:
                 return
                 
-            song_id, play_status, progress = current_info
-            self.current_progress = progress
+            song_id, raw_play_status, cmd_progress, server_seq = current_info
+            if not song_id:
+                return
             
-            # 基于实际时间差计算预期进度，而不是固定的轮询间隔
-            expected_progress = getattr(self, 'last_recorded_progress', progress)
-            last_poll_time = getattr(self, 'last_poll_time', time.time())
-            time_elapsed_ms = int((time.time() - last_poll_time) * 1000)
-            
-            if getattr(self, 'last_recorded_status', '') == "PLAY":
-                expected_progress += time_elapsed_ms
-            
-            # 判断是否发生进度跳变（超过8秒，容忍网络延迟和API误差）
-            is_seek = abs(progress - expected_progress) > 8000
+            # 用 serverSeq 推算实时进度（playCommand.progress 只是指令下发时的快照）
+            now_ms = int(time.time() * 1000)
+            if raw_play_status == "PLAY" and server_seq > 0:
+                progress = cmd_progress + (now_ms - server_seq)
+            else:
+                progress = cmd_progress
+
+            now_ts = time.time()
+            last_poll_time = getattr(self, 'last_poll_time', now_ts)
+            time_elapsed_ms = int((now_ts - last_poll_time) * 1000)
+            last_progress = getattr(self, 'last_recorded_progress', progress)
+            last_status = getattr(self, 'last_recorded_status', raw_play_status)
+            is_new_song = (song_id != self.current_song_id)
+
+            delta_progress = progress - last_progress
+
+            # 检测进度是否停滞（仅用于时长累计保护，不再影响播放状态判定）
+            # 使用估算进度后，正常播放时 delta_progress 会正确反映时间流逝
+            is_stagnant = (time_elapsed_ms >= 5000 and abs(delta_progress) < 1500)
+
+            if is_new_song:
+                self.stagnant_polls = 0
+            elif is_stagnant:
+                self.stagnant_polls = getattr(self, 'stagnant_polls', 0) + 1
+            else:
+                self.stagnant_polls = 0
+
+            # 直接信任 API 的 playStatus：
+            # playCommand.progress 是指令快照而非实时值，用它做停滞检测会误判。
+            # 已通过 serverSeq 推算出实时进度，无需再用停滞次数覆盖播放状态。
+            effective_play_status = raw_play_status
+
+            # 判断是否发生进度跳变（Seek）：
+            # 只有在非停滞且进度真正改变时，偏离预期播放时间超过8秒才算 Seek
+            if not is_new_song and not is_stagnant and abs(delta_progress) >= 1500:
+                if last_status == "PLAY":
+                    is_seek = abs(delta_progress - time_elapsed_ms) > 8000
+                else:
+                    is_seek = True
+            else:
+                is_seek = False
+
+            # 累加一起听时长：只有在真实播放中且进度正常推进时才累加（房间固定2人，时长×2）
+            if effective_play_status == "PLAY" and not is_stagnant and time_elapsed_ms > 0:
+                actual_elapsed_sec = min(int(time_elapsed_ms / 1000), POLL_INTERVAL * 2)
+                if actual_elapsed_sec > 0:
+                    self.total_together_seconds += actual_elapsed_sec * 2
+                    self._save_duration()
+
+            self.last_poll_time = now_ts
             self.last_recorded_progress = progress
-            self.last_recorded_status = play_status
-            
-            # 累加一起听时长：如果当前是播放状态，累加时长（房间固定2人，时长×2）
-            if play_status == "PLAY":
-                # 计算本次轮询距离上次的实际时间差（秒）
-                actual_elapsed_sec = int(time_elapsed_ms / 1000)
-                # 一起听房间固定2人，累加时长需要×2
-                self.total_together_seconds += actual_elapsed_sec * 2
-                self._save_duration()
-            
-            self.last_poll_time = time.time()
-            
-            # 检查是否有变化（切歌或播放/暂停状态改变，或者进度跳变）
-            if song_id != self.current_song_id or play_status != self.current_play_status or is_seek:
-                is_new_song = (song_id != self.current_song_id)
+            self.last_recorded_status = raw_play_status
+            self.current_progress = progress
+
+            # 检查是否有状态改变（切歌、有效播放/暂停状态改变、或进度跳变）
+            state_changed = (is_new_song or effective_play_status != self.current_play_status or is_seek)
+
+            if state_changed:
                 self.current_song_id = song_id
-                self.current_play_status = play_status
-                self.last_update_time = time.time()
-                
-                status_zh = "播放中" if play_status == "PLAY" else "已暂停"
-                logger.info(f"[Music] 状态更新: 歌曲ID={song_id}, 状态={status_zh}, 进度={progress}")
-                
+                self.current_play_status = effective_play_status
+                self.last_update_time = now_ts
+
+                status_zh = "播放中" if effective_play_status == "PLAY" else "已暂停"
+                logger.info(f"[Music] 状态更新: 歌曲ID={song_id}, 状态={status_zh}, 进度={progress} (raw={raw_play_status}, seek={is_seek}, stagnant={self.stagnant_polls})")
+
                 # 如果是切歌，拉取详情
-                if is_new_song and song_id:
+                if is_new_song:
                     logger.info(f"[Music] 检测到切歌: 拉取 {song_id} 详情...")
                     detail = await self.fetch_song_detail(song_id)
                     lyric = await self.fetch_lyric(song_id)
                     hot_comments = await self.fetch_hot_comments(song_id)
-                    
+
                     # 写入文件供 injection.py 提取
                     output = {
                         "song_id": song_id,
@@ -313,7 +355,7 @@ class ListenTogetherWatcher:
                         "hot_comments": hot_comments,
                         "update_time": time.strftime("%Y-%m-%d %H:%M:%S")
                     }
-                    
+
                     with open(STATUS_FILE, "w", encoding="utf-8") as f:
                         json.dump(output, f, ensure_ascii=False, indent=2)
                     logger.info(f"[Music] 状态文件已更新: {detail.get('name')}")

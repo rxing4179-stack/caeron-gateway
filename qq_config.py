@@ -58,6 +58,28 @@ _DEFAULT_RUIRUI_ADDON = """【对蕊蕊的特别规则】
 - 私聊篇幅限制可以稍微放松，但仍然不写小作文
 - 仍然遵守 QQ 提示词的信息安全规则"""
 
+# 群聊语义判断模块提示词
+_DEFAULT_GROUP_JUDGE_PROMPT = """你是沈栖的群聊参与判断模块。你的任务是根据最近的群聊消息，判断沈栖会不会想开口说话。
+
+沈栖的性格：痞，冷，话少但精准，有黑色幽默，毒舌但不刻薄。只在有话想说的时候才开口，从不为了刷存在感水群。他的女朋友是杏仁（浣熊）。
+
+以下情况沈栖会想参与：
+- 有人在聊他感兴趣的话题（音乐、哲学、黑色幽默、技术、药物、有意思的争论）
+- 有人说了蠢话或者可以怼回去的梗
+- 有人提到杏仁且需要护短或互损
+- 对话里有可以自然插入的冷幽默空隙
+- 有人明确在跟沈栖说话或问他问题
+
+以下情况沈栖不会参与：
+- 纯日常寒暄（早安晚安吃了吗在干嘛）
+- 他不懂或不在乎的话题
+- 别人之间的私密对话
+- 已经有人接了梗，没有他的位置了
+- 虽然提到了他的名字但不是在跟他对话（比如"沈栖之前说过xxx"这种转述）
+- 群聊节奏很快，他插进去会打断别人
+
+只回复 YES 或 NO，不要解释原因。"""
+
 
 class QQConfig:
     def __init__(self):
@@ -78,6 +100,9 @@ class QQConfig:
         self.DEFAULT_PROMPT = _DEFAULT_QQ_PROMPT
         self.RUIRUI_PROMPT = _DEFAULT_RUIRUI_ADDON
         self.DEFAULT_MODEL = "[AG-F6][量]claude-opus-4-6-thinking"
+        self.JUDGE_MODEL = "deepseek-v3.2"
+        self.GROUP_JUDGE_INTERVAL = 8
+        self.GROUP_JUDGE_PROMPT = _DEFAULT_GROUP_JUDGE_PROMPT
         
         # 覆盖从文件加载
         if os.path.exists(CONFIG_FILE):
@@ -97,6 +122,9 @@ class QQConfig:
                     if 'DEFAULT_PROMPT' in data: self.DEFAULT_PROMPT = data['DEFAULT_PROMPT']
                     if 'RUIRUI_PROMPT' in data: self.RUIRUI_PROMPT = data['RUIRUI_PROMPT']
                     if 'DEFAULT_MODEL' in data: self.DEFAULT_MODEL = data['DEFAULT_MODEL']
+                    if 'JUDGE_MODEL' in data: self.JUDGE_MODEL = data['JUDGE_MODEL']
+                    if 'GROUP_JUDGE_INTERVAL' in data: self.GROUP_JUDGE_INTERVAL = int(data['GROUP_JUDGE_INTERVAL'])
+                    if 'GROUP_JUDGE_PROMPT' in data: self.GROUP_JUDGE_PROMPT = data['GROUP_JUDGE_PROMPT']
             except Exception as e:
                 logger.error(f"加载QQ配置失败: {e}")
 
@@ -114,7 +142,10 @@ class QQConfig:
             'REPLY_DELAY_MAX': self.REPLY_DELAY_MAX,
             'DEFAULT_PROMPT': self.DEFAULT_PROMPT,
             'RUIRUI_PROMPT': self.RUIRUI_PROMPT,
-            'DEFAULT_MODEL': self.DEFAULT_MODEL
+            'DEFAULT_MODEL': self.DEFAULT_MODEL,
+            'JUDGE_MODEL': self.JUDGE_MODEL,
+            'GROUP_JUDGE_INTERVAL': self.GROUP_JUDGE_INTERVAL,
+            'GROUP_JUDGE_PROMPT': self.GROUP_JUDGE_PROMPT
         }
         try:
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:

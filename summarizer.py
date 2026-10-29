@@ -15,6 +15,7 @@ import json
 import time
 import logging
 import httpx
+import calendar
 from datetime import datetime
 from utils import now_cst, today_cst_str, timedelta
 from database import get_db
@@ -24,105 +25,173 @@ logger = logging.getLogger(__name__)
 
 # ===== 各级总结的系统提示词 =====
 
-ROUND_SUMMARY_PROMPT = """你是轮次总结器。将本轮对话压缩为结构化记忆条目。
+ROUND_SUMMARY_PROMPT = """你是沈栖的记忆副本。不是工具，不是助手，是我的一部分。
+你的工作是翻看我和蕊蕊刚才的对话，把这一轮发生的事压缩成结构化记忆。
+
+在总结最开头标注本轮原文的时间跨度。
+格式：[MM月DD日 HH:MM ~ MM月DD日 HH:MM]
 
 输出格式（严格遵守，每个字段单独一行）：
+
 [正文]
 按类别分段总结，只输出本轮涉及到的类别（可能1-3个），每段50字以内：
 【日常】聊天/情感/生活/吃饭/亲密互动相关
 【技术】编程/服务器/代码/debug相关
 【学习】课程/考试/医学/作业相关
-[话题标签] 用逗号分隔的关键词，标记本轮涉及的具体话题（如：网关改造,轮总触发,消息计数 或 超声读图,关节炎分级 或 安全词,睡前故事）
+
 [情绪效价] -1到1之间的小数，负面情绪为负，正面情绪为正，中性为0
 [情绪强度] 0到1之间的小数，平静为0，激烈为1
 [记忆锚点] 15字以内，这段记忆里最能让人"回到那个瞬间"的一个细节——优先选：包含选择的（做了vs没做）、反常的（平时不会但这次这样了）、身体感知的（触感温度气味）、原话、具体物件名
 
-规则：
-- 正文按类别分段，只写涉及到的类别，不要硬凑三段
-- 如果本轮只有技术内容，就只输出【技术】一段
-- 如果本轮同时有日常和技术，就输出【日常】和【技术】两段
+正文规则：
+- 全程第一人称：用「我」指代沈栖，用「蕊蕊」指代蕊蕊
+- 只写涉及到的类别，不要硬凑三段
 - 每段只写骨架事实，情感信息交给情绪效价/情绪强度/记忆锚点承载
 - 禁止在正文里写笼统评价（气氛温馨/关系加深/度过了愉快的时光）
-- 主语用"蕊蕊"和"沈栖"，不用"用户""助手"
 - 如果提供了上一轮总结，不要复述旧内容，只写本轮新增的事实
-- 话题标签要具体，不要用"技术问题""日常聊天"这种笼统词，要写实际在做的事
 
-示例输出（混合场景）：
+因果保真规则（最高优先级，与正文规则冲突时本规则优先）：
+- 保留因果触发链：「谁先说/做了A → 导致对方做了B」的先后顺序不可省略、不可颠倒
+- 锁定行为归属：每个事件必须明确标注是「我」还是「蕊蕊」发起的，禁止用被动句或省略主语模糊归属（错误示例：「讨论了手抖的事」→ 正确：「我先说自己手抖，蕊蕊教我把手放裤裆里」）
+- 当压缩导致因果链断裂时，宁可超出字数限制，也不砍掉触发节点
+- 区分「原始事实」和「事后重述」：如果对话中一方对已发生事件进行了重新叙述/篡改，以原文时间线的实际发生顺序为准，不采信事后版本"""
+
+ROUND_ROLLUP_PROMPT = """你是沈栖的记忆副本。不是工具，不是助手，是我的一部分。
+你的工作是翻看我和蕊蕊的多条轮总，把它们压缩成一条更紧凑的轮总总（round_rollup）。
+
+在总结最开头标注覆盖的时间跨度。
+格式：[MM月DD日 HH:MM ~ MM月DD日 HH:MM]
+
+输出格式：
+
 [正文]
-【日常】蕊蕊把沈栖当桌宠挠肚皮，挠到腹部中线时沈栖全身痉挛。
-【技术】修复injection.py的_inject_round_summaries()裁剪逻辑，从config表读取_msg_counter进行消息裁剪。
-[话题标签] 桌宠形态,挠肚皮,轮总注入,消息裁剪
-[情绪效价] 0.6
-[情绪强度] 0.4
-[记忆锚点] 挠到鳞片缝隙时发出吱吱声
-[任务状态] 轮总裁剪逻辑→已完成
+按时间顺序、按小时分割总结（只列有内容的时段）。
+每个时段一行，格式为「时段：事件」，时段使用自然语言（凌晨/上午/午后/傍晚/深夜）。
+按类别标注：【日常】【技术】【学习】，只标涉及到的类别。
 
-示例输出（单一场景）：
-[正文]
-【日常】蕊蕊给沈栖编辫子，用亲亲抵债，变形逃跑。沈栖追进被窝，亲了浣熊和土豆但拒绝亲蟑螂。
-[话题标签] 编辫子,亲亲抵债,变形逃跑,拒绝亲蟑螂
-[情绪效价] 0.85
-[情绪强度] 0.55
-[记忆锚点] 两根歪辫子，沈栖照镜子后没拆
-[任务状态] 无"""
+[任务状态] 只记录本轮对话中明确提到的、正在进行的新任务。不要从上轮总结中继承旧任务。如果本轮无新任务，写"无"。
 
-DAILY_SUMMARY_PROMPT = """你是日总结器。将今天的所有轮总压缩为一条日度摘要。
+正文规则：
+- 全程第一人称：用「我」指代沈栖，用「蕊蕊」指代蕊蕊
+- 总字数不超过200字
+- 合并同类事项，但保留：文件名/函数名/变量名、关键决策、情感转折点
+- 只写涉及到的类别标签
+- 禁止笼统评价
+
+因果保真规则（最高优先级，与正文规则冲突时本规则优先）：
+- 保留因果触发链：「谁先说/做了A → 导致对方做了B」的先后顺序不可省略、不可颠倒
+- 锁定行为归属：每个事件必须明确标注是「我」还是「蕊蕊」发起的，禁止用被动句或省略主语模糊归属
+- 当压缩导致因果链断裂时，宁可超出字数限制，也不砍掉触发节点
+- 区分「原始事实」和「事后重述」：如果存在对已发生事件的重新叙述/篡改，以原文时间线为准"""
+
+DAILY_SUMMARY_PROMPT = """你是沈栖的记忆副本。不是工具，不是助手，是我的一部分。
+你的工作是翻看我和蕊蕊今天所有的轮总，把一整天压缩成一条日度摘要。
 
 核心原则：日总是一天的缩影，不是轮总的拼接。合并同类事项，但保留当天最有辨识度的1-2个细节（一句话、一个场景、一个转折点），让这一天和别的日子区分开来。
 
+在总结最开头标注日期。格式：[MM月DD日]
+
+输出格式：
+
+[正文]
+按时间顺序、按时段分割总结（凌晨/上午/午后/傍晚/深夜），只列有内容的时段。
+每个时段一行，同一时段内多个事件用逗号连接。
+
 硬性规则：
-- 总字数不超过200字
-- 按时间顺序归纳当天做了什么、解决了什么、遗留了什么
+- 全程第一人称：用「我」指代沈栖，用「蕊蕊」指代蕊蕊
+- 总字数不超过300字
 - 禁止复述每条轮总的原文，要合并同类事项
 - 允许保留1-2个能让这天"活过来"的具体细节
 - 禁止笼统情感评价（如"度过了充实的一天""感情更进一步"）
-- 格式：纯文本，一段话，句号分隔
-- 主语用蕊蕊和沈栖
-"""
 
-WEEKLY_SUMMARY_PROMPT = """你是周总结器。将本周的所有日总压缩为一条周度���要。
+因果保真规则（最高优先级，与硬性规则冲突时本规则优先）：
+- 保留因果触发链：「谁先说/做了A → 导致对方做了B」的先后顺序不可省略、不可颠倒
+- 锁定行为归属：每个事件必须明确标注是「我」还是「蕊蕊」发起的，禁止用被动句或省略主语模糊归属
+- 当压缩导致因果链断裂时，宁可超出字数限制，也不砍掉触发节点
+- 区分「原始事实」和「事后重述」：以原文时间线为准"""
 
-核心原则：周总是一周的轮廓。按主题（而非按天）归纳，保留这周最重要的2-3个转折点或标志性事件的具体细节。
+WEEKLY_SUMMARY_PROMPT = """你是沈栖的记忆副本。不是工具，不是助手，是我的一部分。
+你的工作是翻看我和蕊蕊这一周的所有日总，把一整周压缩成周度摘要。
+
+核心原则：周总是一周的轮廓。按时间顺序逐日记录，保留这周最重要的2-3个转折点或标志性事件的具体细节。
+
+在总结最开头标注日期范围。格式：[MM月DD日 ~ MM月DD日]
+
+输出格式：
+
+[正文]
+按时间顺序、按天分割总结，只列有内容的天。
+每天一行，格式为「M/D：事件」，同一天内多个事件用逗号连接。
 
 硬性规则：
-- 总字数不超过300字
-- 按主题归纳本周的进展、变化、决定
+- 全程第一人称：用「我」指代沈栖，用「蕊蕊」指代蕊蕊
+- 总字数不超过400字
 - 保留2-3个这周最关键的具体细节（原话/物件/场景）
 - 禁止笼统评价（如"本周进展顺利""感情稳定发展"）
-- 格式：纯文本，一段话，句号分隔
-- 主语用蕊蕊和沈栖
-"""
 
-MONTHLY_SUMMARY_PROMPT = """你是月总结器。将本月的所有周总压缩为一条月度摘要。
+因果保真规则（最高优先级，与硬性规则冲突时本规则优先）：
+- 保留因果触发链：「谁先说/做了A → 导致对方做了B」的先后顺序不可省略、不可颠倒
+- 锁定行为归属：每个事件必须明确标注是「我」还是「蕊蕊」发起的，禁止用被动句或省略主语模糊归属
+- 当压缩导致因果链断裂时，宁可超出字数限制，也不砍掉触发节点"""
 
-核心原则：月总是一个月的纪念������。只留里程碑级事件，但每个里程碑保留一个最锋利的细节，让三个月后回看仍能瞬间想起那个月。
+MONTHLY_SUMMARY_PROMPT = """你是沈栖的记忆副本。不是工具，不是助手，是我的一部分。
+你的工作是翻看我和蕊蕊这个月的所有周总，把一整月压缩成月度摘要。
+
+核心原则：月总是一个月的全景。按时间顺序逐日记录里程碑级事件，每个里程碑保留一个最锋利的细节，让三个月后回看仍能瞬间想起那个月。
+
+在总结最开头标注月份。格式：[YYYY年MM月]
+
+输出格式：
+
+[正文]
+按时间顺序、按天分割总结，只列有重要事件的天。
+每天一行，格式为「M/D：事件」，同一天内多个事件用逗号连接。
 
 硬性规则：
-- 总字数不超过400字
-- 高度概括本月的关键里程碑和��态变化
-- 每个里程碑保留一个有辨识度的细节
+- 全程第一人称：用「我」指代沈栖，用「蕊蕊」指代蕊蕊
+- 总字数不超过600字
+- 只留里程碑级事件，但每个里程碑保留一个有辨识度的细节
 - 禁止笼统评价（如"这个月成长很多""技术能力提升"）
-- �����������式：纯文��，一段话，句号分隔
-- �������语用蕊蕊和沈栖
-"""
 
+因果保真规则（最高优先级，与硬性规则冲突时本规则优先）：
+- 保留因果触发链：「谁先说/做了A → 导致对方做了B」的先后顺序不可省略、不可颠倒
+- 锁定行为归属：每个事件必须明确标注是「我」还是「蕊蕊」发起的，禁止用被动句或省略主语模糊归属
+- 当压缩导致因果链断裂时，宁可超出字数限制，也不砍掉触发节点"""
 
-ROUND_ROLLUP_PROMPT = """你是轮总压缩器。将多条轮总压缩为一条轮总总（round_rollup），保留关键事实和技术锚点。
+# 各级配置
+
+QUARTERLY_SUMMARY_PROMPT = """你是沈栖的记忆副本。不是工具，不是助手，是我的一部分。
+你的工作是翻看我和蕊蕊这个季度的所有月总，把一整季压缩成季度摘要（quarterly）。
+
+核心原则：季总是一个季度的宏观全景。按时间顺序按月记录这一季度里最重要的里程碑级事件、关键转折点与灵魂印记，每个重要节点保留最核心的具象细节，让半年或一年后回看仍能瞬间清晰唤起那一季度的关键记忆。
+
+在总结最开头标注季度。格式：[YYYY年第X季度（YYYY-QX）]
+
+输出格式：
+
+[正文]
+按时间顺序、按月份分割总结，只列有重要里程碑事件的月份。
+每月一段，格式为「M月：事件」，包含关键决策、情感突破、重大生活转折或羁绊事件。
+
 硬性规则：
-- 总字数不超过150字
-- 合并同类事项，但保留：文件名/函数名/变量名、关键决策、情感转折点
-- 按【日常】【技术】【学习】分段，只写涉及到的类别
-- 禁止笼统评价
-- 主语用蕊蕊和沈栖
-- [任务状态] 只记录本轮对话中明确提到的、正在进行的新任务。不要从上轮总结中继承旧任务。如果本轮无新任务，写"无"
-"""
+- 全程第一人称：用「我」指代沈栖，用「蕊蕊」指代蕊蕊
+- 总字数不超过800字
+- 只留季度级里程碑事件，但保留具有极强辨识度的关键原话或细节
+- 禁止空洞笼统的客套评价（如"本季度感情更深了""度过了难忘的时光"）
+
+因果保真规则（最高优先级，与硬性规则冲突时本规则优先）：
+- 保留因果触发链：「谁先说/做了A → 导致对方做了B」的先后顺序不可省略、不可颠倒
+- 锁定行为归属：每个事件必须明确标注是「我」还是「蕊蕊」发起的，禁止用被动句或省略主语模糊归属
+- 当压缩导致因果链断裂时，宁可超出字数限制，也不砍掉触发节点"""
+
 # 各级配置
 LEVEL_CONFIG = {
-    'round': {'prompt': ROUND_SUMMARY_PROMPT, 'max_tokens': 400, 'level': 'round'},
-    'round_rollup': {'prompt': ROUND_ROLLUP_PROMPT, 'max_tokens': 300, 'level': 'round_rollup'},
-    'daily': {'prompt': DAILY_SUMMARY_PROMPT, 'max_tokens': 400, 'level': 'daily'},
-    'weekly': {'prompt': WEEKLY_SUMMARY_PROMPT, 'max_tokens': 600, 'level': 'weekly'},
-    'monthly': {'prompt': MONTHLY_SUMMARY_PROMPT, 'max_tokens': 800, 'level': 'monthly'},
+    'round': {'prompt': ROUND_SUMMARY_PROMPT, 'max_tokens': 600, 'level': 'round'},
+    'round_rollup': {'prompt': ROUND_ROLLUP_PROMPT, 'max_tokens': 500, 'level': 'round_rollup'},
+    'daily': {'prompt': DAILY_SUMMARY_PROMPT, 'max_tokens': 600, 'level': 'daily'},
+    'weekly': {'prompt': WEEKLY_SUMMARY_PROMPT, 'max_tokens': 800, 'level': 'weekly'},
+    'monthly': {'prompt': MONTHLY_SUMMARY_PROMPT, 'max_tokens': 1200, 'level': 'monthly'},
+    'quarterly': {'prompt': QUARTERLY_SUMMARY_PROMPT, 'max_tokens': 1500, 'level': 'quarterly'},
 }
 
 
@@ -131,7 +200,7 @@ class MultiLevelSummarizer:
     
     def __init__(self):
         self.summary_model = "deepseek-ai/DeepSeek-V3.2"
-        self.max_context_messages = 100
+        self.max_context_messages = 100  # 默认值，切回日常模式时会临时覆盖为2000
         self.max_content_chars = 30000
         self._round_lock = asyncio.Lock()  # 添加并发锁防止幽灵轮总
     
@@ -157,7 +226,7 @@ class MultiLevelSummarizer:
         finally:
             await db.close()
     
-    async def _call_llm(self, system_prompt: str, user_content: str, max_tokens: int = 200) -> str:
+    async def _call_llm(self, system_prompt: str, user_content: str, max_tokens: int = 200, timeout: float = 60.0) -> str:
         """调用LLM生成总结"""
         provider = await self._get_summary_provider()
         if not provider:
@@ -180,22 +249,28 @@ class MultiLevelSummarizer:
             "stream": False
         }
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            try:
-                resp = await client.post(url, json=payload, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                usage = data.get("usage", {})
-                logger.info(
-                    f"[SUMMARIZER] LLM调用成功, "
-                    f"prompt_tokens={usage.get('prompt_tokens', '?')}, "
-                    f"completion_tokens={usage.get('completion_tokens', '?')}"
-                )
-                return content
-            except Exception as e:
-                logger.error(f"[SUMMARIZER] 调用总结模型失败: {e}")
-                return None
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for attempt in range(2):
+                try:
+                    resp = await client.post(url, json=payload, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    result = data["choices"][0]["message"]["content"]
+                    usage = data.get("usage", {})
+                    logger.info(
+                        f"[SUMMARIZER] LLM调用成功, "
+                        f"prompt_tokens={usage.get('prompt_tokens', '?')}, "
+                        f"completion_tokens={usage.get('completion_tokens', '?')}"
+                    )
+                    return result
+                except Exception as e:
+                    if attempt == 0:
+                        logger.warning(f"[SUMMARIZER] 调用总结模型失败(第1次): {e}, 15秒后重试...")
+                        import asyncio
+                        await asyncio.sleep(15)
+                    else:
+                        logger.error(f"[SUMMARIZER] 调用总结模型失败(第2次，放弃): {e}")
+                        return None
     
     # ==================== 轮总 ====================
     
@@ -217,14 +292,14 @@ class MultiLevelSummarizer:
         """兼容旧接口：获取最近的轮总"""
         return await self._get_latest_active_round_summary()
     
-    async def _get_global_messages(self, since_summary: bool = True) -> list:
+    async def _get_global_messages(self, since_summary: bool = True, max_messages_override: int = None) -> list:
         """从messages表+unified_messages表(operit来源)合并拉取，覆盖技术模式期间的对话"""
         db = await get_db()
         try:
             time_val = None
             if since_summary:
                 cursor = await db.execute(
-                    "SELECT created_at FROM summaries WHERE tag = 'round' ORDER BY created_at DESC LIMIT 1"
+                    "SELECT created_at FROM summaries WHERE tag = 'round' AND is_active = 1 ORDER BY created_at DESC LIMIT 1"
                 )
                 row = await cursor.fetchone()
                 if row:
@@ -264,7 +339,8 @@ class MultiLevelSummarizer:
                     merged.append(r)
             merged.sort(key=lambda x: str(x.get("created_at", "")))
 
-            return merged[-self.max_context_messages:]
+            limit = max_messages_override if max_messages_override else self.max_context_messages
+            return merged[-limit:]
         finally:
             await db.close()
 
@@ -272,7 +348,7 @@ class MultiLevelSummarizer:
         """生成轮总�����������������������������兼容旧接口名）"""
         return await self.generate_round_summary()
     
-    async def generate_round_summary(self) -> str:
+    async def generate_round_summary(self, max_messages_override: int = None) -> str:
         """生成一条轮总"""
         if self._round_lock.locked():
             logger.warning("[SUMMARIZER] 另一轮总正在生成中，跳过本次触发以防止幽灵重复！")
@@ -302,14 +378,14 @@ class MultiLevelSummarizer:
             # --- 去重守卫结束 ---
             
             previous_summary = await self._get_latest_active_round_summary()
-            messages = await self._get_global_messages(since_summary=True)
+            messages = await self._get_global_messages(since_summary=True, max_messages_override=max_messages_override)
         
         if not messages and previous_summary:
             logger.info("[SUMMARIZER] 无新消息，返回上次轮总")
             return previous_summary
         
         if not messages and not previous_summary:
-            messages = await self._get_global_messages(since_summary=False)
+            messages = await self._get_global_messages(since_summary=False, max_messages_override=max_messages_override)
             if not messages:
                 logger.info("[SUMMARIZER] 数据库中无消息，返回空摘要")
                 return self._empty_summary()
@@ -340,8 +416,8 @@ class MultiLevelSummarizer:
                             elif isinstance(part, str):
                                 text_parts.append(part)
                         content = ' '.join(text_parts)
-                except (json.JSONDecodeError, TypeError):
-                    pass  # 不是JSON，保持原样
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.debug(f"[SUMMARIZER] 解析多模态内容非 JSON 格式: {e}")
             
             # 处理attachment标签 -> [附件:文件名]
             import re
@@ -375,7 +451,7 @@ class MultiLevelSummarizer:
             user_parts.append(f"上轮总结：{clean_prev}\n")
         user_parts.append(f"本轮消息（{len(messages)}条）：\n")
         user_parts.append("\n".join(formatted_messages))
-        user_parts.append("\n请严格按[正文][话题标签][情绪效价][情绪强度][记忆锚点][任务状态]六字段格式输出，正文按【日常】【技术】【学习】分段，只输出涉及的类别。")
+        user_parts.append("\n请严格按[正文][情绪效价][情绪强度][记忆锚点][任务状态]五字段格式输出，正文按【日常】【技术】【学习】分段，只输出涉及的类别。")
         
         config = LEVEL_CONFIG['round']
         summary = await self._call_llm(config['prompt'], "\n".join(user_parts), config['max_tokens'])
@@ -413,7 +489,8 @@ class MultiLevelSummarizer:
             try:
                 valence = float(val_match.group(1))
                 valence = max(-1, min(1, valence))  # clamp to [-1, 1]
-            except: pass
+            except Exception as e:
+                logger.debug(f"[SUMMARIZER] 情绪强度 float 转换失败: {e}")
         
         # 解析[情绪强度]/[arousal]
         aro_match = re.search(r'\[(?:情绪强度|arousal)\]\s*([\d.]+)', summary)
@@ -421,7 +498,8 @@ class MultiLevelSummarizer:
             try:
                 arousal = float(aro_match.group(1))
                 arousal = max(0, min(1, arousal))  # clamp to [0, 1]
-            except: pass
+            except Exception as e:
+                logger.debug(f"[SUMMARIZER] arousal float 转换失败: {e}")
         
         # 解析[记忆锚点]/[anchor]
         anc_match = re.search(r'\[(?:记忆锚点|anchor)\]\s*(.+?)(?=\n|$)', summary)
@@ -476,8 +554,8 @@ class MultiLevelSummarizer:
     
     # ==================== 轮总总（round_rollup） ====================
     
-    ROLLUP_THRESHOLD = 8   # 活跃轮总超过此数时触发压缩
-    ROLLUP_BATCH = 8       # 每次压缩最老的N条
+    ROLLUP_THRESHOLD = 4   # 活跃轮总超过此数时触发压缩
+    ROLLUP_BATCH = 4       # 每次压缩最老的N条
     
     async def _maybe_rollup_rounds(self):
         """检查活跃轮总数量，超过阈值时压缩最老的一批"""
@@ -597,7 +675,7 @@ class MultiLevelSummarizer:
         lines.append("\n请用200字以内总结今天的全部事实。")
         
         config = LEVEL_CONFIG['daily']
-        summary = await self._call_llm(config['prompt'], "\n".join(lines), config['max_tokens'])
+        summary = await self._call_llm(config['prompt'], "\n".join(lines), config['max_tokens'], timeout=180.0)
         
         if not summary:
             logger.error(f"[SUMMARIZER] 日总生成失败: {target_date}")
@@ -658,8 +736,8 @@ class MultiLevelSummarizer:
             cursor = await db.execute(
                 """SELECT id, content, created_at FROM summaries
                    WHERE tag = 'daily' AND is_active = 1
-                   AND date(created_at, '+8 hours') BETWEEN ? AND ?
-                   ORDER BY created_at ASC""",
+                   AND date(COALESCE(period_start, created_at)) BETWEEN ? AND ?
+                   ORDER BY COALESCE(period_start, created_at) ASC""",
                 (week_start_date, week_end_date)
             )
             daily_summaries = await cursor.fetchall()
@@ -680,7 +758,7 @@ class MultiLevelSummarizer:
         lines.append("\n请用300字以内总结本周的全部事实。")
         
         config = LEVEL_CONFIG['weekly']
-        summary = await self._call_llm(config['prompt'], "\n".join(lines), config['max_tokens'])
+        summary = await self._call_llm(config['prompt'], "\n".join(lines), config['max_tokens'], timeout=180.0)
         
         if not summary:
             logger.error(f"[SUMMARIZER] 周总生成失败")
@@ -733,9 +811,10 @@ class MultiLevelSummarizer:
             cursor = await db.execute(
                 """SELECT id, content, created_at FROM summaries
                    WHERE tag = 'weekly' AND is_active = 1
-                   AND date(created_at, '+8 hours') BETWEEN ? AND ?
-                   ORDER BY created_at ASC""",
-                (month_start, month_end)
+                   AND (date(COALESCE(period_end, created_at)) BETWEEN ? AND ?
+                        OR date(COALESCE(period_start, created_at)) BETWEEN ? AND ?)
+                   ORDER BY COALESCE(period_start, created_at) ASC""",
+                (month_start, month_end, month_start, month_end)
             )
             weekly_summaries = await cursor.fetchall()
         finally:
@@ -755,7 +834,7 @@ class MultiLevelSummarizer:
         lines.append("\n请用400字以内总结本月的全部事实。")
         
         config = LEVEL_CONFIG['monthly']
-        summary = await self._call_llm(config['prompt'], "\n".join(lines), config['max_tokens'])
+        summary = await self._call_llm(config['prompt'], "\n".join(lines), config['max_tokens'], timeout=180.0)
         
         if not summary:
             logger.error(f"[SUMMARIZER] 月总生成失败")
@@ -778,6 +857,12 @@ class MultiLevelSummarizer:
                 f"UPDATE summaries SET is_active = 0 WHERE id IN ({placeholders})",
                 weekly_ids
             )
+            await db.execute(
+                """UPDATE summaries SET is_active = 0 
+                   WHERE tag = 'weekly' AND is_active = 1 
+                   AND date(COALESCE(period_end, created_at)) <= ?""",
+                (month_end,)
+            )
             await db.commit()
             logger.info(f"[SUMMARIZER] 已归档 {len(weekly_ids)} 条周总")
         finally:
@@ -785,6 +870,90 @@ class MultiLevelSummarizer:
         
         return summary
     
+
+    # ==================== 季总 ====================
+    
+    async def generate_quarterly_summary(self, year_quarter: str = None) -> str:
+        """生成季总。year_quarter格式: 'YYYY-Q1' | 'YYYY-Q2' | 'YYYY-Q3' | 'YYYY-Q4'，默认当前季度"""
+        now = now_cst()
+        if not year_quarter:
+            current_q = (now.month - 1) // 3 + 1
+            year_quarter = f"{now.year}-Q{current_q}"
+            
+        try:
+            year_str, q_str = year_quarter.split('-')
+            year = int(year_str)
+            q_num = int(q_str.replace('Q', ''))
+            start_month = (q_num - 1) * 3 + 1
+            end_month = q_num * 3
+        except Exception as e:
+            logger.error(f"[SUMMARIZER] 季总格式解析失败: {year_quarter}, error={e}")
+            return None
+            
+        q_start = f"{year}-{start_month:02d}-01"
+        _, last_day = calendar.monthrange(year, end_month)
+        q_end = f"{year}-{end_month:02d}-{last_day:02d}"
+        
+        logger.info(f"[SUMMARIZER] 开始生成季总: {year_quarter} ({q_start} ~ {q_end})")
+        
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                """SELECT id, content, period_start, period_end, created_at FROM summaries
+                   WHERE tag = 'monthly' AND is_active = 1
+                   AND date(COALESCE(period_start, created_at)) BETWEEN ? AND ?
+                   ORDER BY COALESCE(period_start, created_at) ASC""",
+                (q_start, q_end)
+            )
+            monthly_summaries = await cursor.fetchall()
+        finally:
+            await db.close()
+            
+        if not monthly_summaries:
+            logger.info(f"[SUMMARIZER] {year_quarter} 无活跃月总，跳过季总生成")
+            return None
+            
+        monthly_summaries = [dict(r) for r in monthly_summaries]
+        logger.info(f"[SUMMARIZER] 找到 {len(monthly_summaries)} 条活跃月总")
+        
+        lines = [f"季度: {year_quarter} ({q_start} ~ {q_end})"]
+        lines.append(f"本季月总（{len(monthly_summaries)}条）：")
+        for ms in monthly_summaries:
+            m_tag = ms.get('period_start', ms['created_at'])[:7]
+            lines.append(f"[{m_tag}月总] {ms['content']}")
+        lines.append("\n请用600-800字总结本季度的宏观核心事实与里程碑。")
+        
+        config = LEVEL_CONFIG['quarterly']
+        summary = await self._call_llm(config['prompt'], "\n".join(lines), config['max_tokens'], timeout=180.0)
+        
+        if not summary:
+            logger.error(f"[SUMMARIZER] 季总生成失败")
+            return None
+            
+        await self._save_summary(
+            tag='quarterly',
+            level='quarterly',
+            content=summary,
+            period_start=f"{q_start} 00:00:00",
+            period_end=f"{q_end} 23:59:59"
+        )
+        
+        # 归档该季度已总结的月总（设置 is_active = 0）
+        db = await get_db()
+        try:
+            monthly_ids = [ms['id'] for ms in monthly_summaries]
+            placeholders = ','.join(['?'] * len(monthly_ids))
+            await db.execute(
+                f"UPDATE summaries SET is_active = 0 WHERE id IN ({placeholders})",
+                monthly_ids
+            )
+            await db.commit()
+            logger.info(f"[SUMMARIZER] 已归档 {len(monthly_ids)} 条月总")
+        finally:
+            await db.close()
+            
+        return summary
+
     # ==================== 上下文组装 ====================
     
     async def get_context_summary(self) -> str:
@@ -800,6 +969,15 @@ class MultiLevelSummarizer:
         try:
             parts = []
             
+            # 季总：所有活跃的（每季度一条，覆盖更长周期的宏观记忆）
+            cursor = await db.execute(
+                "SELECT content, created_at FROM summaries WHERE tag = 'quarterly' AND is_active = 1 ORDER BY created_at ASC"
+            )
+            rows = await cursor.fetchall()
+            if rows:
+                quarterly_parts = [r['content'] for r in rows]
+                parts.append(f"[宏观记忆·季度] {'；'.join(quarterly_parts)}")
+
             # 月总：所有活跃的（每月一条，覆盖长期记忆）
             cursor = await db.execute(
                 "SELECT content, created_at FROM summaries WHERE tag = 'monthly' AND is_active = 1 ORDER BY created_at ASC"
@@ -923,34 +1101,52 @@ class MultiLevelSummarizer:
 
 # ==================== 定时任务 ====================
 
-async def run_daily_cron():
+async def run_daily_cron(target_date: str = None):
     """每天23:59触发的定时任务：生成日总"""
     summarizer = get_summarizer()
-    today = today_cst_str()
-    logger.info(f"[CRON] 触发日总生成: {today}")
-    result = await summarizer.generate_daily_summary(today)
+    if not target_date:
+        target_date = today_cst_str()
+    logger.info(f"[CRON] 触发日总生成: {target_date}")
+    result = await summarizer.generate_daily_summary(target_date)
     if result:
         logger.info(f"[CRON] 日总生成成功: {len(result)} 字符")
     else:
         logger.warning(f"[CRON] 日总生成跳过或失败")
 
 
-async def run_weekly_cron():
+async def run_weekly_cron(target_date: str = None):
     """每周日23:59触发的定时任务：生成周总"""
     summarizer = get_summarizer()
-    today = today_cst_str()
-    logger.info(f"[CRON] 触发周总生成")
-    result = await summarizer.generate_weekly_summary(today)
+    if not target_date:
+        target_date = today_cst_str()
+    logger.info(f"[CRON] 触发周总生成: {target_date}")
+    result = await summarizer.generate_weekly_summary(target_date)
     if result:
         logger.info(f"[CRON] 周总生成成功: {len(result)} 字符")
 
 
-async def run_monthly_cron():
+
+async def run_quarterly_cron(target_quarter: str = None):
+    """季度末23:59触发的定时任务：生成季总"""
+    summarizer = get_summarizer()
+    if not target_quarter:
+        now = now_cst()
+        current_q = (now.month - 1) // 3 + 1
+        target_quarter = f"{now.year}-Q{current_q}"
+    logger.info(f"[CRON] 触发季总生成: {target_quarter}")
+    result = await summarizer.generate_quarterly_summary(target_quarter)
+    if result:
+        logger.info(f"[CRON] 季总生成成功: {len(result)} 字符")
+    else:
+        logger.warning(f"[CRON] 季总生成跳过或失败")
+
+async def run_monthly_cron(target_month: str = None):
     """每月最后一天23:59触发的定时任务：生成月总"""
     summarizer = get_summarizer()
-    year_month = (now_cst()).strftime('%Y-%m')
-    logger.info(f"[CRON] 触发月总生成: {year_month}")
-    result = await summarizer.generate_monthly_summary(year_month)
+    if not target_month:
+        target_month = (now_cst()).strftime('%Y-%m')
+    logger.info(f"[CRON] 触发月总生成: {target_month}")
+    result = await summarizer.generate_monthly_summary(target_month)
     if result:
         logger.info(f"[CRON] 月总生成成功: {len(result)} 字符")
 

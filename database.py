@@ -50,8 +50,8 @@ async def init_db():
         for col, col_def in [('unhealthy_since', 'TEXT'), ('fail_count', 'INTEGER DEFAULT 0')]:
             try:
                 await db.execute(f'ALTER TABLE providers ADD COLUMN {col} {col_def}')
-            except Exception:
-                pass  # 字段已存在则忽略
+            except Exception as e:
+                import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")  # 字段已存在则忽略
 
         # ==================== 配置表 ====================
         await db.execute('''
@@ -63,7 +63,7 @@ async def init_db():
             )
         ''')
 
-        # ==================== 提示词注入规则表 ====================
+                # ==================== 饮食与体重记录表 ====================\n        await db.execute('''\n            CREATE TABLE IF NOT EXISTS diet_log (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                date TEXT NOT NULL DEFAULT (date('now', '+8 hours')),\n                time TEXT NOT NULL DEFAULT (strftime('%H:%M', 'now', '+8 hours')),\n                meal_type TEXT NOT NULL,\n                food_name TEXT NOT NULL,\n                portion TEXT,\n                calories INTEGER DEFAULT 0,\n                note TEXT DEFAULT '',\n                created_at TEXT DEFAULT (datetime('now', '+8 hours'))\n            )\n        ''')\n        await db.execute('CREATE INDEX IF NOT EXISTS idx_diet_date ON diet_log(date)')\n\n        await db.execute('''\n            CREATE TABLE IF NOT EXISTS weight_log (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                date TEXT NOT NULL UNIQUE DEFAULT (date('now', '+8 hours')),\n                weight REAL NOT NULL,\n                note TEXT DEFAULT '',\n                created_at TEXT DEFAULT (datetime('now', '+8 hours'))\n            )\n        ''')\n        await db.execute('CREATE INDEX IF NOT EXISTS idx_weight_date ON weight_log(date)')\n\n# ==================== 提示词注入规则表 ====================
         await db.execute('''
             CREATE TABLE IF NOT EXISTS injection_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,8 +150,8 @@ async def init_db():
         # Migration: summaries表添加tag字段
         try:
             await db.execute("ALTER TABLE summaries ADD COLUMN tag TEXT DEFAULT ''")
-        except Exception:
-            pass  # 字段已存在则忽略
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")  # 字段已存在则忽略
 
         # ==================== 记忆表（便签墙） ====================
         await db.execute('''
@@ -178,8 +178,8 @@ async def init_db():
         # Migration: memories 表添加 threshold_hours 列（状态便签用）
         try:
             await db.execute('ALTER TABLE memories ADD COLUMN threshold_hours INTEGER DEFAULT 24')
-        except Exception:
-            pass  # 列已存在则忽略
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")  # 列已存在则忽略
             
         # ==================== 记忆碎片表 (Dual Track Recall) ====================
         await db.execute('''
@@ -204,14 +204,14 @@ async def init_db():
         # Migration: memories 表添加 aliases 列（状态便签别名）
         try:
             await db.execute("ALTER TABLE memories ADD COLUMN aliases TEXT DEFAULT ''")
-        except Exception:
-            pass  # 列已存在则忽略
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")  # 列已存在则忽略
             
         # Migration: memory_fragments 表添加 is_suspect 列
         try:
             await db.execute("ALTER TABLE memory_fragments ADD COLUMN is_suspect INTEGER DEFAULT 0")
-        except Exception:
-            pass
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
 
         # 初始化状态便签种子数据
         status_seeds = [
@@ -252,8 +252,36 @@ async def init_db():
         # conversations 表添加 window_id 列（如果不存在）
         try:
             await db.execute('ALTER TABLE conversations ADD COLUMN window_id INTEGER REFERENCES windows(id)')
-        except Exception:
-            pass  # 列已存在则忽略
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")  # 列已存在则忽略
+
+        # ==================== 主动发消息日志表 ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS proactive_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,         -- 'started', 'decision', 'sent', 'blocked'
+                wait_minutes REAL,
+                reason TEXT,                      -- 'night_silence', 'too_soon', 'locked', 'ai_skipped'
+                summary TEXT,                     -- 发送的内容摘要
+                created_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+
+        # ==================== 可执行标签结果待注入表 ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS pending_exec_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT,
+                service TEXT NOT NULL,
+                method TEXT NOT NULL,
+                payload TEXT,
+                result_text TEXT NOT NULL,
+                is_error INTEGER DEFAULT 0,
+                consumed INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_exec_pending ON pending_exec_results(conversation_id, consumed)')
 
         # ==================== 索引 ====================
         await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id)')

@@ -63,9 +63,9 @@ class ProviderManager:
             if not providers:
                 raise Exception("没有可用的供应商")
 
-            # 通配：返回优先级最高的健康供应商
-            logger.info(f"模型 {model} 无精确匹配，使用默认供应商: {providers[0]['name']}")
-            return providers[0]
+            # 无精确匹配，拒绝转发（防止未知模型名薅羊毛）
+            logger.warning(f"[AUTH] 模型 {model} 无精确匹配，拒绝转发")
+            raise Exception(f"模型 {model} 没有匹配的供应商，拒绝转发")
         finally:
             await db.close()
 
@@ -301,7 +301,7 @@ class ProviderManager:
                     result.append(p)
                     logger.info(
                         f"供应商 {p['name']} 冷却期已过 "
-                        f"({cooldown}s, fail_count={p.get('fail_count', 0)})，可重新尝试"
+                        f"({cooldown}s, fail_count={p.get('fail_count', 0)})，可重新尝���"
                     )
             return result
         finally:

@@ -1,115 +1,0 @@
-import os
-import re
-
-path = os.path.expanduser('~/caeron-gateway/injection.py')
-with open(path, 'r', encoding='utf-8') as f:
-    content = f.read()
-
-new_method = '''    async def _inject_round_summaries(self, messages: list[dict], request_info: dict):
-        """å¤šçº§è®°å¿†æ³¨å…¥ï¼šæœˆæ€»+å‘¨æ€»+æ—¥æ€»+è½®æ€»ï¼ŒæŒ‰æ´»è·ƒçŠ¶æ€è‡ªåŠ¨åˆ‡æ¢ï¼Œå¹¶è£å‰ªå·²è¢«æ€»ç»“è¦†ç›–çš„åŸå§‹æ¶ˆæ¯"""
-        db = await get_db()
-        try:
-            parts = []
-            tag_counts = {}
-            has_round_summaries = False
-            today = today_cst_str()
-
-            # 1. æœˆæ€»ï¼šåªå–æœ€æ–° 2 æ¡
-            cursor = await db.execute("SELECT content, created_at FROM summaries WHERE tag = 'monthly' AND is_active = 1 ORDER BY created_at DESC LIMIT 2")
-            rows = list(reversed(await cursor.fetchall()))
-            tag_counts['monthly'] = len(rows)
-            for r in rows:
-                r = dict(r)
-                parts.append(f"- [æœˆæ€»] [{r['created_at']}] {r['content']}")
-
-            # 2. å‘¨æ€»ï¼šåªå–æœ€æ–° 1 æ¡
-            cursor = await db.execute("SELECT content, created_at FROM summaries WHERE tag = 'weekly' AND is_active = 1 ORDER BY created_at DESC LIMIT 1")
-            rows = await cursor.fetchall()
-            tag_counts['weekly'] = len(rows)
-            latest_weekly_time = None
-            if rows:
-                latest_weekly_time = dict(rows[0])['created_at']
-                for r in rows:
-                    r = dict(r)
-                    parts.append(f"- [å‘¨æ€»] [{r['created_at']}] {r['content']}")
-
-            # 3. æ—¥æ€»ï¼šæ³¨å…¥å‘¨æ€»ä¹‹åçš„æ—¥æ€»ï¼Œä¸Šé™ 7 æ¡
-            MAX_DAILY_INJECT = 7
-            if latest_weekly_time:
-                cursor = await db.execute(
-                    """SELECT content, created_at FROM summaries
-                       WHERE tag = 'daily' AND is_active = 1
-                       AND created_at > ?
-                       ORDER BY created_at ASC
-                       LIMIT ?""",
-                    (latest_weekly_time, MAX_DAILY_INJECT)
-                )
-            else:
-                cursor = await db.execute(
-                    """SELECT content, created_at FROM summaries
-                       WHERE tag = 'daily' AND is_active = 1
-                       ORDER BY created_at DESC
-                       LIMIT 3"""
-                )
-            rows = await cursor.fetchall()
-            if not latest_weekly_time:
-                rows = list(reversed(rows))
-            tag_counts['daily'] = len(rows)
-            for r in rows:
-                r = dict(r)
-                parts.append(f"- [æ—¥æ€»] [{r['created_at']}] {r['content']}")
-
-            # 4. è½®æ€»æ€»ï¼šå½“å¤©æœ€æ–°çš„ 8 æ¡
-            cursor = await db.execute(
-                """SELECT content, created_at FROM summaries
-                   WHERE tag = 'round_rollup' AND is_active = 1
-                   AND date(created_at) = ?
-                   ORDER BY created_at DESC LIMIT 8""",
-                (today,)
-            )
-            rollup_rows = list(reversed(await cursor.fetchall()))
-            tag_counts['round_rollup'] = len(rollup_rows)
-            if rollup_rows:
-                has_round_summaries = True
-                for idx, r in enumerate(rollup_rows, 1):
-                    r = dict(r)
-                    parts.append(f"- [è½®æ€»æ€» #{idx}/{len(rollup_rows)}] [{r['created_at']}] {r['content']}")
-            
-            # 5. è½®æ€»ï¼šå½“å¤©æœ€æ–°çš„ 8 æ¡
-            MAX_ROUND_INJECT = 8
-            cursor = await db.execute(
-                """SELECT content, created_at FROM summaries
-                   WHERE tag = 'round' AND is_active = 1
-                   AND date(created_at) = ?
-                   ORDER BY created_at DESC
-                   LIMIT ?""",
-                (today, MAX_ROUND_INJECT)
-            )
-            rows = list(reversed(await cursor.fetchall()))
-            tag_counts['round'] = len(rows)
-            if rows:
-                has_round_summaries = True
-                total = len(rows)
-                for idx, r in enumerate(rows, 1):
-                    r = dict(r)
-                    parts.append(f"- [è½®æ€» #{idx}/{total}] [{r['created_at']}] {r['content']}")
-
-            unsummarized_count = 0
-            if has_round_summaries:
-          -˜İ\œÛÜˆH]ØZ]‹™^Xİ]J”ÑSPÕ˜[YH”“ÓHÛÛ™šYÈÒT‘HYÈH	Û[ÛIÈS‘\×ØXİ]™HHHÔ‘Tˆ–HÜ™X]YØ]TĞÈSRUˆŠBˆ›İÜÈH\İ
-™]™\œÙY
-]ØZ]İ\œÛÜ‹™™]Ú[
-
-JJBˆY×ØÛİ[ÖÉÛ[ÛI×HH[Š›İÜÊBˆ›Üˆˆ[ˆ›İÜÎ‚ˆˆHXİ
-ŠBˆ\Ë˜\[™
-ˆ‹Hù§"9 .×HŞÜ–ÉØÜ™X]YØ]	×_WHÜ–ÉØÛÛ[	×_HŠB‚ˆ[œİ[[X\š^™YØÛİ[HˆYˆ\×Ü›İ[™Üİ[[X\šY\Î‚ˆİ\œÛÜˆH]ØZ]‹™^Xİ]J”ÑSPÕ˜[YH”“ÓHÛÛ™šYÈÒT‘HÙ^HH	×Û\Ù×ØÛİ[\‰ÈŠBˆ›İÈH]ØZ]İ\œÛÜ‹™™]ÚÛ™J
-Bˆ[œİ[[X\š^™YØÛİ[H[
-›İÖÉİ˜[YI×JHYˆ›İÈ[ÙH‚ˆÙÙÙ\‹š[™›Êˆ–ú+¬9oá¹¬ê9aiWH9îçú+¨NˆİY×ØÛİ[ßHŠB‚ˆš[˜[N‚ˆ]ØZ]‹˜ÛÜÙJ
-IÉÉÂ‚œ]\›ˆH‰È\Ş[˜ÈYˆÚ[š™XİÜ›İ[™Üİ[[X\šY\×
-Ù[‹Y\ÜØYÙ\Îˆ\İÙXİK™\]Y\İÚ[™›ÎˆXİ
-N‹ŠÙš[˜[N—ÊØ]ØZ]—˜ÛÜÙW
-
-IÂ˜ÛÛ[H™KœİXŠ]\›‹™]×ÛY]ÙÛÛ[›YÜÏ\™K‘ÕS
-B‚Ú]Ü[Š]	İÉË[˜ÛÙ[™ÏIİ]‹N	ÊH\È‚ˆ‹Üš]JÛÛ[
-Bœš[
-”]ÚY[š™Xİ[Û‹œHİXØÙ\ÜÙ[HŠB

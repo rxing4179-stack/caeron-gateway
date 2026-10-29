@@ -27,6 +27,7 @@ DEFAULT_CONFIG = {
     'feature_qq': ('1', 'QQ桥接功能'),
     'feature_health': ('1', '小米运动健康数据获取'),
     'feature_music': ('1', '网易云音乐状态获取'),
+    'feature_simlife': ('1', '模拟机生模块（SimLife 内心状态注入 + exec 命令协议）'),
 }
 
 

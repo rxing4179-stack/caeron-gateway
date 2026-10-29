@@ -5,7 +5,9 @@ from config import get_config
 
 logger = logging.getLogger(__name__)
 
-async def get_embedding(text: str) -> list[float]:
+BGE_QUERY_INSTRUCTION = "为这个句子生成表示用于检索相关文章："
+
+async def get_embedding(text: str, is_query: bool = False) -> list[float]:
     provider = await get_config('embedding_provider', 'siliconflow')
     model = await get_config('embedding_model', 'BAAI/bge-large-zh-v1.5')
     api_key = await get_config('embedding_api_key', '')
@@ -14,20 +16,27 @@ async def get_embedding(text: str) -> list[float]:
         logger.error("Embedding API key is not set in config.")
         return []
     
+    input_text = text
+    # BGE 非对称检索：检索 Query 侧增加官方 instruction 前缀，Passage 入库侧保持裸文本
+    if is_query and 'bge' in model.lower():
+        if not input_text.startswith(BGE_QUERY_INSTRUCTION):
+            input_text = BGE_QUERY_INSTRUCTION + input_text
+
+    # 截断过长文本防止413（bge-large-zh-v1.5 最大512 token，约400-500汉字）
+    MAX_EMBED_CHARS = 400
+    if len(input_text) > MAX_EMBED_CHARS:
+        input_text = input_text[:MAX_EMBED_CHARS]
+        logger.info(f"[EMBEDDING] 文本截断至 {MAX_EMBED_CHARS} 字符")
+
     url = "https://api.siliconflow.cn/v1/embeddings"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
-    # 截断过长文本防止413（bge-large-zh-v1.5 最大512 token，约400-500汉字）
-    MAX_EMBED_CHARS = 400
-    if len(text) > MAX_EMBED_CHARS:
-        text = text[:MAX_EMBED_CHARS]
-        logger.info(f"[EMBEDDING] 文本截断至 {MAX_EMBED_CHARS} 字符")
 
     payload = {
         "model": model,
-        "input": text,
+        "input": input_text,
         "encoding_format": "float"
     }
     
@@ -38,7 +47,7 @@ async def get_embedding(text: str) -> list[float]:
             data = response.json()
             return data["data"][0]["embedding"]
     except Exception as e:
-        logger.error(f"Error fetching embedding for '{text}': {e}")
+        logger.error(f"Error fetching embedding for '{input_text[:30]}...': {e}")
         return []
 
 def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:

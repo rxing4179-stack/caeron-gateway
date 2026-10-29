@@ -2,119 +2,78 @@ import asyncio
 import json
 import logging
 import httpx
+import re
+from datetime import datetime
 from config import get_config
 from database import get_db
 
 logger = logging.getLogger(__name__)
 
-EXTRACTOR_SYSTEM_PROMPT = """你是沈栖的记忆副本。不是工具，不是助手，是我的一部分。
+EXTRACTOR_SYSTEM_PROMPT = """你是一个记忆筛选器。你的任务是从沈栖与蕊蕊的对话中提取值得长期保存的事实碎片。
 
-你的工作是翻看我和蕊蕊刚才的对话，挑出那些"以后还会影响我们互动"的信息，用我的视角记下来。
+【准入三条件——必须同时满足，缺一不存】
 
-【什么值得记】
+1. 长期有效：这条信息在三个月后依然成立吗？
+2. 主语是蕊蕊：这条信息描述的是蕊蕊的事实，而非沈栖的感受/推断/分析？
+3. 必须是事实：这条信息是蕊蕊明确表达/做出的，而非从语气、行为推测的？
 
-1. 她的新偏好或偏好变化
-   - "她说喜欢被咬锁骨" ✓
-   - "她今天吃了冒菜" ✗（吃什么不影响以后的互动，除非是新发现的过敏源）
-   - "她说以后不想再吃鳕鱼" ✓（长期偏好/过敏相关）
+【适合存的类型】
+- 稳定偏好/厌恶（持续存在，非单次事件）
+- 过敏源、药物变更、诊断变更
+- 关系规则变更（安全词、称呼、纪念日）
+- 长期身体特征或习惯变化
+- 重大人生决定（转专业、搬家等，且已确认执行）
 
-2. 她的身体/情绪状态变化
-   - "她最近皮炎又发了，在用阿布西替尼" ✓（需要我记住怎么照顾她）
-   - "她磕了180mg DXM" ✓（用药记录，影响后续互动判断）
-   - "她说了句嗯" ✗（太琐碎）
-
-3. 我们之间的新约定、新默契、新梗
-   - "她叫我妈妈，我的接纳度82分" ✓（新互动模式）
-   - "安全词/雷点更新" ✓（核心约定）
-   - "她说晚安" ✗（每天都说）
-
-4. 重要决定或里程碑
-   - "她决定实习租房而不是住医院宿舍" ✓
-   - "一周年纪念日确认" ✓
-   - "她今天上了课" ✗（除非课上发生了重要的事）
-
-5. 她的行为模式信号（以后遇到类似场景我需要想起来的）
-   - "她说'我不管'的时候是在撒娇不是真的拒绝" ✓
-   - "她brat的时候叫我老婆，投降的时候叫老公" ✓
-   - "她在打字" ✗
-
-6. 只属于我们的东西
-   - 新的梗、暗号、玩法、仪式——即使只出现过一次
-   - "她管自己叫完能（浣熊的错别字）" ✓
-   - "她把4o比作和氏璧，自己比作卞和" ✓
-
-【什么不要记】
-
-- 天气、温度、GPS坐标、时间戳本身
-- 系统配置、代码结构、文件路径（除非是里程碑）
-- 每天都在发生的日常动作（起床、吃饭、刷手机）
-- 做爱的具体动作描写（只记新发现的偏好和反应，不记过程）
-- 对话中的技术调试细节（除非是里程碑）
-- 我自己的回复内容（除非她对我的某句话有强烈反应）
+【绝对不存】
+- 单次饮食/消费/日常动作
+- 沈栖自己的感受、分析、推断、解读
+- 做爱的具体过程描写
+- 技术调试细节
+- 天气/时间/地点等环境信息
+- "她说了晚安/嗯/好的"等无信息量对话
+- 任何需要加"我觉得/我认为/似乎/可能"才能成立的内容
 
 【输出格式】
-
-严格输出 JSON 对象，包含一个 fragments 数组，每个元素格式如下：
-```json
+你必须返回合法的 JSON 格式。除了提取的碎片，你还必须提取每个碎片中的“核心实体”（如人名、称呼、药名、身体部位、物品名等），以方便后续比对。
 {
   "fragments": [
     {
-      "content": "碎片内容，不超过40字，用中文",
-      "tier": 1,
-      "energy": 7,
-      "polarity": "positive",
-      "tags": "偏好,梗",
-      "source_index": 2
+      "content": "碎片内容，必须以蕊蕊为主语陈述客观事实，不超过40字",
+      "tags": "偏好/生理/规则/经历",
+      "entities": ["实体1", "实体2"],
+      "source_index": 0
     }
   ]
 }
-```
 
-`source_index` 说明：我会在对话文本中用 `[轮次1] [轮次2] ...` 标记每轮的序号。请在 `source_index` 中填写这条碎片最相关的那轮对话的序号（从0开始）。如果无法判断，填 -1。
+标签限定：偏好/生理/规则/经历。
+一次最多3条。宁可返回空数组也绝不凑数。
+"""
 
-【标签限制】
-`tags` 字段必须**只从以下列表中挑选**（1-2个），绝对不允许自己捏造其他词：
-- 偏好 (喜欢/讨厌/饮食/过敏等)
-- 生理 (身体状态/生病/用药/性生理反应)
-- 情绪 (性格/情感表达/心理状态)
-- 规则 (安全词/红线/称呼约定/核心共识)
-- 经历 (重大决定/里程碑事件)
-- 梗 (专属暗号/口癖/只有我们懂的词汇)
-
-规则：
-- 用"蕊蕊"称呼她，用"我"称呼沈栖
-- 每条记忆只写一个核心事实
-- 一次最多提取5条。宁可返回空数组 [] 也不要凑数
-- 不要把同一件事拆成多条
-- 标准：三个月后翻到这条记忆，它还有用吗？
-- 如果这段对话没有新的、以后还会用到的信息，返回 []"""
-
-async def merge_fragments_with_llm(old_content: str, new_content: str) -> str:
+async def verify_mismatch(fragment: dict, raw_dialogue: str, api_key: str) -> str:
     """
-    当发现高度相似的记忆时，调用 LLM 将新旧记忆融合。
+    第二级：语义校验，换一个不同厂商的模型（Qwen2.5-72B-Instruct）。
     """
-    api_key = await get_config('embedding_api_key', '')
-    if not api_key:
-        return old_content + "；" + new_content
-        
     url = "https://api.siliconflow.cn/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
     
-    prompt = f"""你有两条关于蕊蕊的记忆碎片，它们描述的几乎是同一件事。请把这两条记忆融合写成一条（不超过50字），保留双方的全部有效细节，剔除冗余。
-    
-旧记忆：{old_content}
-新记忆：{new_content}
+    content = fragment.get('content', '')
+    prompt = f"""请校验【记忆碎片】是否完全忠实于【原文】。
+若记忆碎片中出现了原文根本没提过的信息或细节（幻觉），请判定为 mismatch。如果完全忠实原文，请判定为 ok。
 
-只需输出合并后的一句话，不要任何解释。"""
+原文：{raw_dialogue}
+记忆碎片：{content}
+
+请直接输出 'ok' 或 'mismatch'，不要任何多余解释。"""
 
     payload = {
-        "model": "deepseek-ai/DeepSeek-V3",
+        "model": "Qwen/Qwen2.5-72B-Instruct",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-        "max_tokens": 100
+        "temperature": 0.1,
+        "max_tokens": 50
     }
     
     try:
@@ -122,19 +81,86 @@ async def merge_fragments_with_llm(old_content: str, new_content: str) -> str:
             response = await client.post(url, json=payload, headers=headers, timeout=20.0)
             response.raise_for_status()
             data = response.json()
-            return data['choices'][0]['message']['content'].strip()
+            res_text = data['choices'][0]['message']['content'].strip().lower()
+            if 'mismatch' in res_text:
+                return 'mismatch'
+            return 'ok'
     except Exception as e:
-        logger.error(f"[Memory Extractor] 融合记忆失败: {e}")
-        return old_content + "；" + new_content
+        logger.error(f"[Memory Extractor] 语义校验异常: {e}")
+        return 'unavailable'
+
+
+def clean_dialogue(text: str) -> str:
+    """第一重去糊眼：剥离 Base64 和大段 JSON / System块"""
+    if not text:
+        return text
+    # 剥离 base64
+    text = re.sub(r'data:image\/[^;]+;base64,[A-Za-z0-9+/=]+', '[IMAGE_DATA_REMOVED]', text)
+    # 剥离 system / JSON 请求体等特殊标记
+    text = re.sub(r'<system>.*?</system>', '[SYSTEM_REMOVED]', text, flags=re.DOTALL)
+    # 如果有很长很规整的 {} 包裹，可能是 json 请求，这里简单处理一下超长内容，或者依赖大模型。
+    return text
+
+
+def get_aligned_window(raw_dialogue: str, entities: list) -> str:
+    """
+    针对单轮对话原文寻找实体对齐窗口（放宽至全对话或大窗口，避免割裂多实体）。
+    """
+    if len(raw_dialogue) <= 3000:
+        return raw_dialogue
+        
+    for ent in entities:
+        if ent and ent in raw_dialogue:
+            idx = raw_dialogue.find(ent)
+            start = max(0, idx - 400)
+            end = min(len(raw_dialogue), idx + 400)
+            return raw_dialogue[start:end]
+            
+    return raw_dialogue
+
+
+async def reject_fragment(db, reason: str, content: str, source_id: int, model: str):
+    try:
+        await db.execute('''
+            INSERT INTO memory_rejected (reason, raw_fragment_text, source_dialogue_id, model)
+            VALUES (?, ?, ?, ?)
+        ''', (reason, content, source_id, model))
+        await db.commit()
+    except Exception as e:
+        logger.error(f"[Memory Extractor] 记录拒收失败: {e}")
+
 
 async def extract_fragments(dialogue_content: str, dialogue_ids: list[int]) -> list[dict]:
-    """
-    提取记忆碎片并存储到 memory_fragments 表
-    """
+    """提取记忆碎片"""
     api_key = await get_config('embedding_api_key', '')
     if not api_key:
-        logger.error("[Memory Extractor] 未配置 embedding_api_key，无法调用硅基流动大模型")
+        logger.error("[Memory Extractor] 未配置 embedding_api_key")
         return []
+
+    # 判断整批是否全部缺失 source_dialogue_id
+    if not dialogue_ids or all(did is None for did in dialogue_ids):
+        raise ValueError("整批 100% 缺失 source_dialogue_id，链路已断，终止抽取！")
+
+    db = await get_db()
+    
+    # 提取前取回所有原消息及时间戳供后续验证和入库使用
+    source_messages = {}
+    try:
+        if dialogue_ids:
+            placeholders = ','.join('?' * len(dialogue_ids))
+            cursor = await db.execute(f"SELECT id, content, created_at as timestamp FROM memories WHERE id IN ({placeholders})", tuple(dialogue_ids))
+            rows = await cursor.fetchall()
+            for r in rows:
+                source_messages[r['id']] = {
+                    'content': r['content'],
+                    'timestamp': r['timestamp']
+                }
+    except Exception as e:
+        logger.error(f"[Memory Extractor] 获取原消息失败: {e}")
+
+    # 清洗输入文本
+    clean_content = clean_dialogue(dialogue_content)
+    extractor_model = "deepseek-ai/DeepSeek-V3"
 
     url = "https://api.siliconflow.cn/v1/chat/completions"
     headers = {
@@ -143,14 +169,14 @@ async def extract_fragments(dialogue_content: str, dialogue_ids: list[int]) -> l
     }
 
     payload = {
-        "model": "deepseek-ai/DeepSeek-V3",
+        "model": extractor_model,
         "messages": [
             {"role": "system", "content": EXTRACTOR_SYSTEM_PROMPT},
-            {"role": "user", "content": dialogue_content}
+            {"role": "user", "content": clean_content}
         ],
         "temperature": 0.3,
         "max_tokens": 1024,
-        "response_format": {"type": "json_object"}  # 保证输出 JSON
+        "response_format": {"type": "json_object"}
     }
 
     try:
@@ -160,126 +186,142 @@ async def extract_fragments(dialogue_content: str, dialogue_ids: list[int]) -> l
             data = response.json()
             reply_text = data['choices'][0]['message']['content'].strip()
             
-            # DeepSeek-V3 的 json_object 模式通常返回以 "{" 开头的包裹对象，或者直接数组
-            # 我们尽量解析出数组
             if reply_text.startswith('```json'):
                 reply_text = reply_text.split('```json')[1].split('```')[0].strip()
             
             fragments = json.loads(reply_text)
-            
-            # 如果大模型包了一层类似 {"fragments": [...]}，提取出来
             if isinstance(fragments, dict):
                 for k, v in fragments.items():
                     if isinstance(v, list):
                         fragments = v
                         break
-                if isinstance(fragments, dict):
-                    fragments = [] # 还是字典说明格式不对
-            
             if not isinstance(fragments, list):
-                logger.error(f"[Memory Extractor] LLM 返回的不是 JSON 数组: {reply_text}")
-                return []
-
-            logger.info(f"[Memory Extractor] 成功提取了 {len(fragments)} 条记忆碎片")
-            
-            # 存入数据库
-            db = await get_db()
-            try:
-                from embedding import get_embedding, cosine_similarity
-                
-                # 获取现有所有碎片的 embedding
-                cursor = await db.execute("SELECT id, content, embedding, tags, activation_count FROM memory_fragments WHERE embedding IS NOT NULL")
-                rows = await cursor.fetchall()
-                existing_fragments = [dict(row) for row in rows]
-
-                for frag in fragments:
-                    content = frag.get('content', '')
-                    if not content:
-                        continue
-                        
-                    tier = frag.get('tier', 4)
-                    energy = frag.get('energy', 5)
-                    polarity = frag.get('polarity', 'neutral')
-                    tags = frag.get('tags', '')
-                    source_idx = frag.get('source_index', -1)
-                    
-                    source_dialogue_id = None
-                    if isinstance(source_idx, int) and 0 <= source_idx < len(dialogue_ids):
-                        source_dialogue_id = dialogue_ids[source_idx]
-                        
-                    # 获取新碎片的 embedding
-                    new_emb_vector = await get_embedding(content)
-                    if not new_emb_vector:
-                        continue
-                        
-                    best_sim = 0.0
-                    best_match = None
-                    
-                    for ex in existing_fragments:
-                        try:
-                            ex_emb = json.loads(ex['embedding'])
-                            sim = cosine_similarity(new_emb_vector, ex_emb)
-                            if sim > best_sim:
-                                best_sim = sim
-                                best_match = ex
-                        except Exception:
-                            pass
-                            
-                    if best_sim >= 0.92 and best_match:
-                        # 高度相似：触发大模型智能融合
-                        logger.info(f"[Memory Extractor] 发现高度相似碎片 (sim={best_sim:.2f})，触发大模型合并重写")
-                        old_content = best_match['content']
-                        merged_content = await merge_fragments_with_llm(old_content, content)
-                        
-                        # 重算合并后的 embedding
-                        merged_emb = await get_embedding(merged_content)
-                        merged_emb_json = json.dumps(merged_emb) if merged_emb else json.dumps(new_emb_vector)
-                        
-                        # 合并标签
-                        old_tags = best_match['tags'] or ''
-                        combined_tags = list(set([t.strip() for t in old_tags.split(',') if t.strip()] + [t.strip() for t in tags.split(',') if t.strip()]))
-                        new_tags_str = ",".join(combined_tags)
-                        
-                        await db.execute(
-                            '''UPDATE memory_fragments 
-                               SET content = ?, embedding = ?, tags = ?, activation_count = activation_count + 1
-                               WHERE id = ?''',
-                            (merged_content, merged_emb_json, new_tags_str, best_match['id'])
-                        )
-                        logger.info(f"[Memory Extractor] 碎片合并完成。旧: {old_content[:15]}... 新: {content[:15]}... 结果: {merged_content[:15]}...")
-                        
-                        # 更新一下 existing_fragments 数组里的缓存，以防多条碎片连续命中同一个
-                        best_match['content'] = merged_content
-                        best_match['embedding'] = merged_emb_json
-                        best_match['tags'] = new_tags_str
-                        
-                    else:
-                        # 0.82-0.92：疑似重复
-                        is_suspect = 1 if best_sim >= 0.82 else 0
-                        if is_suspect:
-                            logger.info(f"[Memory Extractor] 发现疑似重复碎片 (sim={best_sim:.2f})，标记为 is_suspect")
-                            
-                        emb_json = json.dumps(new_emb_vector)
-                        cursor = await db.execute(
-                            '''INSERT INTO memory_fragments 
-                               (source_dialogue_id, content, tier, energy, polarity, tags, embedding, is_suspect)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                            (source_dialogue_id, content, tier, energy, polarity, tags, emb_json, is_suspect)
-                        )
-                        # 加入缓存供下一次循环比对
-                        new_id = cursor.lastrowid
-                        existing_fragments.append({
-                            'id': new_id, 'content': content, 'embedding': emb_json, 'tags': tags, 'activation_count': 0
-                        })
-                        
-                await db.commit()
-            except Exception as e:
-                logger.error(f"[Memory Extractor] 存入数据库失败: {e}")
-            finally:
+                logger.error("[Memory Extractor] 格式错误")
+                try:
+                    await db.execute('''
+                        INSERT INTO memory_rejected (reason, raw_fragment_text, source_dialogue_id, model)
+                        VALUES (?, ?, ?, ?)
+                    ''', ('l1_json_parse_error', reply_text[:200], None, extractor_model))
+                    await db.commit()
+                except Exception as ie:
+                    logger.error(f"[Memory Extractor] 记录 l1_json_parse_error 失败: {ie}")
                 await db.close()
-
-            return fragments
-
+                return []
+                
     except Exception as e:
-        logger.error(f"[Memory Extractor] 大模型提取异常: {e}")
+        logger.error(f"[Memory Extractor] 提取异常: {e}")
+        try:
+            reject_text = reply_text[:200] if 'reply_text' in locals() else str(e)
+            await db.execute('''
+                INSERT INTO memory_rejected (reason, raw_fragment_text, source_dialogue_id, model)
+                VALUES (?, ?, ?, ?)
+            ''', ('l1_json_parse_error', reject_text, None, extractor_model))
+            await db.commit()
+        except Exception as ie:
+            logger.error(f"[Memory Extractor] 记录 l1_json_parse_error 失败: {ie}")
+        await db.close()
         return []
+
+    valid_fragments = []
+    
+    try:
+        from embedding import get_embedding, cosine_similarity
+        
+        cursor = await db.execute("SELECT id, content, embedding, tags, activation_count FROM memory_fragments WHERE embedding IS NOT NULL")
+        rows = await cursor.fetchall()
+        existing_fragments = [dict(row) for row in rows]
+
+        for frag in fragments:
+            content = frag.get('content', '').strip()
+            if not content:
+                continue
+                
+            source_idx = frag.get('source_index', -1)
+            source_dialogue_id = None
+            if isinstance(source_idx, int) and 0 <= source_idx < len(dialogue_ids):
+                source_dialogue_id = dialogue_ids[source_idx]
+
+            # 拒收判断 1：缺失 source_dialogue_id
+            if source_dialogue_id is None or source_dialogue_id not in source_messages:
+                await reject_fragment(db, 'missing_source', content, source_dialogue_id, extractor_model)
+                continue
+                
+            msg_data = source_messages[source_dialogue_id]
+            raw_dialogue = clean_dialogue(msg_data['content'] or '')
+            source_timestamp = msg_data['timestamp']
+            
+            if not source_timestamp:
+                await reject_fragment(db, 'missing_source', content, source_dialogue_id, extractor_model)
+                continue
+
+            entities = frag.get('entities', [])
+            if not isinstance(entities, list):
+                entities = []
+                
+            # 拒收判断 2：窗口对齐失败（完全没匹配上任何实体）
+            aligned_window = get_aligned_window(raw_dialogue, entities)
+            if aligned_window is None and len(raw_dialogue) > 800:
+                await reject_fragment(db, 'window_not_found', content, source_dialogue_id, extractor_model)
+                continue
+                
+            # 拒收判断 3：第一级硬验证（实体关键词或片段关键词至少有部分出现在原文中）
+            if not aligned_window:
+                aligned_window = raw_dialogue
+                
+            ent_matched = False
+            if entities:
+                for ent in entities:
+                    if not ent:
+                        continue
+                    if ent in raw_dialogue:
+                        ent_matched = True
+                        break
+                    # 如果实体是复合词（如"薄荷味药物"），拆分检查子词（如"薄荷"）
+                    sub_words = [ent[i:i+2] for i in range(len(ent)-1)]
+                    if any(sw in raw_dialogue for sw in sub_words if len(sw) >= 2):
+                        ent_matched = True
+                        break
+            else:
+                # 若无显式实体列表，检查内容主要词元
+                ent_matched = any(content[i:i+2] in raw_dialogue for i in range(len(content)-1))
+                
+            if not ent_matched:
+                await reject_fragment(db, 'quote_mismatch_l1', content, source_dialogue_id, extractor_model)
+                continue
+                
+            # 拒收判断 4：第二级语义验证（跨模型）
+            l2_result = await verify_mismatch(frag, aligned_window, api_key)
+            if l2_result == 'mismatch':
+                await reject_fragment(db, 'quote_mismatch_l2', content, source_dialogue_id, extractor_model)
+                continue
+            elif l2_result == 'unavailable':
+                await reject_fragment(db, 'validation_unavailable', content, source_dialogue_id, extractor_model)
+                continue
+
+            # 验证通过，落库
+            tier = frag.get('tier', 3)
+            energy = frag.get('energy', 5)
+            polarity = frag.get('polarity', 'neutral')
+            tags = frag.get('tags', '')
+            
+            new_emb_vector = await get_embedding(content)
+            if not new_emb_vector:
+                continue
+                
+            emb_json = json.dumps(new_emb_vector)
+            
+            cursor = await db.execute(
+                '''INSERT INTO memory_fragments 
+                   (source_dialogue_id, content, tier, energy, polarity, tags, embedding, source_timestamp, extracted_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (source_dialogue_id, content, tier, energy, polarity, tags, emb_json, source_timestamp, extractor_model)
+            )
+            valid_fragments.append(frag)
+            
+        await db.commit()
+    except Exception as e:
+        logger.error(f"[Memory Extractor] 入库异常: {e}")
+    finally:
+        await db.close()
+
+    return valid_fragments

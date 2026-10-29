@@ -1,3 +1,4 @@
+from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timedelta
 from utils import now_cst, today_cst_str
 import calendar
@@ -44,44 +45,115 @@ logger = logging.getLogger('caeron')
 provider_manager = ProviderManager()
 
 # 技术模式：跳过轮总触发和上下文压缩
-tech_mode = True  # 默认技术模式
+# tech_mode 持久化：从数据库读取，进程重启不丢状态
+import sqlite3 as _sqlite3
+def _load_tech_mode():
+    try:
+        conn = _sqlite3.connect('gateway.db')
+        cur = conn.execute("SELECT value FROM config WHERE key = 'tech_mode'")
+        row = cur.fetchone()
+        conn.close()
+        return row[0] == '1' if row else True
+    except:
+        return True
+tech_mode = _load_tech_mode()
+
+
+async def _check_and_backfill_summaries():
+    """服务启动时检查并自动补全过去7天内遗漏的日总或上周遗漏的周总"""
+    await asyncio.sleep(5)
+    try:
+        from summarizer import run_daily_cron, run_weekly_cron
+        from database import get_db
+        
+        now = now_cst()
+        for i in range(1, 8):
+            past_date = (now - timedelta(days=i)).strftime('%Y-%m-%d')
+            db = await get_db()
+            try:
+                cur = await db.execute("SELECT COUNT(*) FROM summaries WHERE tag = 'round' AND date(created_at) = ?", (past_date,))
+                round_count = (await cur.fetchone())[0]
+                cur2 = await db.execute("SELECT COUNT(*) FROM summaries WHERE tag = 'daily' AND date(COALESCE(period_start, created_at)) = ?", (past_date,))
+                daily_count = (await cur2.fetchone())[0]
+            finally:
+                await db.close()
+            
+            if round_count > 0 and daily_count == 0:
+                logger.info(f"[BACKFILL] 发现未总结的历史日总: {past_date} (含 {round_count} 轮总)，正在自动补全...")
+                await run_daily_cron(past_date)
+        
+        days_since_sunday = (now.weekday() - 6) % 7
+        if days_since_sunday == 0 and now.hour < 23:
+            days_since_sunday = 7
+        elif days_since_sunday == 0:
+            days_since_sunday = 0
+            
+        if days_since_sunday > 0:
+            last_sunday = (now - timedelta(days=days_since_sunday)).strftime('%Y-%m-%d')
+            last_sunday_start = (now - timedelta(days=days_since_sunday + 6)).strftime('%Y-%m-%d')
+            db = await get_db()
+            try:
+                cur = await db.execute("SELECT COUNT(*) FROM summaries WHERE tag = 'weekly' AND date(COALESCE(period_end, created_at)) = ?", (last_sunday,))
+                weekly_count = (await cur.fetchone())[0]
+                cur2 = await db.execute("""SELECT COUNT(*) FROM summaries 
+                                           WHERE tag = 'daily' 
+                                           AND date(COALESCE(period_start, created_at)) BETWEEN ? AND ?""", 
+                                        (last_sunday_start, last_sunday))
+                daily_count = (await cur2.fetchone())[0]
+            finally:
+                await db.close()
+            
+            if daily_count > 0 and weekly_count == 0:
+                logger.info(f"[BACKFILL] 发现未总结的历史周总: {last_sunday_start} ~ {last_sunday}，正在自动补全...")
+                await run_weekly_cron(last_sunday)
+    except Exception as e:
+        logger.error(f"[BACKFILL] 历史总结自愈补全异常: {e}")
 
 
 async def _summary_cron_loop():
-    """后台定时任务：每天UTC 15:59（北京时间23:59）触发日总，周日额外触发周总，月末额外触发月总"""
-    from summarizer import run_daily_cron, run_weekly_cron, run_monthly_cron
+    """后台定时任务：每天北京时间23:59触发日总，周日额外触发周总，月末额外触发月总"""
+    from summarizer import run_daily_cron, run_weekly_cron, run_monthly_cron, run_quarterly_cron
     from datetime import datetime
+    
+    # 启动时异步触发一次历史总结自愈检查
+    asyncio.create_task(_check_and_backfill_summaries())
     
     while True:
         try:
-            # 计算距离下一个UTC 15:59的秒数
+            # 计算距离下一个北京时间23:59的秒数
             now = now_cst()
             target = now.replace(hour=23, minute=59, second=0, microsecond=0)
             if now >= target:
                 target += timedelta(days=1)
             wait_seconds = (target - now).total_seconds()
             
-            logger.info(f"[CRON] 下次总结触发: {target.isoformat()}Z (等待 {wait_seconds:.0f}s)")
+            logger.info(f"[CRON] 下次总结触发: {target.isoformat()} (等待 {wait_seconds:.0f}s)")
             await asyncio.sleep(wait_seconds)
             
-            # 到点了，执行日总
-            trigger_time = now_cst()
-            logger.info(f"[CRON] 定时触发: {trigger_time.isoformat()}Z")
+            # 以计划目标日期为基准（防止睡眠飘移跨过零点导致日期偏移一天）
+            target_date = target.date()
+            target_date_str = target_date.strftime('%Y-%m-%d')
+            is_sunday = (target_date.weekday() == 6)
+            _, last_day = calendar.monthrange(target_date.year, target_date.month)
+            is_month_end = (target_date.day == last_day)
             
-            await run_daily_cron()
+            logger.info(f"[CRON] 定时触发: 目标总结日期={target_date_str} (周日={is_sunday}, 月末={is_month_end}), 实际唤醒时间={now_cst().isoformat()}")
             
-            # 判断是否周日（北京时间）-> UTC周日15:59 = 北京时间周日23:59
-            # UTC周日 weekday=6
-            if trigger_time.weekday() == 6:
-                logger.info("[CRON] 今天是周日，触发周总")
-                await run_weekly_cron()
+            await run_daily_cron(target_date_str)
             
-            # 判断是否月末
-            beijing_date = (trigger_time + timedelta(hours=8)).date()
-            _, last_day = calendar.monthrange(beijing_date.year, beijing_date.month)
-            if beijing_date.day == last_day:
-                logger.info("[CRON] 今天是月末，触发月总")
-                await run_monthly_cron()
+            if is_sunday:
+                logger.info(f"[CRON] 目标日期为周日，触发周总 ({target_date_str})")
+                await run_weekly_cron(target_date_str)
+            
+            if is_month_end:
+                month_str = target_date.strftime('%Y-%m')
+                logger.info(f"[CRON] 目标日期为月末，触发月总 ({month_str})")
+                await run_monthly_cron(month_str)
+                if target_date.month in (3, 6, 9, 12):
+                    quarter_num = (target_date.month - 1) // 3 + 1
+                    quarter_str = f"{target_date.year}-Q{quarter_num}"
+                    logger.info(f"[CRON] 目标日期为季末，触发季总 ({quarter_str})")
+                    await run_quarterly_cron(quarter_str)
             
         except asyncio.CancelledError:
             logger.info("[CRON] 定时任务已取消")
@@ -100,7 +172,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     await init_default_config()
 
-    # 启动时重置所有供应商为健康状态（服务重启 = 清空历史故障）
+    # 启动时重置所有供应商为健康状态（服务���启 = 清空历史故障）
     from database import get_db as _get_db
     db = await _get_db()
     try:
@@ -114,10 +186,15 @@ async def lifespan(app: FastAPI):
         await db.close()
 
     # 启动后台健康探针
-    health_probe_task = asyncio.create_task(provider_manager.start_health_probe_loop())
+    # health_probe_task = asyncio.create_task(provider_manager.start_health_probe_loop())  # 已关闭自动健康探针
+    health_probe_task = None
 
     # 启动定时总结任务（日总/周总/月总）
     summary_cron_task = asyncio.create_task(_summary_cron_loop())
+
+    # 启动 proactive 主动消息循环
+    from proactive import proactive_loop
+    proactive_task = asyncio.create_task(proactive_loop())
 
     # 启动网易云听歌状态监控
     try:
@@ -126,6 +203,14 @@ async def lifespan(app: FastAPI):
         logger.info("网易云听歌状态监控已启动")
     except Exception as e:
         logger.warning(f"网易云听歌状态监控启动失败（非致命）: {e}")
+
+    # 启动深夜睡眠守护后台任务 (每日 00:30 ~ 06:00)
+    try:
+        from sleep_guardian import sleep_guardian
+        sleep_guardian.start()
+        logger.info("深夜睡眠守护后台任务已启动")
+    except Exception as e:
+        logger.warning(f"深夜睡眠守护启动失败（非致命）: {e}")
         
     # [已禁用] 小米健康状态监控 - API被小米改参数拦截，等待修复
     # try:
@@ -140,14 +225,19 @@ async def lifespan(app: FastAPI):
     yield
 
     # 关闭时停止后台任务
-    health_probe_task.cancel()
-    summary_cron_task.cancel()
+    if health_probe_task:
+        health_probe_task.cancel()
+    if summary_cron_task:
+        summary_cron_task.cancel()
+    if proactive_task:
+        proactive_task.cancel()
     
-    for task in [health_probe_task, summary_cron_task]:
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    for task in [health_probe_task, summary_cron_task, proactive_task]:
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     logger.info("Caeron Gateway 已关闭")
 
 
@@ -157,6 +247,8 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan
 )
+app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+
 
 from log_viewer import log_app
 app.mount("/syslogs", log_app)
@@ -173,10 +265,16 @@ async def get_qr():
 from qq_adapter import qq_router
 app.include_router(qq_router)
 
+# ==================== 手机监控模块路由与DB初始化 ====================
+from monitor_routes import router as monitor_router
+from monitor_db import init_monitor_db
+init_monitor_db()
+app.include_router(monitor_router, prefix="/monitor", tags=["monitor"])
+
 # ==================== Admin 认证中间件 ====================
 class AdminAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.path.startswith("/admin/api/"):
+        if request.url.path.startswith("/admin/api/") or request.url.path.startswith("/api/life-hub/"):
             auth = request.headers.get("authorization", "")
             if auth.startswith("Bearer "):
                 token = auth[7:].strip()
@@ -288,6 +386,13 @@ async def chat_completions(request: Request):
     """
     核心路由：转发 chat completion 请求
     """
+    try:
+        raw_bytes = await request.body()
+        raw_text = raw_bytes.decode('utf-8', errors='replace')[:2000]
+        logger.info(f'RAW_REQ: {raw_text}')
+    except Exception as e:
+        logger.info(f"RAW_REQ dump failed: {e}")
+        
     global tech_mode
     # DEBUG: Log all request headers to identify Operit session markers
     hdrs = dict(request.headers)
@@ -314,6 +419,27 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 async def _handle_chat_completions(request: Request):
+    # === 入口鉴权：拒绝未知来源 ===
+    import os
+    import json
+    gateway_secret = os.getenv('GATEWAY_SECRET', '')
+    auth_header = request.headers.get('authorization', '')
+    incoming_key = auth_header[7:].strip() if auth_header.startswith('Bearer ') else ''
+    
+    if gateway_secret:
+        # 方式1: 客户端直接用 GATEWAY_SECRET 作为 Bearer Token
+        if incoming_key == gateway_secret:
+            pass  # 合法
+        # 方式2: 客户端用的是某个供应商的 api_key（兼容旧逻辑）
+        elif incoming_key:
+            matched = await provider_manager.get_provider_by_api_key(incoming_key)
+            if not matched:
+                logger.warning(f"[AUTH] 未知 API Key 拒绝访问: {incoming_key[:12]}... IP={request.client.host}")
+                raise HTTPException(status_code=403, detail="Forbidden: unknown API key")
+        else:
+            logger.warning(f"[AUTH] 无 API Key 拒绝访问, IP={request.client.host}")
+            raise HTTPException(status_code=401, detail="Unauthorized: missing API key")
+
     # 解析请求体
     try:
         body = await request.json()
@@ -321,6 +447,9 @@ async def _handle_chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="无效的 JSON 请求体")
 
     model = body.get('model', '')
+
+    # [Bugfix] Operit client unconditionally sends `enable_thinking` for some reason, which SiliconFlow strict validation rejects
+    body.pop('enable_thinking', None)
 
     is_stream = body.get('stream', False)
     logger.info(f"收到请求: model={model}, stream={is_stream}")
@@ -588,13 +717,13 @@ async def _handle_chat_completions(request: Request):
     if explicit_session_id:
         conversation_id = explicit_session_id
     else:
-        conversation_id = generate_conversation_id(raw_messages)
+        conversation_id = await generate_conversation_id(raw_messages)
 
-    # 异步存储，不阻塞主流程（存储失败不影响请求转发）
+    # 异��存储，不阻塞主流程（存储失败不影响请求转发）
     unified_history = []
     if gateway_master and feature_memory and not tech_mode and request.headers.get('x-skip-rules', '').lower() != 'true':
         import message_store
-        unified_history = await message_store.get_unified_history(char_limit=15000)
+        unified_history = await message_store.get_unified_history(char_limit=15000, ruirui_sync=True)
 
     # 异步存储，不阻塞主流程（存储失败不影响请求转发）
     stored_count = 0
@@ -605,16 +734,24 @@ async def _handle_chat_completions(request: Request):
     try:
         await ensure_conversation(conversation_id, model=model)
         if _is_qq:
-            # QQ端自己管history，不需要store_incoming_messages
-            # 只需要proxy的store_assistant_response单独存回复
-            # 但仍然需要存最新的user消息（用于轮总和记忆）
-            last_user = None
-            for msg in reversed(raw_messages):
-                if msg.get('role') == 'user':
-                    last_user = msg
-                    break
-            if last_user:
-                stored_count, was_rerolled, current_turn = await store_incoming_messages(conversation_id, [last_user])
+            # QQ端自己管history，由qq_adapter维护unified_messages
+            # 存入messages表仅供记忆向量化和统计，使用安全的独立追加，绝不触发全量Reroll误删
+            if explicit_source != 'qq-judge':
+                last_user = None
+                for msg in reversed(raw_messages):
+                    if msg.get('role') == 'user':
+                        last_user = msg
+                        break
+                if last_user:
+                    from message_store import append_qq_user_message
+                    user_text = last_user.get('content', '')
+                    if isinstance(user_text, list):
+                        import json
+                        user_text = json.dumps(user_text, ensure_ascii=False)
+                    await append_qq_user_message(conversation_id, str(user_text))
+                    stored_count = 1
+                    was_rerolled = False
+                    current_turn = [last_user]
         else:
             if tech_mode:
                 import message_store
@@ -626,25 +763,8 @@ async def _handle_chat_completions(request: Request):
                         break
                 if last_user:
                     await message_store.store_unified_message('operit', 'main', 'user', last_user.get('content', ''))
-                    # 技术模式下也递增计数器（让前端显示"已存X条待总结"），但不触发轮总
-                    try:
-                        db = await get_db()
-                        try:
-                            cursor = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")
-                            row = await cursor.fetchone()
-                            current_count = int(row['value']) if row else 0
-                            new_count = current_count + 1
-                            await db.execute(
-                                "INSERT INTO config (key, value, description) VALUES ('_msg_counter', ?, '轮总触发计数器') "
-                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                                (str(new_count),)
-                            )
-                            await db.commit()
-                            logger.info(f"[TECH_MODE] 计数器递增: {current_count} -> {new_count} (不触发轮总)")
-                        finally:
-                            await db.close()
-                    except Exception as e:
-                        logger.error(f"[TECH_MODE] 计数器递增异常: {e}")
+                    # 技术模式不递增轮总计数器，避免退出技术模式时计数器爆炸
+                    logger.debug(f"[TECH_MODE] 消息已存入 unified_messages，跳过计数器递增")
             else:
                 stored_count, was_rerolled, current_turn = await store_incoming_messages(conversation_id, raw_messages)
                 
@@ -652,14 +772,36 @@ async def _handle_chat_completions(request: Request):
                 # 需要重新拉取，并排除刚刚存入的 current_turn
                 if was_rerolled:
                     logger.info(f"[REROLL] 检测到历史截断，重新拉取统一历史...")
-                    unified_history = await message_store.get_unified_history(char_limit=15000, exclude_count=stored_count)
+                    exclude_c = stored_count if stored_count > 0 else 1
+                    unified_history = await message_store.get_unified_history(char_limit=15000, exclude_count=exclude_c, ruirui_sync=True)
                     
     except Exception as e:
         logger.error(f"消息存储管道异常（不影响转发）: {e}")
     
     # === Step 2.5: 主动轮总触发 ===
-    # 每存入N条消息（跨对话累计），后台触发一次轮总
+    # === 工具调用循环检测：直接看原始请求的 messages 尾部 ===
+    valid_summary_count = 0
     if stored_count > 0:
+        last_msg_role = raw_messages[-1].get('role', '') if raw_messages else ''
+        if last_msg_role in ('tool', 'function'):
+            # 这是工具调用循环中的中间请求，跳过总结计数
+            logger.debug(f"[SUMMARY_SKIP] Skipped counting: last message role is '{last_msg_role}', in tool-call loop")
+        else:
+            # 仅对“实质对话轮次”计数，工具调用轮次不纳入计数
+            for msg in current_turn:
+                role = msg.get('role')
+                has_tool_calls = bool(msg.get('tool_calls') or msg.get('function_call'))
+                is_skipped = (role in ('tool', 'function')) or (role == 'assistant' and has_tool_calls)
+                
+                logger.info(f"[COUNT_DEBUG] 收到新消息 role={role}, has_tool_calls={has_tool_calls}, is_skipped={is_skipped}")
+                
+                if is_skipped:
+                    continue
+                valid_summary_count += 1
+                
+            logger.info(f"[COUNT_DEBUG] 本次提取增量消息 {len(current_turn)} 条，有效总结计数={valid_summary_count}")
+
+    if valid_summary_count > 0:
         try:
             trigger_threshold = int(await get_config('summary_interval', '16'))
             # 从数据库读取当前累计计数
@@ -668,16 +810,15 @@ async def _handle_chat_completions(request: Request):
                 cursor = await db.execute("SELECT value FROM config WHERE key = '_msg_counter'")
                 row = await cursor.fetchone()
                 current_count = int(row['value']) if row else 0
-                new_count = current_count + stored_count
+                new_count = current_count + valid_summary_count
                 
                 if new_count >= trigger_threshold:
                     # 达到阈值，后台触发轮总
                     # 注意：技术模式下的消息已经跳过了 messages 表，所以这里的 new_count 都是日常模式消息
                     logger.info(f"[AUTO_SUMMARY] 累计 {new_count} 条消息，触发轮总生成")
                     
-                    # --- Bug 修复：防止异步并发导致的重复生成 ---
-                    # 先将计数器扣除阈值（原子化概念），而不是简单置0，这样能承接并发请求的消息
-                    new_count = max(0, new_count - trigger_threshold)
+                    # 直接清零，防止大批量导入后计数器残留导致后续每条消息都触发轮总
+                    new_count = 0
                     
                     logger.info(f"[AUTO_SUMMARY] 准备触发轮总。当前触发阈值:{trigger_threshold}, 剩余未总结数:{new_count}")
 
@@ -863,36 +1004,64 @@ async def _handle_chat_completions(request: Request):
                     c = c.replace('...', '').replace('…', '').strip()
                     msg['content'] = c if c else ' '
 
+    # === 天气数据注入与高精度替换 (Weather Injection & Optimization) ===
+    try:
+        from weather_service import get_weather_formatted, save_last_location, get_last_location
+        for msg in body.get('messages', []):
+            if msg.get('role') == 'user' and isinstance(msg.get('content'), str) and '<attachment' in msg['content']:
+                c = msg['content']
+                if '【当前位置】' in c or '【当前天气】' in c:
+                    import re
+                    lat, lon = None, None
+                    m_coord = re.search(r'坐标:\s*([0-9.]+),\s*([0-9.]+)', c)
+                    if not m_coord:
+                        m_coord = re.search(r'地点:\s*([0-9.]+),\s*([0-9.]+)', c)
+                    if m_coord:
+                        try:
+                            lat = float(m_coord.group(1))
+                            lon = float(m_coord.group(2))
+                        except Exception:
+                            pass
+                    
+                    address = None
+                    m_addr = re.search(r'地址:\s*([^\n\r<]+)', c)
+                    if m_addr:
+                        address = m_addr.group(1).strip()
+                        
+                    if lat is not None and lon is not None:
+                        save_last_location(lat, lon, address)
+                    else:
+                        last_loc = get_last_location()
+                        lat, lon, address = last_loc['lat'], last_loc['lon'], last_loc.get('address')
+                        
+                    fresh_weather_text = await get_weather_formatted(lat, lon, address)
+                    
+                    if '【当前天气】' in c:
+                        pattern = r'【当前天气】[\s\S]*?(?=(【当前位置】|【当前时间】|【当前屏幕应用】|</attachment>))'
+                        c_new = re.sub(pattern, fresh_weather_text + '\n\n', c)
+                        msg['content'] = c_new
+                        logger.info(f"[WEATHER_INJECT] 成功替换 Operit 附件中的天气块为高精度实时天气: {lat}, {lon}")
+                    elif '</attachment>' in c:
+                        c_new = c.replace('</attachment>', f'\n{fresh_weather_text}\n</attachment>')
+                        msg['content'] = c_new
+                        logger.info(f"[WEATHER_INJECT] 在 Operit 附件中追加高精度实时天气")
+    except Exception as e:
+        logger.error(f"[WEATHER_INJECT] 天气注入优化处理异常: {e}")
+
     # 检查是否为 QQ 来源（跳过规则注入，但保留记忆注入）
     skip_rules = request.headers.get('x-skip-rules', '').lower() == 'true'
     
-    # === 新增：统一跨端上下文构建 (仅 Operit 日常模式) ===
-    # 技术模式下必须完全透传 Operit 的原始历史，绝不能用统一历史覆盖！
-    # 必须在 InjectionEngine 注入规则之前完成，否则会把注入的 user_wrapped_system 规则覆盖掉！
-    if not skip_rules and not tech_mode:
-        # 1. 提取所有 system 消息（此时为 Operit 原始请求的 system）
-        sys_msgs = [m for m in body.get('messages', []) if m.get('role') == 'system']
-        
-        # 2. current_turn 已经由 store_incoming_messages 提取出来了。
-        # 如果因为某些异常导致 current_turn 为空，回退为最后一条 user 消息
-        if not current_turn:
-            messages_without_sys = [m for m in body.get('messages', []) if m.get('role') != 'system']
-            last_user = None
-            for m in reversed(messages_without_sys):
-                if m.get('role') == 'user':
-                    last_user = m
-                    break
-            current_turn = [last_user] if last_user else messages_without_sys[-1:]
-            
-        # 3. 组装新的 messages 数组 (system + unified_history + current_turn)
-        body['messages'] = sys_msgs + unified_history + current_turn
-        logger.info(f"[UNIFIED] 已替换 Operit 历史为跨端统一历史，包含 {len(unified_history)} 条历史和 {len(current_turn)} 条当前轮")
+    # === Operit 原生历史保护 ===
+    # Operit 客户端已自带完整真实的会话历史（包含多模态图片和连续对话），
+    # 绝对禁止用数据库的重构历史覆盖它，以确保上下文绝对精准且不发生错位脱节。
+    # 跨端消息（QQ）通过 InjectionEngine 的记忆摘要和召回机制自然融入。
+    logger.info(f"[OPERIT_NATIVE] 保留 Operit 原生完整历史，共 {len(body.get('messages', []))} 条消息")
 
     if skip_rules:
         # QQ 来源：跳过 injection_rules（Operit人格提示词），但注入记忆/摘要（跨端桥接）
         # QQ 始终以日常模式运行，不受技术模式影响
         injection_engine = InjectionEngine()
-        body['messages'] = await injection_engine.inject_memory_only(body.get('messages', []), {'model': model, 'conversation_id': conversation_id})
+        body['messages'] = await injection_engine.inject_memory_only(body.get('messages', []), {'model': model, 'conversation_id': conversation_id, 'source': explicit_source})
         logger.info(f"[QQ_INJECT] QQ来源: 跳过规则注入，执行记忆注入（跨端桥接）")
     elif tech_mode:
         # Operit 技术模式：只注入核心身份规则（priority=0），跳过轮总/召回/网易云
@@ -907,16 +1076,27 @@ async def _handle_chat_completions(request: Request):
     # === Bug 1.5 修复：防止 AI 工具调用陷入死循环 (Ghost Wall) ===
     _final_msgs = body.get('messages', [])
     
-    # 检测逻辑：往回倒推，统计遇到 user 之前，有多少个包含 tool_calls 或 XML <tool_call 的 assistant 消息
+    # 检测逻辑：往回倒推，统计遇到 user 之前，有多少个包含 tool_calls、XML <tool_call 或提示词的 assistant 消息
     consecutive_tool_turns = 0
     last_tool_idx = -1
+    is_attachment_context = False
     
     for i in range(len(_final_msgs) - 1, -1, -1):
         role = _final_msgs[i].get('role')
         content = _final_msgs[i].get('content', '')
+        if not isinstance(content, str):
+            content = str(content)
         
-        # 兼容 OpenAI 的 role: tool 以及 Claude 的 user + <tool_result
-        is_tool_result = (role == 'tool') or (role == 'user' and isinstance(content, str) and '<tool_result' in content)
+        # 检查是否涉及客户端本地文件/附件（必须排除系统时间位置 bundle 以及已作为视觉输入的多模态图片附件）
+        if '/storage/emulated/0/' in content or 'walkthrough' in content:
+            if not ('type="image/' in content or 'cleanOnExit' in content):
+                is_attachment_context = True
+        elif '<attachment' in content and 'message_insert_extra_bundle' not in content and 'type="image/' not in content:
+            is_attachment_context = True
+        
+        # 兼容 OpenAI 的 role: tool 以及 Claude 的 user + <tool_result，以及客户端自动续写轮次
+        is_continuation_user = (role == 'user' and content.strip() in ('请继续。', '继续', '请继续', 'continue'))
+        is_tool_result = (role == 'tool') or ('<tool_result' in content) or is_continuation_user
         
         if role == 'user' and not is_tool_result:
             break  # 遇到上一轮真正的用户发言就停止
@@ -924,22 +1104,44 @@ async def _handle_chat_completions(request: Request):
             if last_tool_idx == -1:
                 last_tool_idx = i
         elif role == 'assistant':
-            has_tool_call = _final_msgs[i].get('tool_calls') or (isinstance(content, str) and '<tool_call' in content)
+            is_fallback_cue = (content.strip() == '我这就去查。')
+            has_tool_call = _final_msgs[i].get('tool_calls') or ('<tool_call' in content) or is_fallback_cue
             if has_tool_call:
                 consecutive_tool_turns += 1
-                
-    if consecutive_tool_turns >= 3 and not tech_mode:
-        logger.warning(f"[TOOL_LOOP] 检测到连续 {consecutive_tool_turns} 次工具调用，强制中断死循环！")
+
+    # 检查工具调用中是否有实际尝试 read_file（区分本地文件读取与网络检索/通用工具）
+    has_read_file_attempt = False
+    for msg in _final_msgs:
+        tcs = msg.get('tool_calls') or []
+        for tc in tcs:
+            fn_name = tc.get('function', {}).get('name', '')
+            if fn_name in ('read_file', 'read_file_part', 'list_files'):
+                has_read_file_attempt = True
+                break
+        c_str = str(msg.get('content', ''))
+        if '<tool_call' in c_str and ('read_file' in c_str or 'read_file_part' in c_str):
+            has_read_file_attempt = True
+
+    # 针对真实的本地附件读取死循环：连续 2 次读文件无果即中断
+    # 通用工具（网络搜索、网页浏览等需要多轮检索比对）：允许最多 6 轮
+    is_real_file_loop = is_attachment_context and has_read_file_attempt
+    loop_threshold = 2 if is_real_file_loop else 6
+    if consecutive_tool_turns >= loop_threshold and not tech_mode:
+        logger.warning(f"[TOOL_LOOP] 检测到连续 {consecutive_tool_turns} 次工具调用 (真实本地文件场景={is_real_file_loop})，强制中断死循环！")
         if 'tools' in body:
             del body['tools']
+        if is_real_file_loop:
+            interrupt_msg = "【系统提示】：你已连续多次尝试通过工具读取手机本地文件但未能获取内容。检测到该附件为客户端本地临时文件（云端环境无法直接通过工具读取手机本地存储）。请停止再次调用 read_file 工具，直接用中文回复用户：告知用户你无法直接读取该手机本地附件，请用户将文件文本直接复制粘贴到对话框中，或根据已有信息进行解答！"
+        else:
+            interrupt_msg = "【系统提示】：工具调用轮次已达上限。请立即停止调用工具，直接根据已有检索结果或已知信息，用你原本的人设口吻详细回复用户！"
         _final_msgs.append({
             "role": "system",
-            "content": "【系统强制中断】你已经连续多次调用工具且未能得出最终回复。请立即停止调用任何工具，直接根据已有信息用中文回复用户！"
+            "content": interrupt_msg
         })
         body['messages'] = _final_msgs
 
-    # === 根源治理：强化工具调用的边界感知 ===
-    if last_tool_idx != -1:
+    # === 根源治理：强化工具调用的边界感知（技术模式跳过） ===
+    if last_tool_idx != -1 and not tech_mode:
         original_content = _final_msgs[last_tool_idx].get('content', '')
         if isinstance(original_content, str):
             patch = "\n\n[System Action Required: 此工具已执行。请评估是否需要继续调用其他工具（如还需要操作），若无须进一���调用，请直接以中文文字回复用户。]"
@@ -952,6 +1154,14 @@ async def _handle_chat_completions(request: Request):
     final_msg_count = len(body['messages'])
     final_msg_chars = sum(_msg_chars(m) for m in body['messages'])
     logger.info(f"[API_REQUEST] 最终发送至上游 API: 包含 {final_msg_count} 条消息, 约 {final_msg_chars} 字符")
+    
+    # [DEBUG] 将最后一次请求的完整消息体写入本地文件用于排查注入
+    try:
+        import json as _debug_json
+        with open(os.path.join(os.path.dirname(__file__), 'last_request.json'), 'w', encoding='utf-8') as f:
+            _debug_json.dump(body['messages'], f, ensure_ascii=False, indent=2)
+    except Exception as _e:
+        logger.error(f"写入 last_request.json 失败: {_e}")
 
     # 获取主供应商
     try:
@@ -971,38 +1181,20 @@ async def _handle_chat_completions(request: Request):
     used_cooled_down = False  # 是否已经尝试过冷却期到期的���应商
 
     for attempt in range(5):
-        # 跳过已尝试的供应商
-        if provider['id'] in tried_ids:
-            # 先尝试健康的fallback
-            fallbacks = await provider_manager.get_fallback_providers(model, provider['id'])
-            fallbacks = [p for p in fallbacks if p['id'] not in tried_ids]
-
-            if not fallbacks and not used_cooled_down:
-                # 健康供应商���部耗尽，尝试冷却期到期的不健康供应商
-                cooled = await provider_manager.get_cooled_down_providers(model=model, exclude_ids=tried_ids)
-                if cooled:
-                    fallbacks = cooled
-                    used_cooled_down = True
-                    logger.warning(
-                        f"健康供应商已耗尽，启用 {len(cooled)} 个冷却期到期的供应商"
-                    )
-
-            if not fallbacks:
-                break
-            provider = fallbacks[0]
-
-        tried_ids.add(provider['id'])
+        # 不做fallback路由，5次全打同一个供应商
 
         try:
             # 更新最近使用时间
             await provider_manager.update_last_used(provider['id'])
 
+            client_host = request.headers.get("host", "1.14.59.116:8080")
             response = await proxy_chat_completion(
                 body, 
                 provider, 
                 conversation_id=conversation_id, 
                 source=explicit_source,
-                skip_messages_table=(tech_mode and not _is_qq)
+                skip_messages_table=(tech_mode and not _is_qq),
+                client_host=client_host
             )
 
             # 成功，确保���记为��康
@@ -1017,24 +1209,8 @@ async def _handle_chat_completions(request: Request):
                 f"供应商 {provider['name']} 请求失败 (尝试 {attempt + 1}/5): {e}"
             )
             await provider_manager.mark_unhealthy(provider['id'], last_error)
-
-            # 获取下一个 fallback 供应商
-            fallbacks = await provider_manager.get_fallback_providers(model, provider['id'])
-            fallbacks = [p for p in fallbacks if p['id'] not in tried_ids]
-
-            if not fallbacks and not used_cooled_down:
-                # 健康供应商全部耗尽，尝试冷却期到期的不健康供应商
-                cooled = await provider_manager.get_cooled_down_providers(model=model, exclude_ids=tried_ids)
-                if cooled:
-                    fallbacks = cooled
-                    used_cooled_down = True
-                    logger.warning(
-                        f"健康���应商已耗尽，启用 {len(cooled)} 个冷却期到期的供应商"
-                    )
-
-            if fallbacks:
-                provider = fallbacks[0]
-                logger.info(f"切换到供应商: {provider['name']}")
+            # 不做fallback，继续retry同一个供应商
+            logger.info(f"供应商 {provider['name']} 第{attempt+1}次失败，继续重试")
 
     # 全部失败
     raise HTTPException(
@@ -1512,7 +1688,7 @@ async def admin_create_status(request: Request):
 
 @app.put("/admin/api/status/{status_id}")
 async def admin_update_status(status_id: int, request: Request):
-    return {"message": "状态便签功能已禁用"}
+    return {"message": "状态便签功���已禁用"}
 
 @app.delete("/admin/api/status/{status_id}")
 async def admin_delete_status(status_id: int):
@@ -1940,7 +2116,10 @@ async def get_qq_config():
         'REPLY_DELAY_MAX': qq_config.REPLY_DELAY_MAX,
         'DEFAULT_PROMPT': qq_config.DEFAULT_PROMPT,
         'RUIRUI_PROMPT': qq_config.RUIRUI_PROMPT,
-        'DEFAULT_MODEL': qq_config.DEFAULT_MODEL
+        'DEFAULT_MODEL': qq_config.DEFAULT_MODEL,
+        'JUDGE_MODEL': qq_config.JUDGE_MODEL,
+        'GROUP_JUDGE_INTERVAL': qq_config.GROUP_JUDGE_INTERVAL,
+        'GROUP_JUDGE_PROMPT': qq_config.GROUP_JUDGE_PROMPT
     }
 
 @app.post("/admin/api/qq-config")
@@ -1961,6 +2140,9 @@ async def save_qq_config(request: Request):
     if 'DEFAULT_PROMPT' in data: qq_config.DEFAULT_PROMPT = data['DEFAULT_PROMPT']
     if 'RUIRUI_PROMPT' in data: qq_config.RUIRUI_PROMPT = data['RUIRUI_PROMPT']
     if 'DEFAULT_MODEL' in data: qq_config.DEFAULT_MODEL = data['DEFAULT_MODEL']
+    if 'JUDGE_MODEL' in data: qq_config.JUDGE_MODEL = data['JUDGE_MODEL']
+    if 'GROUP_JUDGE_INTERVAL' in data: qq_config.GROUP_JUDGE_INTERVAL = int(data['GROUP_JUDGE_INTERVAL'])
+    if 'GROUP_JUDGE_PROMPT' in data: qq_config.GROUP_JUDGE_PROMPT = data['GROUP_JUDGE_PROMPT']
     qq_config.save()
     return {"ok": True}
 
@@ -1979,7 +2161,13 @@ async def set_tech_mode(request: Request):
     new_state = bool(data.get('enabled', False))
     old_state = tech_mode
     tech_mode = new_state
-    logger.info(f"[TECH_MODE] 技术模式切换: {old_state} → {new_state}")
+    # 持久化到数据库
+    import sqlite3 as _sq
+    _conn = _sq.connect('gateway.db')
+    _conn.execute("INSERT INTO config (key, value, description) VALUES ('tech_mode', ?, '技术模式开关') ON CONFLICT(key) DO UPDATE SET value = excluded.value", ('1' if new_state else '0',))
+    _conn.commit()
+    _conn.close()
+    logger.info(f"[TECH_MODE] 技术模式切换: {old_state} → {new_state} (已持久化)")
     
     # 从技术模式切回正常模式时，自动触发一次轮总，压缩技术模式期间积累的消息
     if old_state and not new_state:
@@ -1987,7 +2175,7 @@ async def set_tech_mode(request: Request):
         async def _bg_catchup_summary():
             try:
                 summarizer = get_summarizer()
-                result = await summarizer.generate_round_summary()
+                result = await summarizer.generate_round_summary(max_messages_override=2000)
                 logger.info(f"[TECH_MODE] 切回后轮总完成 ({len(result) if result else 0} 字符)")
                 # 重置计数��
                 db = await get_db()
@@ -2032,11 +2220,16 @@ async def trigger_round_summary():
 # ==================== 管理面板 ====================
 
 @app.get("/admin")
+@app.get("/admin/simlife")
 async def admin_panel():
     """返回管理面板 HTML 页面"""
     html_path = os.path.join(os.path.dirname(__file__), 'static', 'admin.html')
     if os.path.exists(html_path):
-        return FileResponse(html_path, media_type='text/html')
+        response = FileResponse(html_path, media_type='text/html')
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
     return HTMLResponse("<h1>管理面板文件未找到</h1>", status_code=404)
 
 @app.get("/admin/test-recall")
@@ -2090,30 +2283,191 @@ async def api_test_recall(request: Request):
 
 # ==================== 记忆碎片 Fragments ====================
 
+
+# ==================== 情感里程碑 (Memory Milestones) API ====================
+
+@app.get("/admin/api/milestones")
+async def admin_list_milestones(month: str = None, is_active: int = None, search: str = None):
+    """查询情感里程碑列表"""
+    db = await get_db()
+    try:
+        query = "SELECT id, category, event_anchor, subconscious_residue, intensity, source_dialogue_ids, source_timestamp, month_tag, is_active, created_at FROM memory_milestones WHERE 1=1"
+        params = []
+        if month:
+            query += " AND month_tag = ?"
+            params.append(month)
+        if is_active is not None:
+            query += " AND is_active = ?"
+            params.append(is_active)
+        if search:
+            query += " AND (event_anchor LIKE ? OR subconscious_residue LIKE ?)"
+            params.extend([f"%{search}%", f"%{search}%"])
+        query += " ORDER BY source_timestamp DESC, id DESC"
+        
+        cursor = await db.execute(query, tuple(params))
+        rows = await cursor.fetchall()
+        milestones = [dict(r) for r in rows]
+        
+        # 统计数据
+        cursor2 = await db.execute("SELECT COUNT(*) as total, SUM(CASE WHEN is_active=1 THEN 1 ELSE 0 END) as active, SUM(CASE WHEN is_active=0 THEN 1 ELSE 0 END) as archived FROM memory_milestones")
+        stats_row = await cursor2.fetchone()
+        stats = {
+            "total": stats_row["total"] if stats_row and stats_row["total"] else 0,
+            "active": stats_row["active"] if stats_row and stats_row["active"] else 0,
+            "archived": stats_row["archived"] if stats_row and stats_row["archived"] else 0
+        }
+        
+        return {"milestones": milestones, "stats": stats}
+    finally:
+        await db.close()
+
+@app.post("/admin/api/milestones")
+async def admin_create_milestone(request: Request):
+    """手动新增情感里程碑"""
+    data = await request.json()
+    category = data.get("category", "bound_affirmation")
+    event_anchor = str(data.get("event_anchor", "")).strip()
+    subconscious_residue = str(data.get("subconscious_residue", "")).strip()
+    intensity = int(data.get("intensity", 8))
+    source_timestamp = data.get("source_timestamp") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    month_tag = source_timestamp[:7]
+    is_active = int(data.get("is_active", 1))
+    
+    if not event_anchor or not subconscious_residue:
+        raise HTTPException(status_code=400, detail="经历与印记不能为空")
+        
+    from embedding import get_embedding
+    emb = await get_embedding(f"{event_anchor} {subconscious_residue}")
+    emb_json = json.dumps(emb) if emb else None
+    
+    db = await get_db()
+    try:
+        cursor = await db.execute("""
+            INSERT INTO memory_milestones 
+            (category, event_anchor, subconscious_residue, intensity, source_dialogue_ids, source_timestamp, month_tag, is_active, embedding)
+            VALUES (?, ?, ?, ?, '[]', ?, ?, ?, ?)
+        """, (category, event_anchor, subconscious_residue, intensity, source_timestamp, month_tag, is_active, emb_json))
+        await db.commit()
+        return {"id": cursor.lastrowid, "message": "创建成功"}
+    finally:
+        await db.close()
+
+@app.put("/admin/api/milestones/{milestone_id}")
+async def admin_update_milestone(milestone_id: int, request: Request):
+    """编辑情感里程碑"""
+    data = await request.json()
+    category = data.get("category")
+    event_anchor = str(data.get("event_anchor", "")).strip()
+    subconscious_residue = str(data.get("subconscious_residue", "")).strip()
+    intensity = int(data.get("intensity", 8))
+    source_timestamp = data.get("source_timestamp")
+    is_active = int(data.get("is_active", 1))
+    
+    from embedding import get_embedding
+    emb = await get_embedding(f"{event_anchor} {subconscious_residue}")
+    emb_json = json.dumps(emb) if emb else None
+    
+    month_tag = source_timestamp[:7] if source_timestamp else None
+    
+    db = await get_db()
+    try:
+        await db.execute("""
+            UPDATE memory_milestones 
+            SET category = ?, event_anchor = ?, subconscious_residue = ?, intensity = ?, 
+                source_timestamp = COALESCE(?, source_timestamp),
+                month_tag = COALESCE(?, month_tag),
+                is_active = ?, embedding = ?
+            WHERE id = ?
+        """, (category, event_anchor, subconscious_residue, intensity, source_timestamp, month_tag, is_active, emb_json, milestone_id))
+        await db.commit()
+        return {"message": "更新成功"}
+    finally:
+        await db.close()
+
+@app.post("/admin/api/milestones/{milestone_id}/toggle")
+async def admin_toggle_milestone(milestone_id: int):
+    """切换情感里程碑活跃/归档状态"""
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT is_active FROM memory_milestones WHERE id = ?", (milestone_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="里程碑不存在")
+        new_active = 0 if row["is_active"] == 1 else 1
+        await db.execute("UPDATE memory_milestones SET is_active = ? WHERE id = ?", (new_active, milestone_id))
+        await db.commit()
+        return {"id": milestone_id, "is_active": new_active}
+    finally:
+        await db.close()
+
+@app.delete("/admin/api/milestones/{milestone_id}")
+async def admin_delete_milestone(milestone_id: int):
+    """删除情感里程碑"""
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM memory_milestones WHERE id = ?", (milestone_id,))
+        await db.commit()
+        return {"message": "删除成功"}
+    finally:
+        await db.close()
+
+
 @app.get("/admin/api/fragments")
-async def get_fragments(page: int = 1, page_size: int = 50, tier: int = None):
+async def get_fragments(
+    page: int = 1,
+    page_size: int = 50,
+    status: str = None,        # active / inactive / None=全部
+    tag: str = None,           # 单标签筛选
+    q: str = None,             # 服务端内容搜索
+    sort: str = "created_desc" # created_desc / created_asc / updated_desc
+):
     """获取碎片记忆列表"""
     db = await get_db()
     try:
-        query = "SELECT memory_fragments.*, memories.content as source_text FROM memory_fragments LEFT JOIN memories ON memory_fragments.source_dialogue_id = memories.id WHERE 1=1"
+        where_clauses = ["1=1"]
         params = []
-        if tier is not None:
-            query += " AND memory_fragments.tier = ?"
-            params.append(tier)
+        
+        if status == "active":
+            where_clauses.append("memory_fragments.is_active = 1")
+        elif status == "inactive":
+            where_clauses.append("memory_fragments.is_active = 0")
             
+        if tag:
+            where_clauses.append("memory_fragments.tags LIKE ?")
+            params.append(f"%{tag}%")
+            
+        if q:
+            where_clauses.append("memory_fragments.content LIKE ?")
+            params.append(f"%{q}%")
+            
+        where_sql = " AND ".join(where_clauses)
+        
         # 算总数
-        count_query = "SELECT COUNT(*) FROM memory_fragments WHERE 1=1"
-        if tier is not None:
-            count_query += " AND tier = ?"
-            
+        count_query = f"SELECT COUNT(*) FROM memory_fragments WHERE {where_sql}"
         cursor = await db.execute(count_query, params)
         total_count = (await cursor.fetchone())[0]
         
+        # 排序
+        if sort == "created_asc":
+            order_by = "memory_fragments.created_at ASC, memory_fragments.id ASC"
+        elif sort == "updated_desc":
+            order_by = "COALESCE(memory_fragments.updated_at, memory_fragments.created_at) DESC, memory_fragments.id DESC"
+        else: # created_desc default
+            order_by = "memory_fragments.created_at DESC, memory_fragments.id DESC"
+            
         # 查数据
-        query += " ORDER BY memory_fragments.created_at DESC LIMIT ? OFFSET ?"
-        params.extend([page_size, (page - 1) * page_size])
+        query = f"""
+            SELECT memory_fragments.*, memories.content as source_text 
+            FROM memory_fragments 
+            LEFT JOIN memories ON memory_fragments.source_dialogue_id = memories.id 
+            WHERE {where_sql} 
+            ORDER BY {order_by} 
+            LIMIT ? OFFSET ?
+        """
+        data_params = list(params)
+        data_params.extend([page_size, (page - 1) * page_size])
         
-        cursor = await db.execute(query, params)
+        cursor = await db.execute(query, data_params)
         rows = await cursor.fetchall()
         
         fragments = []
@@ -2138,19 +2492,126 @@ async def get_fragments(page: int = 1, page_size: int = 50, tier: int = None):
     finally:
         await db.close()
 
+@app.get("/admin/api/fragments/stats")
+async def get_fragments_stats():
+    """获取碎片统计数据"""
+    db = await get_db()
+    try:
+        cursor = await db.execute("""
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active,
+                SUM(CASE WHEN is_active = 0 THEN 1 ELSE 0 END) as inactive,
+                SUM(CASE WHEN embedding IS NULL THEN 1 ELSE 0 END) as unvectorized
+            FROM memory_fragments
+        """)
+        row = await cursor.fetchone()
+        return {
+            "success": True,
+            "total": row["total"] or 0,
+            "active": row["active"] or 0,
+            "inactive": row["inactive"] or 0,
+            "unvectorized": row["unvectorized"] or 0,
+        }
+    except Exception as e:
+        logger.error(f"获取碎片统计失败: {e}")
+        return {"success": False, "error": str(e)}
+    finally:
+        await db.close()
+
 @app.post("/admin/api/fragments/{fragment_id}/toggle")
 async def toggle_fragment(fragment_id: int):
     """切换碎片活跃状态"""
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT is_active FROM memory_fragments WHERE id = ?", (fragment_id,))
+        cursor = await db.execute("SELECT is_active, status FROM memory_fragments WHERE id = ?", (fragment_id,))
         row = await cursor.fetchone()
         if not row:
             return {'success': False, 'error': 'Fragment not found'}
-        new_status = 0 if row['is_active'] == 1 else 1
-        await db.execute("UPDATE memory_fragments SET is_active = ? WHERE id = ?", (new_status, fragment_id))
+        new_active = 0 if row['is_active'] == 1 else 1
+        new_status = 'active' if new_active == 1 else ('outdated' if row['status'] == 'outdated' else 'disputed')
+        await db.execute("UPDATE memory_fragments SET is_active = ?, status = ?, updated_at = datetime('now', '+8 hours') WHERE id = ?", (new_active, new_status, fragment_id))
         await db.commit()
-        return {'success': True, 'is_active': new_status}
+        return {'success': True, 'is_active': new_active, 'status': new_status}
+    finally:
+        await db.close()
+
+@app.post("/admin/api/fragments/{fragment_id}/correct")
+async def correct_fragment(fragment_id: int, payload: dict):
+    """
+    记忆纠错接口：
+    action: 'deactivate' | 'rewrite' | 'restore'
+    new_content: str (仅 rewrite 时需要)
+    """
+    action = payload.get("action")
+    new_content = payload.get("new_content", "").strip()
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT id, content FROM memory_fragments WHERE id = ?", (fragment_id,))
+        row = await cursor.fetchone()
+        if not row:
+            return {'success': False, 'error': 'Fragment not found'}
+
+        if action == "deactivate":
+            await db.execute("UPDATE memory_fragments SET is_active = 0, updated_at = datetime('now', '+8 hours') WHERE id = ?", (fragment_id,))
+            await db.commit()
+            return {'success': True, 'action': 'deactivated', 'id': fragment_id}
+
+        elif action == "restore":
+            await db.execute("UPDATE memory_fragments SET is_active = 1, updated_at = datetime('now', '+8 hours') WHERE id = ?", (fragment_id,))
+            await db.commit()
+            return {'success': True, 'action': 'restored', 'id': fragment_id}
+
+        elif action == "rewrite":
+            if not new_content:
+                return {'success': False, 'error': 'new_content is required for rewrite'}
+            from embedding import get_embedding
+            emb = await get_embedding(new_content, is_query=False)
+            if not emb:
+                return {'success': False, 'error': 'Failed to generate embedding for new content'}
+            emb_json = json.dumps(emb)
+            await db.execute(
+                "UPDATE memory_fragments SET content = ?, embedding = ?, is_active = 1, updated_at = datetime('now', '+8 hours') WHERE id = ?",
+                (new_content, emb_json, fragment_id)
+            )
+            await db.commit()
+            return {'success': True, 'action': 'rewritten', 'id': fragment_id, 'new_content': new_content}
+        else:
+            return {'success': False, 'error': f'Unsupported action: {action}'}
+    except Exception as e:
+        logger.error(f"纠错碎片失败: {e}")
+        return {'success': False, 'error': str(e)}
+    finally:
+        await db.close()
+
+@app.post("/admin/api/fragments/batch_correct")
+async def batch_correct_fragments(payload: dict):
+    """
+    批量纠错碎片接口：
+    action: 'deactivate' | 'restore'
+    ids: list[int]
+    """
+    ids = payload.get("ids", [])
+    action = payload.get("action")
+    if not ids or not isinstance(ids, list):
+        return {"success": False, "error": "ids list required"}
+    if action not in ["deactivate", "restore"]:
+        return {"success": False, "error": f"Unsupported batch action: {action}"}
+    
+    db = await get_db()
+    try:
+        placeholders = ",".join(["?"] * len(ids))
+        if action == "deactivate":
+            sql = f"UPDATE memory_fragments SET is_active = 0, updated_at = datetime('now', '+8 hours') WHERE id IN ({placeholders})"
+        elif action == "restore":
+            sql = f"UPDATE memory_fragments SET is_active = 1, updated_at = datetime('now', '+8 hours') WHERE id IN ({placeholders})"
+        
+        await db.execute(sql, ids)
+        await db.commit()
+        return {"success": True, "action": action, "count": len(ids)}
+    except Exception as e:
+        logger.error(f"批量纠错碎片失败: {e}")
+        return {"success": False, "error": str(e)}
     finally:
         await db.close()
 
@@ -2400,3 +2861,150 @@ if __name__ == "__main__":
         reload=False,
         log_level="info"
     )
+# ==================== Proactive 模块 Admin APIs ====================
+from proactive import get_last_ruirui_msg_time, get_next_trigger_time_cst, get_last_proactive_sent_time, get_time_multiplier
+from datetime import datetime
+
+@app.get("/admin/api/proactive/status")
+async def get_proactive_status():
+    from utils import now_cst
+    from config import get_config
+    
+    last_msg = await get_last_ruirui_msg_time()
+    last_sent = await get_last_proactive_sent_time()
+    now = now_cst()
+    
+    # Calculate deltas in minutes
+    delta_minutes = (now.replace(tzinfo=None) - last_msg.replace(tzinfo=None)).total_seconds() / 60.0
+    cooldown_minutes = (now.replace(tzinfo=None) - last_sent.replace(tzinfo=None)).total_seconds() / 60.0
+    
+    next_trigger = await get_next_trigger_time_cst()
+    
+    # Calculate seconds until next trigger
+    if next_trigger:
+        seconds_until = (next_trigger.replace(tzinfo=None) - now.replace(tzinfo=None)).total_seconds()
+        if seconds_until < 0:
+            seconds_until = 0
+    else:
+        seconds_until = None
+        
+    current_time_mult = get_time_multiplier(now)
+    current_level = await get_config('proactive_level', 'high')
+        
+    return {
+        "last_message_time": last_msg.isoformat(),
+        "last_sent_time": last_sent.isoformat(),
+        "delta_minutes": delta_minutes,
+        "cooldown_minutes": cooldown_minutes,
+        "current_time_mult": current_time_mult,
+        "current_level": current_level,
+        "next_trigger_time": next_trigger.isoformat() if next_trigger else None,
+        "seconds_until_trigger": seconds_until
+    }
+
+
+@app.get("/admin/api/proactive/logs")
+async def get_proactive_logs(page: int = 1, limit: int = 20, filter_type: str = 'all'):
+    from database import get_db
+    db = await get_db()
+    try:
+        offset = (page - 1) * limit
+        
+        where_clause = ""
+        params = []
+        if filter_type == 'sent':
+            where_clause = "WHERE event_type = 'sent'"
+        elif filter_type == 'blocked':
+            where_clause = "WHERE event_type = 'blocked'"
+            
+        cursor = await db.execute(f"SELECT COUNT(*) as total FROM proactive_logs {where_clause}", params)
+        total_row = await cursor.fetchone()
+        total = total_row['total']
+        
+        cursor = await db.execute(f"SELECT * FROM proactive_logs {where_clause} ORDER BY created_at DESC LIMIT ? OFFSET ?", params + [limit, offset])
+        rows = await cursor.fetchall()
+        
+        return {
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "logs": [dict(r) for r in rows]
+        }
+    finally:
+        await db.close()
+
+# ==================== Life Hub API 转发路由 ====================
+@app.post("/api/life-hub/{method}")
+@app.post("/admin/api/life-hub/{method}")
+async def proxy_life_hub_endpoint(method: str, request: Request):
+    """
+    转发 Life Hub 请求至 127.0.0.1:8081/api/{method}
+    """
+    import httpx
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    
+    target_url = f"http://127.0.0.1:8081/api/{method}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(target_url, json=body)
+            try:
+                data = resp.json()
+                return JSONResponse(status_code=resp.status_code, content=data)
+            except Exception:
+                return JSONResponse(status_code=resp.status_code, content={"ok": False, "msg": resp.text})
+    except Exception as e:
+        logger.error(f"[LIFE_HUB_PROXY] 转发失败 ({method}): {e}")
+        return JSONResponse(status_code=502, content={"ok": False, "msg": f"Life Hub 服务连接失败: {str(e)}"})
+
+
+# ==================== SimLife API 转发路由 ====================
+@app.post("/api/simlife/{method}")
+@app.post("/admin/api/simlife/{method}")
+async def proxy_simlife_endpoint(method: str, request: Request):
+    """
+    转发 SimLife 请求至 127.0.0.1:8082/api/{method}
+    """
+    import httpx
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    
+    target_url = f"http://127.0.0.1:8082/api/{method}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(target_url, json=body)
+            try:
+                data = resp.json()
+                return JSONResponse(status_code=resp.status_code, content=data)
+            except Exception:
+                return JSONResponse(status_code=resp.status_code, content={"ok": False, "msg": resp.text})
+    except Exception as e:
+        logger.error(f"[SIMLIFE_PROXY] 转发失败 ({method}): {e}")
+        return JSONResponse(status_code=502, content={"ok": False, "msg": f"SimLife 服务连接失败: {str(e)}"})
+
+@app.get("/debug_memory")
+async def debug_memory():
+    import gc, sys
+    objs = gc.get_objects()
+    type_counts = {}
+    type_sizes = {}
+    for obj in objs:
+        t = type(obj).__name__
+        type_counts[t] = type_counts.get(t, 0) + 1
+        try:
+            s = sys.getsizeof(obj)
+            type_sizes[t] = type_sizes.get(t, 0) + s
+        except Exception:
+            pass
+    
+    sorted_sizes = sorted(type_sizes.items(), key=lambda x: x[1], reverse=True)[:20]
+    sorted_counts = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+    return {
+        "total_objects": len(objs),
+        "top_sizes_mb": {k: round(v / (1024*1024), 2) for k, v in sorted_sizes},
+        "top_counts": dict(sorted_counts)
+    }

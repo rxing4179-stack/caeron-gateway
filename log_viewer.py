@@ -30,8 +30,8 @@ class ConnectionManager:
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
-            except Exception:
-                pass
+            except Exception as e:
+                import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
 
 manager = ConnectionManager()
 
@@ -47,10 +47,10 @@ async def cleanup_old_logs():
                         file_date = datetime.strptime(date_str, "%Y-%m-%d")
                         if file_date < cutoff:
                             os.remove(os.path.join(LOGS_DIR, filename))
-                    except:
-                        pass
-        except Exception:
-            pass
+                    except Exception as e:
+                        import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
         await asyncio.sleep(86400) # Check once a day
 
 @log_app.on_event("startup")
@@ -75,8 +75,8 @@ async def log_request_event(source: str, last_user_msg: str, status_code: int, d
     try:
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as e:
+        import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
         
     # Broadcast to WS
     await manager.broadcast(event)
@@ -106,8 +106,8 @@ async def websocket_endpoint(websocket: WebSocket):
                             history.append(json.loads(line))
                 if history:
                     await websocket.send_json({"type": "history", "data": history})
-            except:
-                pass
+            except Exception as e:
+                import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
                 
         while True:
             # Keep connection open

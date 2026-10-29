@@ -1,3 +1,4 @@
+import re
 from utils import now_cst, today_cst_str
 """
 Caeron Gateway - 消息存储管道
@@ -54,7 +55,7 @@ def _generate_fresh_id(messages: list) -> str:
     return hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:16]
 
 
-def generate_conversation_id(messages: list) -> str:
+async def generate_conversation_id(messages: list) -> str:
     """
     基于会话连续性检测生成稳定的对话ID
     
@@ -73,6 +74,41 @@ def generate_conversation_id(messages: list) -> str:
     
     now = _time.time()
     
+    if not _session_state['conversation_id']:
+        try:
+            db = await get_db()
+            cursor = await db.execute(
+                "SELECT conversation_id, created_at FROM messages WHERE role = 'user' AND conversation_id NOT LIKE 'qq-%' ORDER BY id DESC LIMIT 1"
+            )
+            row = await cursor.fetchone()
+            if row:
+                last_conv_id = row['conversation_id']
+                last_created = row['created_at']
+                
+                cursor2 = await db.execute(
+                    "SELECT content FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY id DESC LIMIT 500",
+                    (last_conv_id,)
+                )
+                rows2 = await cursor2.fetchall()
+                hashes = set()
+                for r in rows2:
+                    hashes.add(_hash_content(r['content']))
+                
+                import datetime
+                try:
+                    last_dt = datetime.datetime.strptime(last_created, '%Y-%m-%d %H:%M:%S')
+                    last_ts = last_dt.timestamp()
+                except:
+                    last_ts = now
+                
+                _session_state['conversation_id'] = last_conv_id
+                _session_state['known_msg_hashes'] = hashes
+                _session_state['last_activity'] = last_ts
+                logger.info(f"[SESSION] 重启恢复状态: conv_id={last_conv_id[:8]}, 恢复了 {len(hashes)} 个哈希")
+            await db.close()
+        except Exception as e:
+            logger.error(f"[SESSION] 恢复状态失败: {e}")
+            
     # 提取本次请求中所有user消息的哈希
     incoming_hashes = set()
     for msg in messages:
@@ -94,17 +130,49 @@ def generate_conversation_id(messages: list) -> str:
                      f"(overlap={has_overlap}, timeout={is_timed_out}, known={len(_session_state['known_msg_hashes'])})")
         return _session_state['conversation_id']
     
-    # 新session
+    # 尝试在数据库中通过最近的 user 消息寻找历史会话
+    db = await get_db()
+    try:
+        user_msgs = [m for m in messages if m.get('role') == 'user']
+        if len(user_msgs) > 1:
+            # 使用倒数第二条user消息作为锚点（最后一条通常是新消息）
+            anchor_msg = user_msgs[-2]
+            anchor_content = anchor_msg.get('content', '')
+            if isinstance(anchor_content, list):
+                anchor_content = json.dumps(anchor_content, ensure_ascii=False)
+            
+            cursor = await db.execute(
+                "SELECT conversation_id FROM messages WHERE role = 'user' AND content = ? AND conversation_id NOT LIKE 'qq-%' ORDER BY id DESC LIMIT 1",
+                (anchor_content,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                found_conv_id = row['conversation_id']
+                logger.info(f"[SESSION] 通过数据库锚点找回丢失的session: {found_conv_id[:8]}")
+                _session_state['conversation_id'] = found_conv_id
+                _session_state['last_activity'] = now
+                
+                # 重新加载这个会话的 hashes
+                cursor = await db.execute(
+                    "SELECT content FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY id DESC LIMIT 500",
+                    (found_conv_id,)
+                )
+                rows = await cursor.fetchall()
+                _session_state['known_msg_hashes'] = {_hash_content(r['content']) for r in rows}
+                _session_state['known_msg_hashes'].update(incoming_hashes)
+                return found_conv_id
+    finally:
+        await db.close()
+
+    # 没找到历史会话，创建新session
     new_id = _generate_fresh_id(messages)
     logger.info(f"[SESSION] 新session {new_id[:8]}... "
                 f"(overlap={has_overlap}, timed_out={is_timed_out}, "
-                f"gap={now - _session_state['last_activity']:.0f}s)")
+                f"gap={now - _session_state.get('last_activity', 0):.0f}s)")
     
-    _session_state = {
-        'conversation_id': new_id,
-        'last_activity': now,
-        'known_msg_hashes': incoming_hashes,
-    }
+    _session_state['conversation_id'] = new_id
+    _session_state['last_activity'] = now
+    _session_state['known_msg_hashes'] = incoming_hashes
     return new_id
 
 
@@ -166,8 +234,9 @@ async def ensure_conversation(conversation_id: str, model: str = None, provider_
 async def _delete_excess_messages(db, conversation_id: str, delete_from_index: int):
     # 查出要删除的 messages
     cursor = await db.execute('''
-        SELECT id, role, content FROM messages 
+        SELECT id, role, content, message_index FROM messages 
         WHERE conversation_id = ? AND message_index > ?
+        ORDER BY message_index ASC
     ''', (conversation_id, delete_from_index))
     excess_msgs = await cursor.fetchall()
     
@@ -183,7 +252,7 @@ async def _delete_excess_messages(db, conversation_id: str, delete_from_index: i
     deleted_count = len(excess_msgs)
     logger.info(f"[REROLL_DB_CLEANUP] 对话 {conversation_id[:8]} 删除了 {deleted_count} 条废弃记录 (index > {delete_from_index})")
     
-    # 删 unified_messages 中的对应 assistant 记录
+    # 删 unified_messages 中的对应 assistant 记录和 user 记录
     deleted_assistant_count = sum(1 for m in excess_msgs if m['role'] == 'assistant')
     if deleted_assistant_count > 0:
         await db.execute('''
@@ -194,14 +263,42 @@ async def _delete_excess_messages(db, conversation_id: str, delete_from_index: i
                 ORDER BY id DESC LIMIT ?
             )
         ''', (deleted_assistant_count,))
+        logger.info(f"[REROLL_DB_CLEANUP] 对话 {conversation_id[:8]} 从 unified_messages 删除了 {deleted_assistant_count} 条废弃 assistant 记录")
         
+    deleted_user_count = sum(1 for m in excess_msgs if m['role'] == 'user')
+    if deleted_user_count > 0:
+        await db.execute('''
+            DELETE FROM unified_messages 
+            WHERE id IN (
+                SELECT id FROM unified_messages 
+                WHERE source = 'operit' AND role = 'user'
+                ORDER BY id DESC LIMIT ?
+            )
+        ''', (deleted_user_count,))
+        logger.info(f"[REROLL_DB_CLEANUP] 对话 {conversation_id[:8]} 从 unified_messages 删除了 {deleted_user_count} 条废弃 user 记录")
+        
+    # 关键：立即提交事务，防止后续代码提前 return 导致 SQLite 自动回滚删除操作
+    await db.commit()
+        
+    # 级联清理 summaries 表中相关的轮总（避免重roll废弃的内容残留在轮总中）
+    deleted_times = [m['created_at'] for m in excess_msgs if ('created_at' in m.keys() and m['created_at'])]
+    min_deleted_time = min(deleted_times) if deleted_times else None
+    if min_deleted_time:
+        await db.execute("""
+            UPDATE summaries 
+            SET is_active = 0 
+            WHERE tag = 'round' AND is_active = 1 AND created_at >= ?
+        """, (min_deleted_time,))
+        logger.info(f"[REROLL_DB_CLEANUP] 废弃了 created_at >= {min_deleted_time} 的旧轮总")
+
     # 级联清理 memories 和 memory_fragments
     from utils import clean_chat_text
     dropped_texts = [m['content'] for m in excess_msgs if m['role'] == 'assistant' and m['content']]
-    for text in dropped_texts:
-        cleaned_ast = clean_chat_text(text).strip()
+    for text_val in dropped_texts:
+        cleaned_ast = clean_chat_text(text_val).strip()
         if cleaned_ast:
-            cursor = await db.execute("SELECT id FROM memories WHERE category='dialogue' AND content LIKE ?", ('%' + cleaned_ast + '%',))
+            cursor = await db.execute("SELECT id FROM memories WHERE category='dialogue' AND (content LIKE ? OR content LIKE ?)", 
+                ('%' + cleaned_ast[:60] + '%', '%' + cleaned_ast + '%'))
             mem_rows = await cursor.fetchall()
             mem_ids = [str(r['id']) for r in mem_rows]
             
@@ -210,137 +307,152 @@ async def _delete_excess_messages(db, conversation_id: str, delete_from_index: i
                 await db.execute(f"DELETE FROM memory_fragments WHERE source_dialogue_id IN ({ids_str})")
                 await db.execute(f"DELETE FROM memories WHERE id IN ({ids_str})")
                 logger.info(f"[REROLL_DB_CLEANUP] 删除了 {len(mem_ids)} 条 memories 及其关联碎片")
+    await db.commit()
 
-async def store_incoming_messages(conversation_id: str, messages: list) -> tuple[int, bool, list]:
+async def store_incoming_messages(conversation_id: str, messages: list) -> tuple:
     """
-    增量存储入站消息（兼容Operit滑动窗口）
-    返回 (新增条数, 是否触发了reroll, 新增消息列表)
+    存储客户端发送的一批入站消息，支持智能锚点比对、历史截断(Reroll/回滚/编辑)检测与增量消息写入。
+    返回: (stored_count, was_rerolled, current_turn_messages)
     """
-    chat_messages = [m for m in messages if m.get('role') in ('user', 'assistant', 'tool')]
-    
+    if not messages:
+        return 0, False, []
+
+    chat_messages = [m for m in messages if m.get('role') != 'system']
     if not chat_messages:
         return 0, False, []
-        
-    was_rerolled = False
-    new_messages = []
-    
+
     db = await get_db()
+    was_rerolled = False
     try:
-        # 获取当前对话的最大序号
         cursor = await db.execute(
-            '''SELECT content, message_index FROM messages 
-               WHERE conversation_id = ? 
-               ORDER BY message_index DESC LIMIT 1''',
+            '''SELECT MAX(message_index) as max_idx, COUNT(*) as total_count FROM messages WHERE conversation_id = ?''',
             (conversation_id,)
         )
-        last_stored = await cursor.fetchone()
-        
-        if not last_stored:
-            # 全新对话，全部存入
-            new_messages = chat_messages
-            start_index = 0
-        else:
-            last_index = last_stored['message_index']
-            
-            # 取最近几条已存的USER消息作为锚点候选
-            # （不用assistant消息，因为Operit会修改assistant内容：去掉thinking标签等）
+        row = await cursor.fetchone()
+        last_index = row['max_idx'] if row and row['max_idx'] is not None else 0
+        total_in_db = row['total_count'] if row else 0
+
+        def _norm_text(val):
+            if not val:
+                return ""
+            if isinstance(val, list):
+                val = json.dumps(val, ensure_ascii=False)
+            from utils import clean_chat_text
+            cleaned = clean_chat_text(val)
+            cleaned = re.sub(r'<attachment[^>]*>', '', cleaned).replace('</attachment>', '')
+            cleaned = re.sub(r'\[Time:[^\]]*\]', '', cleaned)
+            return cleaned.strip()
+
+        def _calc_hash(role, val):
+            norm = _norm_text(val)
+            key = norm if norm else (str(val)[:80] if val else "")
+            return hashlib.md5(f"{role}:{key}".encode('utf-8')).hexdigest()[:16]
+
+        # 预计算入站user消息的归一化哈希 → 位置映射
+        incoming_user_hashes = {}
+        for i, msg in enumerate(chat_messages):
+            if msg.get('role') == 'user':
+                h = _calc_hash('user', msg.get('content', ''))
+                incoming_user_hashes[h] = i
+
+        match_pos = -1
+        matched_db_index = -1
+
+        if last_index > 0:
             cursor2 = await db.execute(
-                '''SELECT content, message_index FROM messages 
-                   WHERE conversation_id = ? AND role = 'user'
-                   ORDER BY message_index DESC LIMIT 5''',
+                '''SELECT content, message_index FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY message_index DESC LIMIT 15''',
                 (conversation_id,)
             )
             anchor_candidates = await cursor2.fetchall()
-            
-            # 预计算入站user消息的哈希 → 位置映射
-            incoming_user_hashes = {}
-            for i, msg in enumerate(chat_messages):
-                if msg.get('role') == 'user':
-                    c = msg.get('content', '')
-                    if isinstance(c, list):
-                        c = json.dumps(c, ensure_ascii=False)
-                    h = hashlib.md5(c.encode('utf-8')).hexdigest()[:16]
-                    incoming_user_hashes[h] = i  # 同哈希保留最后出现的位置
-            
-            match_pos = -1
-            matched_db_index = -1
+
             for anchor in anchor_candidates:
-                anchor_content = anchor['content'] or ''
-                anchor_hash = hashlib.md5(anchor_content.encode('utf-8')).hexdigest()[:16]
+                anchor_hash = _calc_hash('user', anchor['content'] or '')
                 if anchor_hash in incoming_user_hashes:
                     match_pos = incoming_user_hashes[anchor_hash]
                     matched_db_index = anchor['message_index']
                     break
-            
-            if match_pos >= 0:
-                # 1. 获取 DB 中在 anchor 之后的所有消息
-                cursor3 = await db.execute(
-                    '''SELECT id, role, content, message_index FROM messages 
-                       WHERE conversation_id = ? AND message_index > ?
-                       ORDER BY message_index ASC''',
-                    (conversation_id, matched_db_index)
-                )
-                db_after_anchor = await cursor3.fetchall()
-                
-                # 2. 准备 incoming 中在 anchor 之后的所有消息
-                incoming_after_anchor_msgs = chat_messages[match_pos + 1:]
-                
-                # 3. 逐个对比，找到分歧点
-                divergence_offset = 0
-                max_compare = min(len(db_after_anchor), len(incoming_after_anchor_msgs))
-                for i in range(max_compare):
-                    db_msg = db_after_anchor[i]
-                    inc_msg = incoming_after_anchor_msgs[i]
-                    
-                    if db_msg['role'] != inc_msg.get('role'):
-                        break
-                        
-                    inc_content = inc_msg.get('content', '')
-                    if isinstance(inc_content, list):
-                        inc_content = json.dumps(inc_content, ensure_ascii=False)
-                    
-                    db_hash = hashlib.md5((db_msg['content'] or '').encode('utf-8')).hexdigest()[:16]
-                    inc_hash = hashlib.md5(inc_content.encode('utf-8')).hexdigest()[:16]
-                    
-                    if db_hash != inc_hash:
-                        break
-                    
+
+        if match_pos >= 0:
+            # 找到锚点，对比锚点之后的消息
+            cursor3 = await db.execute(
+                '''SELECT id, role, content, message_index FROM messages WHERE conversation_id = ? AND message_index > ? ORDER BY message_index ASC''',
+                (conversation_id, matched_db_index)
+            )
+            db_after_anchor = await cursor3.fetchall()
+            incoming_after_anchor_msgs = chat_messages[match_pos + 1:]
+
+            divergence_offset = 0
+            max_compare = min(len(db_after_anchor), len(incoming_after_anchor_msgs))
+            for i in range(max_compare):
+                db_msg = db_after_anchor[i]
+                inc_msg = incoming_after_anchor_msgs[i]
+
+                if db_msg['role'] != inc_msg.get('role'):
+                    break
+
+                if db_msg['role'] == 'assistant':
+                    # Assistant 消息格式差异不作为分歧截断点
                     divergence_offset += 1
-                
-                # ==== 检测历史截断 / Reroll / 回滚 / 编辑 ====
-                # 如果 DB 中在分歧点之后还有消息，说明发生了截断、重置、或消息被编辑，必须删除这些过期的记录
-                if divergence_offset < len(db_after_anchor):
-                    first_invalid_db_index = db_after_anchor[divergence_offset]['message_index']
-                    delete_from_index = first_invalid_db_index - 1
-                    await _delete_excess_messages(db, conversation_id, delete_from_index)
-                    last_index = delete_from_index
-                    was_rerolled = True
-                
-                # 新消息从 分歧点 开始截取并存入数据库
-                slice_start = match_pos + 1 + divergence_offset
-                new_messages = chat_messages[slice_start:]
-                
-                start_index = last_index + 1
-                logger.info(f"[STORE] 锚点匹配成功 pos={match_pos}, db_idx={matched_db_index}, 发现相同消息 {divergence_offset} 条, "
-                           f"新增 {len(new_messages)} 条 (对话: {conversation_id[:8]}...)")
-            else:
-                # 没找到匹配 — 所有锚点都被Operit滑掉了
-                # 截取最后一条user消息及之后的所有消息（确保不丢失tool_result等）
-                last_user_idx = len(chat_messages) - 1
-                while last_user_idx >= 0 and chat_messages[last_user_idx].get('role') != 'user':
-                    last_user_idx -= 1
-                
-                if last_user_idx != -1:
-                    new_messages = chat_messages[last_user_idx:]
+                    continue
+
+                db_norm = _norm_text(db_msg['content'] or '')
+                inc_norm = _norm_text(inc_msg.get('content', ''))
+
+                if db_norm == inc_norm:
+                    divergence_offset += 1
                 else:
-                    new_messages = chat_messages[-1:]
-                    
-                start_index = last_index + 1
-                logger.warning(f"[STORE] 未找到锚点，存储最新user及后续消息 {len(new_messages)} 条 (对话: {conversation_id[:8]}...)")
-        
+                    break
+
+            if divergence_offset < len(db_after_anchor):
+                first_invalid_db_index = db_after_anchor[divergence_offset]['message_index']
+                delete_from_index = first_invalid_db_index - 1
+                await _delete_excess_messages(db, conversation_id, delete_from_index)
+                last_index = delete_from_index
+                was_rerolled = True
+
+            slice_start = match_pos + 1 + divergence_offset
+            new_messages = chat_messages[slice_start:]
+            start_index = last_index + 1
+            logger.info(f"[STORE] 锚点匹配成功 pos={match_pos}, db_idx={matched_db_index}, 发现相同消息 {divergence_offset} 条, 新增 {len(new_messages)} 条 (对话: {conversation_id[:8]}...)")
+        elif last_index > 0:
+            # 存在历史但没有匹配到任何用户锚点 -> 发生了深度回滚或编辑了最初的消息
+            cursor_all = await db.execute(
+                '''SELECT id, role, content, message_index FROM messages WHERE conversation_id = ? ORDER BY message_index ASC''',
+                (conversation_id,)
+            )
+            all_db_msgs = await cursor_all.fetchall()
+            divergence_idx = 0
+            max_c = min(len(all_db_msgs), len(chat_messages))
+            for i in range(max_c):
+                db_m = all_db_msgs[i]
+                inc_m = chat_messages[i]
+                if db_m['role'] != inc_m.get('role'):
+                    break
+                if db_m['role'] == 'assistant':
+                    divergence_idx += 1
+                    continue
+                if _norm_text(db_m['content']) == _norm_text(inc_m.get('content')):
+                    divergence_idx += 1
+                else:
+                    break
+
+            if divergence_idx < len(all_db_msgs):
+                del_from = all_db_msgs[divergence_idx]['message_index'] - 1
+                await _delete_excess_messages(db, conversation_id, del_from)
+                last_index = del_from
+                was_rerolled = True
+
+            new_messages = chat_messages[divergence_idx:]
+            start_index = last_index + 1
+            logger.info(f"[STORE] 深度回滚/编辑匹配 divergence_idx={divergence_idx}, 新增 {len(new_messages)} 条 (对话: {conversation_id[:8]}...)")
+        else:
+            # 纯新会话
+            new_messages = chat_messages
+            start_index = 1
+
         if not new_messages:
-            return 0
-        
+            return 0, was_rerolled, []
+
         now_bj = now_cst().strftime('%Y-%m-%d %H:%M:%S')
         stored = 0
         unified_to_save = []
@@ -348,27 +460,21 @@ async def store_incoming_messages(conversation_id: str, messages: list) -> tuple
             content = msg.get('content', '')
             if isinstance(content, list):
                 content = json.dumps(content, ensure_ascii=False)
-            
+
             await db.execute(
-                '''INSERT INTO messages (conversation_id, role, content, message_index, created_at)
-                   VALUES (?, ?, ?, ?, ?)''',
+                '''INSERT INTO messages (conversation_id, role, content, message_index, created_at) VALUES (?, ?, ?, ?, ?)''',
                 (conversation_id, msg['role'], content, start_index + i, now_bj)
             )
             stored += 1
-            
-            # 记录要同步到 unified_messages 的记录，稍后在关闭当前数据库连接后统一保存，避免死锁
-            if not conversation_id.startswith('qq-'):
-                unified_to_save.append(msg)
-        
-        # 更新对话元信息
+
+            if not conversation_id.startswith('qq-') and msg['role'] != 'assistant':
+                if not unified_to_save or unified_to_save[-1].get('content') != msg.get('content'):
+                    unified_to_save.append(msg)
+
         await db.execute(
-            '''UPDATE conversations 
-               SET last_message_at = datetime('now', '+8 hours'), 
-                   message_count = message_count + ?
-               WHERE conversation_id = ?''',
+            '''UPDATE conversations SET last_message_at = datetime('now', '+8 hours'), message_count = message_count + ? WHERE conversation_id = ?''',
             (stored, conversation_id)
         )
-        
         await db.commit()
         logger.info(f"存储 {stored} 条入站消息 (对话: {conversation_id[:8]}...)")
     except Exception as e:
@@ -377,7 +483,6 @@ async def store_incoming_messages(conversation_id: str, messages: list) -> tuple
     finally:
         await db.close()
 
-    # === 在主数据库连接关闭后，单独保存跨端同步记录，防止写锁冲突死锁 ===
     for msg in unified_to_save:
         await store_unified_message('operit', 'main', msg['role'], msg.get('content', ''))
 
@@ -398,7 +503,11 @@ async def store_unified_message(source: str, source_context: str, role: str, con
     metadata = {}
     
     if role == 'tool':
-        return  # 忽略工具返回结果，避免污染跨端上下文，也防止组装历史时引起 API 校验报错
+        return
+        
+    if isinstance(content, str):
+        if '<tool_result' in content or '<tool_call' in content or '<status type="warning"' in content:
+            return  # 绝不将工具调用结果和警告状态存入统一跨端历史
         
     text_content = content
     char_count = 0
@@ -432,10 +541,13 @@ async def store_unified_message(source: str, source_context: str, role: str, con
         await db.close()
 
 def _is_technical_content(content: str) -> bool:
-    """检测消息是否包含技术内容（代码、命令、文件路径等）"""
+    """检测消息是否包含技术内容（代码、命令、文件路径、工具调用等）"""
     if not isinstance(content, str):
         return False
     
+    if '<tool_result' in content or '<tool_call' in content or '<status' in content:
+        return True
+        
     # 检测代码块标记
     if '```' in content or '~~~' in content:
         return True
@@ -469,52 +581,59 @@ def _is_technical_content(content: str) -> bool:
     
     return False
 
-async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0, filter_technical: bool = False, source_filter: str = None) -> list:
+async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0, filter_technical: bool = False, source_filter: str = None, context_filter: str = None, ruirui_sync: bool = False, keep_image_turns: int = 0) -> list:
     """
-    获取统一的历史记录，按字符数限制（从新到旧截断）
-    exclude_count: 排除最新的N条记录（用于在存入新消息后，重新拉取时不包含新消息）
+    获取统一的历史记录，按字符数限制（从新到旧截断），
+    将连续同一角色的多条消息智能合并为一个回合，保证上下文严格对齐且不丢失任何用户输入与图片。
     """
     db = await get_db()
     try:
-        if source_filter:
+        if context_filter:
             cursor = await db.execute('''
-                SELECT source, source_context, role, content, char_count 
+                SELECT source, source_context, role, content, char_count, timestamp 
+                FROM unified_messages 
+                WHERE source_context = ?
+                ORDER BY timestamp DESC, id DESC LIMIT 150
+            ''', (context_filter,))
+        elif ruirui_sync:
+            cursor = await db.execute('''
+                SELECT source, source_context, role, content, char_count, timestamp 
+                FROM unified_messages 
+                WHERE source = 'operit' OR (source = 'qq' AND source_context LIKE 'private_%')
+                ORDER BY timestamp DESC, id DESC LIMIT 150
+            ''')
+        elif source_filter:
+            cursor = await db.execute('''
+                SELECT source, source_context, role, content, char_count, timestamp 
                 FROM unified_messages 
                 WHERE source = ?
-                ORDER BY timestamp DESC
+                ORDER BY timestamp DESC, id DESC LIMIT 150
             ''', (source_filter,))
         else:
             cursor = await db.execute('''
-                SELECT source, source_context, role, content, char_count 
+                SELECT source, source_context, role, content, char_count, timestamp 
                 FROM unified_messages 
-                ORDER BY timestamp DESC
+                ORDER BY timestamp DESC, id DESC LIMIT 150
             ''')
         rows = await cursor.fetchall()
         
         if exclude_count > 0:
             rows = rows[exclude_count:]
 
-        
-        history = []
+        # 从新到旧筛选出不超过 char_limit 的记录
+        selected_rows = []
         total_chars = 0
+        row_idx = 0
         for row in rows:
-            if total_chars + row['char_count'] > char_limit:
-                break
-            
-            source = row['source']
-            source_context = row['source_context']
-            role = row['role']
+            row_idx += 1
             content = row['content']
             
-            # 【新增】过滤技术内容
+            # 过滤技术内容
             if filter_technical:
-                # 对于字符串内容直接检测
                 if isinstance(content, str) and _is_technical_content(content):
                     continue
-                # 对于多模态消息，检查其中的文本块
                 if content.startswith('[') and '"type"' in content:
                     try:
-                        import json
                         content_obj = json.loads(content)
                         if isinstance(content_obj, list):
                             has_technical = False
@@ -525,8 +644,38 @@ async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0, f
                                         break
                             if has_technical:
                                 continue
-                    except:
+                    except Exception as e:
                         pass
+            
+            if total_chars + row['char_count'] > char_limit:
+                break
+                
+            selected_rows.append((row, row_idx))
+            total_chars += row['char_count']
+            
+        # 翻转为时间正序 (ASC)
+        asc_rows = list(reversed(selected_rows))
+        
+        # 组装并合并连续同一角色的消息（时间间隔>30分钟的不合并，插入分隔）
+        merged_history = []
+        effective_keep = min(keep_image_turns, 3) if keep_image_turns > 0 else 3
+        MERGE_GAP_SECONDS = 1800  # 30分钟
+        
+        prev_timestamp = None
+        
+        for row, r_idx in asc_rows:
+            source = row['source']
+            source_context = row['source_context']
+            role = row['role']
+            content = row['content']
+            row_ts = row['timestamp'] if 'timestamp' in row.keys() else None
+            
+            # 清理 assistant 消息中可能残留的思考过程
+            if role == 'assistant' and isinstance(content, str):
+                content = re.sub(r'<think>[\s\S]*?</think>\s*', '', content)
+                match = re.search(r'(\d{4}年\d{1,2}月\d{1,2}日\s*\d{1,2}:\d{2}[\s\S]*)', content)
+                if match and match.start() > 0:
+                    content = match.group(1)
             
             # 打标签
             prefix = ""
@@ -542,40 +691,75 @@ async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0, f
             elif source == 'operit':
                 prefix = f"[Operit] "
             
-            # 如果是带有系统/附件标签的，避免加前缀破坏解析
             if '<attachment' in content or content.startswith('<system>'):
                 prefix = ""
                 
+            # 处理多模态结构
+            msg_content = None
             if content.startswith('[') and '"type"' in content:
                 try:
-                    import json
                     content_obj = json.loads(content)
                     if isinstance(content_obj, list):
-                        # 核心修复：清理历史记录中的巨大 base64 图片，防止 token 爆炸
-                        for block in content_obj:
-                            if isinstance(block, dict) and block.get("type") == "image_url":
-                                block["type"] = "text"
-                                block["text"] = "[图片]"
-                                if "image_url" in block:
-                                    del block["image_url"]
+                        # 超过保留轮次的图片转换为 [图片] 占位符
+                        if r_idx > effective_keep:
+                            for block in content_obj:
+                                if isinstance(block, dict) and block.get("type") == "image_url":
+                                    block["type"] = "text"
+                                    block["text"] = "[图片]"
+                                    if "image_url" in block:
+                                        del block["image_url"]
 
                         if prefix:
                             if content_obj and content_obj[0].get("type") == "text":
                                 content_obj[0]["text"] = prefix + content_obj[0]["text"]
                             else:
                                 content_obj.insert(0, {"type": "text", "text": prefix})
-                        history.append({'role': role, 'content': content_obj})
-                        total_chars += row['char_count']
-                        continue
-                except:
+                        msg_content = content_obj
+                except Exception:
                     pass
 
-            tagged_content = f"{prefix}{content}"
-            history.append({'role': role, 'content': tagged_content})
-            total_chars += row['char_count']
+            if msg_content is None:
+                msg_content = f"{prefix}{content}"
             
-        # 翻转顺序，按时间正序排列
-        return list(reversed(history))
+            # 计算与上一条消息的时间间隔
+            time_gap_big = False
+            if row_ts and prev_timestamp:
+                try:
+                    from datetime import datetime
+                    ts_fmt = "%Y-%m-%d %H:%M:%S"
+                    t_cur = datetime.strptime(str(row_ts)[:19], ts_fmt)
+                    t_prev = datetime.strptime(str(prev_timestamp)[:19], ts_fmt)
+                    gap_sec = (t_cur - t_prev).total_seconds()
+                    if gap_sec > MERGE_GAP_SECONDS:
+                        time_gap_big = True
+                except Exception:
+                    pass
+            
+            prev_timestamp = row_ts
+                
+            # 智能合并同一角色的连续消息
+            # 但如果时间间隔>30分钟，则不合并，而是插入 [用户未回复] 分隔
+            if merged_history and merged_history[-1]['role'] == role:
+                if time_gap_big:
+                    # 时间间隔大，不合并。插入对方角色的占位消息来分隔
+                    sep_role = 'user' if role == 'assistant' else 'assistant'
+                    merged_history.append({'role': sep_role, 'content': '[对方未回复]'})
+                    merged_history.append({'role': role, 'content': msg_content})
+                else:
+                    # 时间间隔小，正常合并
+                    prev_c = merged_history[-1]['content']
+                    if isinstance(prev_c, str) and isinstance(msg_content, str):
+                        merged_history[-1]['content'] = prev_c + "\n\n" + msg_content
+                    elif isinstance(prev_c, list) and isinstance(msg_content, list):
+                        merged_history[-1]['content'] = prev_c + msg_content
+                    elif isinstance(prev_c, list) and isinstance(msg_content, str):
+                        merged_history[-1]['content'] = prev_c + [{"type": "text", "text": "\n\n" + msg_content}]
+                    elif isinstance(prev_c, str) and isinstance(msg_content, list):
+                        merged_history[-1]['content'] = [{"type": "text", "text": prev_c}] + msg_content
+            else:
+                merged_history.append({'role': role, 'content': msg_content})
+                
+        return merged_history
     except Exception as e:
         logger.error(f"[UNIFIED] 获取统一历史异常: {e}")
         return []
@@ -595,9 +779,15 @@ async def store_assistant_response(conversation_id: str, content: str, source: s
     """
     if not content or not content.strip():
         return
+        
+    if source == 'qq-judge':
+        return
+        
+    if source == 'qq-proactive' and '[SKIP]' in content.upper():
+        return
     
     if skip_messages_table:
-        if source != 'qq':
+        if not source.startswith('qq'):
             await store_unified_message(source, source_context, 'assistant', content)
         return
         
@@ -624,7 +814,7 @@ async def store_assistant_response(conversation_id: str, content: str, source: s
             )
             logger.info(f"覆盖AI回复(重roll) (对话: {conversation_id[:8]}..., {len(content)} 字符)")
             
-            if source != 'qq':
+            if not source.startswith('qq'):
                 # 删除旧的 unified_messages 记录
                 await db.execute('''
                     DELETE FROM unified_messages 
@@ -675,7 +865,7 @@ async def store_assistant_response(conversation_id: str, content: str, source: s
 
     # === 新增：统一历史桥接 ===
     # 在所有数据库清理工作（重roll的删除）完成后，再保存新的 unified_message
-    if source != 'qq':
+    if not source.startswith('qq'):
         await store_unified_message(source, source_context, 'assistant', content)
 
 async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_content: str):
@@ -683,12 +873,11 @@ async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_conte
     db = await get_db()
     try:
         # 1. 查找最近一条 user message
-        cursor = await db.execute(
-            '''SELECT content FROM messages 
-               WHERE conversation_id = ? AND role = 'user' 
-               ORDER BY message_index DESC LIMIT 1''',
-            (conversation_id,)
-        )
+        cursor = await db.execute("""
+            SELECT content FROM messages 
+            WHERE conversation_id = ? AND role = 'user' 
+            ORDER BY message_index DESC LIMIT 1
+        """, (conversation_id,))
         row = await cursor.fetchone()
         user_content = row['content'] if row else ''
         
@@ -699,13 +888,13 @@ async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_conte
                 if isinstance(arr, list):
                     text_parts = [item.get('text', '') for item in arr if item.get('type') == 'text']
                     user_content = '\n'.join(text_parts)
-            except:
-                pass
+            except Exception as e:
+                import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
                 
         # 预处理清洗元数据
         from utils import clean_chat_text
-        cleaned_user = clean_chat_text(user_content)
-        cleaned_ast = clean_chat_text(assistant_content)
+        cleaned_user = clean_chat_text(user_content).strip()
+        cleaned_ast = clean_chat_text(assistant_content).strip()
                 
         # 2. 拼接成对存储
         combined_text = f"User: {cleaned_user}\nAssistant: {cleaned_ast}"
@@ -716,30 +905,48 @@ async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_conte
         
         emb_json = json.dumps(emb_vector) if emb_vector else None
         
-        # 4. 存入 memories 表
-        await db.execute(
-            '''INSERT INTO memories (content, category, embedding, created_at, updated_at)
-               VALUES (?, 'dialogue', ?, datetime('now', '+8 hours'), datetime('now', '+8 hours'))''',
-            (combined_text, emb_json)
-        )
-        await db.commit()
-        logger.info(f"[EMBEDDING] 成功将对话对存入 memories 表并生成向量 (dim={len(emb_vector) if emb_vector else 0})")
+        # 4. 存入 memories 表（精准更新或新增，避免重roll重复插入相同用户的对话对）
+        cursor = await db.execute("""
+            SELECT id FROM memories 
+            WHERE category = 'dialogue' 
+              AND content LIKE ?
+            ORDER BY id DESC LIMIT 1
+        """, (f"User: {cleaned_user}\nAssistant:%",))
+        existing_mem = await cursor.fetchone()
         
-        # === Memory Fragments 提取逻辑 ===
-        # 获取当前轮次计数
+        if existing_mem:
+            await db.execute("""
+                UPDATE memories 
+                SET content = ?, embedding = ?, updated_at = datetime('now', '+8 hours')
+                WHERE id = ?
+            """, (combined_text, emb_json, existing_mem['id']))
+            await db.execute("DELETE FROM memory_fragments WHERE source_dialogue_id = ?", (existing_mem['id'],))
+            await db.commit()
+            logger.info(f"[EMBEDDING] 重roll覆盖更新 dialogue 记忆 (id={existing_mem['id']})")
+        else:
+            await db.execute("""
+                INSERT INTO memories (content, category, embedding, created_at, updated_at)
+                VALUES (?, 'dialogue', ?, datetime('now', '+8 hours'), datetime('now', '+8 hours'))
+            """, (combined_text, emb_json))
+            await db.commit()
+            logger.info(f"[EMBEDDING] 成功将对话对存入 memories 表并生成向量 (dim={len(emb_vector) if emb_vector else 0})")
+        
+        # === Memory Fragments 提取逻辑 (每 8 轮提取一次) ===
         cursor = await db.execute("SELECT value FROM config WHERE key = 'fragment_extraction_round_counter'")
         row = await cursor.fetchone()
-        counter = int(row['value']) if row else 0
+        counter = int(row['value']) if row and row['value'] else 0
         counter += 1
+        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('fragment_extraction_round_counter', ?)", (str(counter),))
+        await db.commit()
         
-        if counter >= 5:
+        if counter >= 8:
             # 重置计数器
             await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('fragment_extraction_round_counter', '0')")
             await db.commit()
             
-            # 取最近5条对话记忆
+            # 取最近 8 轮对话记忆
             cursor = await db.execute(
-                "SELECT id, content FROM memories WHERE category = 'dialogue' ORDER BY id DESC LIMIT 5"
+                "SELECT id, content FROM memories WHERE category = 'dialogue' ORDER BY id DESC LIMIT 8"
             )
             rows = await cursor.fetchall()
             if rows:
@@ -753,11 +960,41 @@ async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_conte
                 # 异步触发提取
                 from memory_extractor import extract_fragments
                 asyncio.create_task(extract_fragments(dialogue_text, dialogue_ids))
-        else:
-            await db.execute(f"INSERT OR REPLACE INTO config (key, value) VALUES ('fragment_extraction_round_counter', '{counter}')")
-            await db.commit()
-            
+                
+                # 异步触发重大情感里程碑提炼
+                from milestone_extractor import extract_milestones
+                asyncio.create_task(extract_milestones(dialogue_text, dialogue_ids))
     except Exception as e:
-        logger.error(f"[EMBEDDING] 对话向量化存储失败: {e}")
+        logger.error(f"存储对话记忆/生成向量失败: {e}")
+    finally:
+        await db.close()
+
+
+async def append_qq_user_message(conversation_id: str, content: str) -> int:
+    """专为 QQ 端安全追加单条用户消息，避免触发全量锚点比对与误删(Reroll)"""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT MAX(message_index) as max_idx FROM messages WHERE conversation_id = ?",
+            (conversation_id,)
+        )
+        row = await cursor.fetchone()
+        next_idx = (row['max_idx'] + 1) if row and row['max_idx'] is not None else 0
+        from utils import now_cst
+        now_bj = now_cst().strftime('%Y-%m-%d %H:%M:%S')
+        await db.execute(
+            "INSERT INTO messages (conversation_id, role, content, message_index, created_at) VALUES (?, ?, ?, ?, ?)",
+            (conversation_id, 'user', content, next_idx, now_bj)
+        )
+        await db.execute(
+            "UPDATE conversations SET last_message_at = ?, message_count = message_count + 1 WHERE conversation_id = ?",
+            (now_bj, conversation_id)
+        )
+        await db.commit()
+        logger.info(f"[STORE] QQ用户消息成功追加至 messages (conv={conversation_id[:8]}, idx={next_idx})")
+        return next_idx
+    except Exception as e:
+        logger.error(f"[STORE] QQ用户消息追加失败: {e}")
+        return -1
     finally:
         await db.close()

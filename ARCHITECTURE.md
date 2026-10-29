@@ -1,330 +1,363 @@
-# Caeron Gateway 架构总览
+# Caeron Gateway 架构文档（代码地图）
 
-## 系统架构图
+> 生成时间：2026-06-07
+> 总代码量：~7800行（13个核心文件）
+> 技术栈：Python 3 + FastAPI + SQLite + httpx
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                            客户端层                                       │
-├──────────────────────┬──────────────────────┬──────────────────────────┤
-│   Operit (Android)   │  QQ Bot (NapCat)    │   SillyTavern (Web)      │
-│   X-Source: operit   │  X-Source: qq       │   (默认 operit)           │
-└──────────┬───────────┴──────────┬───────────┴──────────────┬───────────┘
-           │                      │                           │
-           ▼                      ▼                           ▼
-     POST /v1/chat/completions                         GET /v1/models
-           │                                                  │
-┌──────────┴──────────────────────────────────────────────────┴───────────┐
-│                      Caeron Gateway (FastAPI)                           │
-│  ┌───────────────────────────────────────────────────────────────────┐ │
-│  │ 1. 请求预处理 (main.py)                                           │ │
-│  │    • 解析请求头 (X-Source, X-Session-Id)                          │ │
-│  │    • 总结请求拦截（Operit特殊指令识别）                           │ │
-│  │    • API Key匹配 Provider                                         │ │
-│  └─────────────────────┬─────────────────────────────────────────────┘ │
-│                        ▼                                                │
-│  ┌───────────────────────────────────────────────────────────────────┐ │
-│  │ 2. 消息存储管道 (message_store.py)                                │ │
-│  │    • 会话ID生成/复用（哈希锚定）                                   │ │
-│  │    • 增量存储入站消息                                             │ │
-│  │    • Reroll检测与清理                                             │ │
-│  │    • 技术内容过滤（代码、路径、异常）                              │ │
-│  └─────────────────────┬─────────────────────────────────────────────┘ │
-│                        ▼                                                │
-│  ┌───────────────────────────────────────────────────────────────────┐ │
-│  │ 3. 统一历史桥接 (message_store.py)                                │ │
-│  │    • 从unified_messages读取跨端历史                                │ │
-│  │    • 过滤技术讨论（filter_technical=True）                         │ │
-│  │    • 组装：system + unified_history + current_turn                │ │
-│  └─────────────────────┬─────────────────────────────────────────────┘ │
-│                        ▼                                                │
-│  ┌───────────────────────────────────────────────────────────────────┐ │
-│  │ 4. 注入引擎 (injection.py)                                         │ │
-│  │    ┌─────────────────────────────────────────────────────────┐   │ │
-│  │    │ 条件匹配 (match_condition)                              │   │ │
-│  │    │  • match_model: 按模型名过滤                            │   │ │
-│  │    │  • match_source: 按来源过滤 (operit/qq) ★新增         │   │ │
-│  │    │  • match_length_min: 按消息数过滤                       │   │ │
-│  │    └─────────────────────────────────────────────────────────┘   │ │
-│  │    ┌─────────────────────────────────────────────────────────┐   │ │
-│  │    │ 规则注入 (injection_rules)                              │   │ │
-│  │    │  • system_prepend/append                                │   │ │
-│  │    │  • user_last / depth_N                                  │   │ │
-│  │    │  • assistant_prefill (Claude)                           │   │ │
-│  │    └─────────────────────────────────────────────────────────┘   │ │
-│  │    ┌─────────────────────────────────────────────────────────┐   │ │
-│  │    │ 记忆注入 (summaries)                                    │   │ │
-│  │    │  • <context_summaries>                                  │   │ │
-│  │    │    - 月总 (Monthly)                                     │   │ │
-│  │    │    - 周总 (Weekly)                                      │   │ │
-│  │    │    - 日总 (Daily)                                       │   │ │
-│  │    │    - 轮总 (Round, 按tag分类)                            │   │ │
-│  │    └─────────────────────────────────────────────────────────┘   │ │
-│  │    ┌─────────────────────────────────────────────────────────┐   │ │
-│  │    │ 上下文裁剪                                              │   │ │
-│  │    │  • 删除已被摘要覆盖的旧消息                             │   │ │
-│  │    │  • 控制Token上限                                        │   │ │
-│  │    └─────────────────────────────────────────────────────────┘   │ │
-│  └─────────────────────┬─────────────────────────────────────────────┘ │
-│                        ▼                                                │
-│  ┌───────────────────────────────────────────────────────────────────┐ │
-│  │ 5. Ghost Wall防御 (main.py)                                        │ │
-│  │    • 检测连续工具调用死循环                                        │ │
-│  │    • 超过阈值强制截断                                              │ │
-│  └─────────────────────┬─────────────────────────────────────────────┘ │
-│                        ▼                                                │
-│  ┌───────────────────────────────────────────────────────────────────┐ │
-│  │ 6. 上游路由 (providers.py + proxy.py)                             │ │
-│  │    • 按API Key匹配Provider                                         │ │
-│  │    • 健康检查与熔断                                                │ │
-│  │    • 错误重试（最多2次）                                           │ │
-│  │    • 流式/非流式响应透传                                           │ │
-│  └─────────────────────┬─────────────────────────────────────────────┘ │
-└────────────────────────┼─────────────────────────────────────────────┘
-                         ▼
-           ┌─────────────────────────┐
-           │   上游LLM API            │
-           │  • DeepSeek              │
-           │  • OpenAI                │
-           │  • Claude (Anthropic)    │
-           │  • Gemini                │
-           └─────────────┬───────────┘
-                         │
-                         ▼ (响应)
-           ┌─────────────────────────┐
-           │ 7. 响应拦截与存档        │
-           │  • 拼接Assistant回复     │
-           │  • 存入messages表        │
-           │  • 更新_msg_counter      │
-           └─────────────┬───────────┘
-                         │
-                         ▼
-                  返回给客户端
+## 一、系统总览
 
+网关是一个**智能中转服务器**，架在蕊蕊的前端（Operit/QQ/未来的Caeron Home）和上游AI API（Claude/Deepseek/GPT等）之间。
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         后台任务层 (Async)                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────┐  │
-│  │ 摘要系统 (summarizer.py)                                         │  │
-│  │                                                                  │  │
-│  │  触发方式：                                                       │  │
-│  │   1. 计次触发：_msg_counter达到阈值 → 轮总                        │  │
-│  │   2. Cron触发：                                                  │  │
-│  │      • 每天 23:59 → 日总                                         │  │
-│  │      • 每周日 23:59 → 周总                                       │  │
-│  │      • 每月末 23:59 → 月总                                       │  │
-│  │   3. 手动触发：Operit总结请求 → 轮总                             │  │
-│  │                                                                  │  │
-│  │  生成流程：                                                       │  │
-│  │   1. 从messages表读取原始对话                                     │  │
-│  │   2. 调用上游API生成摘要                                         │  │
-│  │   3. 提取情绪标签(valence/arousal)                               │  │
-│  │   4. 存入summaries表，标记is_active=1                            │  │
-│  │   5. 归档低层级摘要（is_active=0）                                │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-│                                                                         │
-│  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │ 供应商健康探针 (providers.py)                                     │ │
-│  │                                                                   │ │
-│  │  • 每30秒探测一次 /v1/models                                      │ │
-│  │  • 连续失败3次 → is_healthy=0 (熔断)                             │ │
-│  │  • 探测成功 → is_healthy=1 (恢复)                                │ │
-│  └───────────────────────────────────────────────────────────────────┘│
-│                                                                         │
-│  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │ 网易云音乐监控 (music_status.py)                                  │ │
-│  │                                                                   │ │
-│  │  • 每15秒轮询 /listentogether/status                              │ │
-│  │  • 检测播放状态                                                   │ │
-│  │  • 累加时长：elapsed_seconds × 2（房间2人）                       │ │
-│  │  • 保存到music_status.json和music_duration.json                  │ │
-│  └───────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────────┘
+它不只是转发请求——它会在请求经过时做五件事：
+1. **注入**：往消息里塞身份规则、记忆、轮总摘要、音乐状态
+2. **裁剪**：把已被总结覆盖的旧消息裁掉，防止token爆炸
+3. **存储**：把所有对话存入数据库，跨端桥接
+4. **调度**：选最合适的API供应商转发
+5. **后台任务**：自动轮总、记忆提取、音乐监控
 
+## 二、核心文件职责
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         数据持久化层 (SQLite)                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  gateway.db (433MB)                                                     │
-│                                                                         │
-│  核心表：                                                                │
-│   • messages: 原始对话记录（conversation_id, role, content）            │
-│   • summaries: 多级摘要（level, tag, is_active, period_start/end）     │
-│   • conversations: 会话元数据（conversation_id, model, message_count）  │
-│   • providers: 上游API配置（api_base_url, api_key, is_healthy）        │
-│   • injection_rules: 注入规则（content, position, match_condition）    │
-│   • config: 系统配置KV（gateway_master_switch, feature_*）             │
-│   • unified_messages: 跨端消息桥接（source, conversation_id）            │
-│   • memories: 原子记忆（未完全启用）                                     │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### main.py（2383行）— 邮局前台
 
-## 数据流图
+**职责**：所有HTTP路由的入口，请求处理主流程，admin后台API。
 
-### 入站消息流（Operit → Gateway → LLM）
+**关键路由**：
+- `POST /v1/chat/completions` — 核心！Operit/Caeron Home的聊天请求入口
+- `GET/POST /admin/api/*` — 后台管理API（供应商/规则/配置/记忆/轮总）
+- `POST /admin/api/tech-mode` — 技术模式切换
+- `POST /admin/api/trigger-round-summary` — 手动触发轮总
+- `GET /api/music/status` — 音乐状态API
+- `WebSocket /onebot/ws` — QQ Bot的WebSocket连接
 
-```
-Operit发送消息
-  ↓
-[1] main.py接收POST /v1/chat/completions
-  ↓
-[2] 解析X-Source: operit
-  ↓
-[3] message_store.generate_conversation_id()
-  │   • 哈希锚定识别会话
-  │   • 复用或创建conversation_id
-  ↓
-[4] message_store.store_incoming_messages()
-  │   • 增量存储到messages表
-  │   • 检测Reroll并清理
-  │   • 更新_msg_counter
-  ↓
-[5] message_store.get_unified_history()
-  │   • 读取跨端历史（Operit + QQ）
-  │   • 过滤技术内容
-  ↓
-[6] injection.inject(messages, {source: 'operit'})
-  │   • 条件匹配：match_source='operit'
-  │   • 注入规则（最高优先、旧记忆、背景信息等）
-  │   • 注入摘要<context_summaries>
-  │   • 裁剪旧消息
-  ↓
-[7] proxy.proxy_chat_completion()
-  │   • 匹配Provider
-  │   • 转发到上游API
-  ↓
-上游LLM处理
-  ↓
-[8] 响应返回（流式/非流式）
-  │   • proxy.py拼接Assistant回复
-  │   • 存入messages表
-  ↓
-返回给Operit
-```
+**核心请求处理流程（/v1/chat/completions）**：
+1. 解析请求，提取消息列表、模型名
+2. MIME修正（修复octet-stream图片）
+3. 判断来源（Operit/QQ/Caeron Home）
+4. 存储用户消息到message_store
+5. 根据模式选择注入策略：
+   - 日常模式：完整注入（规则+记忆+轮总+语义召回+音乐）+ 裁剪
+   - 技术模式：核心规则+轮总（跳过音乐、跳过裁剪）
+   - QQ来源：只注入记忆（跳过规则，QQ有自己的prompt）
+6. Ghost Wall检测（技术模式跳过）
+7. 选择供应商，转发到上游API（5次retry同一供应商，不做fallback路由）
+8. 收到回复后存储，递增消息计数器
+9. 计数器达阈值时后台触发轮总
 
-### QQ消息流（QQ → NapCat → Gateway → LLM → QQ）
-
-```
-QQ用户@机器人
-  ↓
-NapCat接收消息
-  ↓
-POST到gateway /qq/message
-  ↓
-[1] qq_adapter.py处理
-  │   • 提取群号/用户ID/消息内容
-  │   • 读取QQ侧历史（source='qq'）
-  │   • 过滤Operit技术讨论
-  ↓
-[2] 调用gateway /v1/chat/completions
-  │   • 带请求头 X-Source: qq
-  │   • 带请求头 X-Skip-Rules: true（跳过人格规则）
-  ↓
-[3] injection.inject_memory_only()
-  │   • 仅注入记忆和摘要
-  │   • 跳过Operit专用规则（match_source过滤）
-  ↓
-上游LLM处理
-  ↓
-[4] qq_adapter.split_and_send()
-  │   • 按换行符切分回复
-  │   • 每段延迟500ms
-  ↓
-NapCat发送到QQ群
-```
-
-### 摘要生成流（后台任务）
-
-```
-用户对话中...
-  ↓
-每条消息存入messages表
-  ↓
-_msg_counter递增
-  ↓
-达到阈值（默认16条）
-  ↓
-[后台任务] summarizer.generate_round_summary()
-  │   1. 读取未总结的消息
-  │   2. 按tag分类（日常/技术）
-  │   3. 调用上游API生成摘要
-  │   4. 提取情绪(valence/arousal)
-  │   5. 存入summaries表（is_active=1）
-  │   6. 重置_msg_counter
-  ↓
-日总/周总/月总（Cron触发）
-  │   1. 读取低层级活跃摘要
-  │   2. 生成高层级摘要
-  │   3. 归档低层级（is_active=0）
-  ↓
-下次对话时注入<context_summaries>
-```
-
-## 关键设计决策
-
-### 1. 为什么用SQLite而不是PostgreSQL？
-- 部署简单，无需独立数据库服务
-- 单用户场景，并发压力小
-- 文件级备份方便
-- 未来可平滑迁移到PostgreSQL（SQL语法兼容）
-
-### 2. 为什么要做哈希锚定？
-- Operit的滑动窗口会丢弃早期消息
-- 纯靠messages数组对比无法识别会话延续
-- 哈希overlap检测能准确识别"这是同一个会话的后续"
-
-### 3. 为什么要做渠道隔离？
-- Operit和QQ bot对AI的人格要求不同
-- Operit需要详细的人设规则，QQ需要简洁回复
-- 技术讨论不应该出现在QQ群里
-- 通过match_source实现灵活配置
-
-### 4. 为什么要过滤技术内容？
-- 避免QQ群里的AI输出代码片段（用户体验差）
-- 防止技术讨论污染日常对话的摘要
-- 保持跨端历史的纯粹性
-
-### 5. 为什么摘要系统分四层？
-- 轮总：捕捉短期上下文（16条消息）
-- 日总：压缩单日内容（防止同一天重复摘要）
-- 周总/月总：长期记忆折叠，控制Token膨胀
-- 四层结构在信息密度和查询效率间平衡
-
-## 性能指标
-
-**测试环境**：Ubuntu 22.04, 2 vCPU, 2GB RAM
-
-| 指标 | 数值 |
-|------|------|
-| 单次请求延迟 | 50-200ms（不含上游API） |
-| 数据库大小 | 433MB（约30万条消息） |
-| 注入引擎耗时 | 10-30ms（含规则匹配和摘要读取） |
-| 摘要生成耗时 | 5-15秒（取决于上游API） |
-| 并发能力 | 10 QPS（SQLite限制） |
-| 内存占用 | 60-80MB（稳定运行） |
-
-## 扩展性考虑
-
-### 水平扩展
-当前架构为单实例设计，如需水平扩展：
-
-1. **数据库层**：迁移到PostgreSQL，支持多实例共享
-2. **会话状态**：引入Redis存储session锁，防止并发写冲突
-3. **消息队列**：摘要生成改为异步任务（Celery + RabbitMQ）
-4. **负载均衡**：Nginx反向代理多个gateway实例
-
-### 垂直扩展
-单实例性能优化方向：
-
-1. **数据库索引**：为高频查询字段添加索引
-2. **连接池**：使用aiosqlite的连接池（当前每次创建新连接）
-3. **缓存层**：Redis缓存活跃摘要和规则（减少DB查询）
-4. **批量写入**：消息存储改为批量insert（当前逐条）
+**关键行为变更（06-06~06-07）**：
+- tech_mode持久化到config表（L47-55），重启不丢
+- 健康探针已关闭（L125-128）
+- System Action Required催促语技术模式跳过（L950-952）
+- fallback路由关闭，retry同一供应商（L983-1009）
+- Ghost Wall技术模式豁免（L914）
 
 ---
 
-**文档版本**：2026-06-05
-**维护者**：Caeron Team
+### injection.py（593行）— 注入+裁剪+召回引擎
+
+**职责**：往消息列表里插入各种上下文信息，裁剪旧消息，召回相关记忆。
+
+**三种注入模式**：
+| 方法 | 用途 | 注入内容 |
+|------|------|----------|
+| `inject()` | 日常模式Operit | 身份规则+记忆+轮总+语义召回+音乐+裁剪 |
+| `inject_memory_only()` | QQ | 只轮总（QQ有自己的身份prompt） |
+| `inject_tech_mode()` | 技术模式Operit | priority=0规则+轮总（跳过音乐和裁剪） |
+
+**内部方法**：
+- `_inject_music_status()` — 读music_status.json注入当前播放状态（含歌词/热评/累计时长/风格标签）
+- `_inject_round_summaries()` — 从summaries表拉多级总结（月总/周总/日总/轮总）+ 语义召回 + 裁剪
+- `_replace_variables()` — 替换规则模板里的变量占位符
+
+**语义召回流程（L415-530）**：
+1. 提取最后一条用户纯文本消息（去除attachment标签）
+2. 调用`get_embedding()`生成向量
+3. 碎片召回：`memory_fragments`表，余弦相似度>0.45，加权激活衰减，top5
+4. 原文召回：`memories`表，余弦相似度>0.5，排除碎片已溯源的，top3
+5. 递增碎片`activation_count`
+6. 注入格式：`【脑海中闪回的旧日记忆碎片】` / `【脑海中闪回的旧日历史对话】`
+
+**裁剪流程（L541-575）**：
+1. 分离system消息和对话消息
+2. 固定保留最后50条对话消息（不再依赖_msg_counter，该值在技术模式下会累积到几百导致保留阈值形同虚设）
+3. 保留所有system消息（规则/轮总/召回/音乐不裁）
+4. 日志：`[记忆裁剪-入口]`/`[记忆裁剪-出口]`
+
+**数据来源**：
+- 身份规则：`injection_rules`表（priority/position/role/content）
+- 轮总：`summaries`表（月总/周总/日总/轮总四级）
+- 音乐：`music_status.json`文件 + `music_duration.json`
+- 记忆碎片：`memory_fragments`表（带embedding向量）
+- 原文记忆：`memories`表（带embedding向量）
+
+---
+
+### summarizer.py（965行）— 轮总引擎
+
+**职责**：把大段对话压缩成摘要，供后续注入使用。
+
+**关键方法**：
+- `generate_round_summary(max_messages_override=None)` — 生成一条轮总
+- `_get_global_messages(since_summary, max_messages_override)` — 从messages+unified_messages合并拉取消息
+- `_get_latest_active_round_summary()` — 获取最近一条有效轮总
+
+**工作流程**：
+1. 检查并发锁（防幽灵轮总）
+2. 3分钟去重守卫
+3. 拉取上次轮总之后的所有消息（messages表+unified_messages表合并）
+4. 截取最后N条（默认100，切回日常模式时可覆盖为2000）
+5. 格式化消息（处理多模态/attachment/工具调用标签）
+6. 用DeepSeek V3.2生成摘要
+7. 存入summaries表
+
+**关键变更（06-06~06-07）**：
+- `_get_global_messages`新增`max_messages_override`参数（覆盖默认100条上限）
+- 合并messages+unified_messages(source=operit)，覆盖技术模式期间的对话
+
+---
+
+### message_store.py（762行）— 消息存储
+
+**职责**：管理两张消息表，处理消息的存取和跨端桥接。
+
+**两张核心表**：
+- `messages` — 正式对话记录，轮总从这里拉，日常模式存这里
+- `unified_messages` — 统一消息流，所有来源（Operit/QQ）都存一份，用于跨端桥接
+
+**关键函数**：
+- `store_incoming_messages()` — 存用户消息到messages表
+- `store_unified_message()` — 存到unified_messages表（跨端桥接用）
+- `store_assistant_response()` — 存AI回复（由proxy.py调用）
+- `get_unified_history()` — 拉统一历史（支持`source_filter`按来源过滤）
+- `_is_technical_content()` — 判断消息是否为技术内容（用于QQ过滤）
+
+**技术模式下的存储行为**：
+- 用户消息：只存unified_messages，不存messages（避免触发轮总）
+- AI回复：同上
+- 计数器照常递增（让前端看到"已存X条待总结"）
+
+---
+
+### proxy.py（260行）— 请求转发
+
+**职责**：拿到注入完的消息后，真正发给上游API。
+
+**功能**：
+- `proxy_chat_completion()` — 主转发函数
+- `_proxy_stream()` — 流式转发（SSE）
+- `_proxy_json()` — 非流式转发
+- `clean_system_prompt()` — 清洗上游平台注入的预设（白名单保护用户角色卡）
+- 存储`last_request.json`供调试
+- 流结束后自动调`store_assistant_response`存档
+
+---
+
+### providers.py（419行）— 供应商管理
+
+**职责**：多API供应商路由、优先级选择。
+
+**核心类：ProviderManager**
+- `get_provider(model)` — 根据模型名选供应商（精确匹配→通配→含不健康的）
+- `mark_healthy/mark_unhealthy` — 标记健康状态
+- `update_last_used` — 更新使用时间
+- 后台健康探针：已关闭（06-06）
+- fallback路由：已关闭（06-06），5次retry同一供应商
+
+---
+
+### qq_adapter.py（462行）— QQ Bot适配器
+
+**职责**：处理QQ群/私聊消息，组装请求，切分回复。
+
+**流程**：
+1. NapCat通过WebSocket推来QQ消息
+2. 判断是群聊还是私聊、是否蕊蕊
+3. 解析消息（含图片下载转base64）
+4. 拉QQ历史（source_filter=qq）+ Operit跨端桥接（source_filter=operit，加身份锚定提示）
+5. 用inject_memory_only注入记忆/轮总
+6. 发给网关API
+7. 收到回复后strip_thinking去掉思考标签
+8. 正则去掉时间戳
+9. 按句号/问号/感叹号切分成短消息
+10. 加随机延迟逐条发送到QQ
+
+**身份防线**：
+- 桥接内容加身份硬锚定（06-06 #14）
+- DEFAULT_PROMPT加抗诱导规则
+- 发送前正则剥离时间戳
+
+---
+
+### music_status.py（449行）— 网易云音乐监控
+
+**职责**：每15秒轮询网易云一起听状态，保存到json文件供注入使用。
+
+**监控内容**：当前歌曲/歌手/专辑/风格标签/进度/歌词/热评/累计时长
+
+**注入格式**（06-05 #4完善）：
+```
+<music_status>
+🎵 蕊蕊正在网易云一起听：
+歌曲/歌手/专辑/风格/状态/进度
+📊 一起听了 XXX小时XX分钟
+📝 歌词（前5行）
+💬 热门评论（前2条）
+</music_status>
+```
+
+---
+
+### memory_extractor.py（285行）— 记忆碎片提取
+
+**职责**：从对话中提取值得长期记住的信息碎片。
+
+**工作方式**：
+- 用DeepSeek分析最近对话，以沈栖第一人称视角提取碎片
+- 存入memories表（原文）+ memory_fragments表（碎片），带向量嵌入
+- 后续通过语义召回机制按相似度检索
+
+---
+
+### config.py（80行）— 配置管理
+
+**职责**：从SQLite config表读写动态配置。
+
+**常用配置项**：
+- gateway_master_switch — 总开关
+- feature_injection/memory/summary/qq/health/music — 各功能开关
+- summary_interval — 轮总触发间隔（默认15条消息）
+- _msg_counter — 消息计数器（仅用于轮总触发，不再用于裁剪保留阈值）
+- tech_mode — 技术模式状态（持久化）
+
+---
+
+### database.py（270行）— 数据库连接
+
+**职责**：管理SQLite连接池，初始化表结构。
+
+**核心表**：
+- `providers` — API供应商
+- `injection_rules` — 注入规则
+- `messages` — 对话消息
+- `conversations` — 对话会话
+- `unified_messages` — 统一消息流
+- `summaries` — 轮总摘要（月总/周总/日总/轮总四级）
+- `memories` — 原文记忆（带embedding）
+- `memory_fragments` — 记忆碎片（带embedding + activation_count）
+- `config` — 动态配置
+
+---
+
+### health_status.py（270行）— 健康数据
+
+**职责**：处理小米手环推来的健康数据。目前配了但禁用。
+
+---
+
+### embedding.py（52行）— 向量嵌入
+
+**职责**：调用API生成文本向量，提供余弦相似度计算。
+
+**函数**：
+- `get_embedding(text)` — 生成文本embedding向量
+- `cosine_similarity(a, b)` — 计算两个向量的余弦相似度
+
+---
+
+### utils.py（70行）— 工具函数
+
+**内容**：时间工具（now_cst/today_cst_str/timedelta）、`smart_truncate_dialogue()`（截断对话文本用于召回展示）
+
+---
+
+## 三、数据流图
+
+```
+蕊蕊发消息（Operit/QQ/Caeron Home）
+     ↓
+main.py 接收请求
+     ↓
+┌─ 存储用户消息 → message_store.py → messages表 + unified_messages表
+│
+├─ 注入上下文 → injection.py
+│     ├── 身份规则（injection_rules表）
+│     ├── 多级总结（summaries表：月总/周总/日总/轮总）
+│     ├── 语义召回（memory_fragments表 + memories表，embedding余弦匹配）
+│     ├── 音乐状态（music_status.json + music_duration.json）
+│     └── 裁剪旧消息（固定保留最后50条对话）
+│
+├─ 选择供应商 → providers.py → providers表
+│
+└─ 转发请求 → proxy.py → 上游API（Claude/Deepseek/GPT）
+     ↓
+收到AI回复
+     ↓
+┌─ 存储AI回复 → message_store.py
+├─ 返回给前端
+└─ 后台任务：
+      ├── 消息计数器+1，达阈值触发 summarizer.py 做轮总
+      └── memory_extractor.py 提取记忆碎片（存入memory_fragments）
+```
+
+## 四、已知问题 & 技术债
+
+| 问题 | 严重程度 | 说明 |
+|------|---------|------|
+| fix/patch脚本堆积 | 低 | 50+个一次性脚本没清理，不影响运行 |
+| 记忆提取质量不理想 | 中 | 小模型提取碎片精度不够，需优化prompt或换模型 |
+| 轮总质量不理想 | 中 | 同上 |
+| main.py过大 | 中 | 2383行全塞一个文件，应拆分路由 |
+| QQ技术内容过滤不完善 | 低 | _is_technical_content只认代码特征，中文技术讨论会漏过 |
+| 前端全量发送历史 | 低 | Operit前端不裁剪，网关固定保留50条兜底（已修复，06-07） |
+
+## 五、文件间调用关系
+
+```
+main.py
+  ├── imports: injection.py, message_store.py, proxy.py, providers.py,
+  │           config.py, database.py, summarizer.py, music_status.py,
+  │           qq_adapter.py, health_status.py
+  │
+  ├── injection.py
+  │     └── imports: database.py, config.py, embedding.py,
+  │                  music_status.json(文件读取), music_duration.json(文件读取),
+  │                  utils.py(smart_truncate_dialogue)
+  │
+  ├── summarizer.py
+  │     └── imports: database.py, config.py, providers.py
+  │
+  ├── message_store.py
+  │     └── imports: database.py, embedding.py, memory_extractor.py
+  │
+  ├── proxy.py
+  │     └── imports: message_store.py
+  │
+  ├── providers.py
+  │     └── imports: database.py
+  │
+  ├── qq_adapter.py
+  │     └── imports: message_store.py, injection.py, qq_config.py
+  │
+  ├── embedding.py（独立工具）
+  │
+  └── music_status.py（独立后台任务）
+```
+
+## 六、那50+个历史脚本
+
+全是一次性工具，不参与日常运行。可以安全清理或移到`/archive`目录。
+
+分类：
+- `fix_*.py`（11个）— bug修复脚本
+- `patch_*.py`（8个）— 功能补丁
+- `check_*.py`（6个）— 数据检查
+- `test_*.py`（11个）— 测试脚本
+- `investigate_*.py`（2个）— 问题调查
+- 其他一次性工具
+
+## 七、版本改动时间线
+
+| 日期 | 关键改动 |
+|------|----------|
+| 06-05 | 渠道隔离(match_source)、音乐注入完善(歌词/热评/时长)、技术模式注入修复(priority=0)、Ghost Wall豁免、QQ发串修复(source_filter)、QQ身份注入修复(inject_memory_only)、MIME兜底修复、技术模式注入加轮总 |
+| 06-06 | QQ身份诱导防线、xray代理、GitHub推送、CI编译debug(12+问题修复)、System Action Required跳过、fallback路由关闭、pm2/systemd冲突修复、日志写入修复、代码审计地图 |
+| 06-07 | 裁剪失效修复(\\n字面字符)、语义召回首次验证通过、裁剪引擎首次验证通过、裁剪保留阈值改为固定50条(不再依赖_msg_counter)、Caeron Home 98个编译错误批量stub修复 |
