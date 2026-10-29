@@ -1,3 +1,4 @@
+import re
 
 def clean_summary_for_injection(text: str) -> str:
     """
@@ -298,6 +299,7 @@ class InjectionEngine:
         return len(messages)
 
     def _extract_last_user_msg(self, messages: list[dict]) -> str | None:
+        import re
         for m in reversed(messages):
             if m.get('role') == 'user':
                 c = m.get('content', '')
