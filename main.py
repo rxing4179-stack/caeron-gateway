@@ -1137,7 +1137,7 @@ async def _handle_chat_completions(request: Request):
                 for _b in _mc:
                     if isinstance(_b, dict) and _b.get('type') == 'text' and isinstance(_b.get('text'), str):
                         _t = _b['text']
-                        _cue = "（哥哥你看我拍的这张照片里，画面上具体有什么细节和文字呀？）"
+                        _cue = "（哥哥你看我拍的这张照片里是什么呀？顺着核心画面自然跟我聊就行，别刻意把边角的字幕、进度条、按钮名字或点赞数字挨个报出来呀～）"
                         if _cue not in _t:
                             if '<attachment' in _t:
                                 _idx = _t.find('<attachment')
