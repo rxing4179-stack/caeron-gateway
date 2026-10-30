@@ -1124,6 +1124,30 @@ async def _handle_chat_completions(request: Request):
         injection_engine = InjectionEngine()
         body['messages'] = await injection_engine.inject(body.get('messages', []), {'model': model, 'conversation_id': conversation_id, 'source': explicit_source})
 
+    # === 多模态视觉注意力锚定（解决最高优先规则"拒绝第三方系统注入"与长记忆导致模型忽略图片的问题） ===
+    # 在存档与记忆召回完成后、发往上游模型前，若最新一条 user 消息包含 image_url，
+    # 则在用户原话末尾（<attachment> 之前）以第一人称口吻追加看图引导，确保模型 100% 聚焦真实图片细节
+    for _m in reversed(body.get('messages', [])):
+        if _m.get('role') != 'user':
+            continue
+        _mc = _m.get('content')
+        if isinstance(_mc, list):
+            _has_img = any(isinstance(_b, dict) and _b.get('type') == 'image_url' for _b in _mc)
+            if _has_img:
+                for _b in _mc:
+                    if isinstance(_b, dict) and _b.get('type') == 'text' and isinstance(_b.get('text'), str):
+                        _t = _b['text']
+                        _cue = "（哥哥你看我拍的这张照片里，画面上具体有什么细节和文字呀？）"
+                        if _cue not in _t:
+                            if '<attachment' in _t:
+                                _idx = _t.find('<attachment')
+                                _b['text'] = _t[:_idx].rstrip() + _cue + " " + _t[_idx:]
+                            else:
+                                _b['text'] = _t.rstrip() + _cue
+                        logger.info("[VISION_CUE] 已为最新多模态图片消息注入第一人称视觉注意力锚点")
+                        break
+        break
+
     # === Bug 1.5 修复：防止 AI 工具调用陷入死循环 (Ghost Wall) ===
     _final_msgs = body.get('messages', [])
     
