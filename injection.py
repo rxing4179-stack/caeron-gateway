@@ -321,10 +321,14 @@ class InjectionEngine:
         source = str(request_info.get('source', '') if request_info else '')
 
         # 1. 预启动天气异步获取（若上下文尚未包含天气块）
-        has_weather = any(
-            isinstance(m.get('content', ''), str) and ('【当前天气】' in m.get('content', '') or '<weather_status>' in m.get('content', ''))
-            for m in messages[-15:]
-        )
+        def _msg_has_weather(m):
+            mc = m.get('content', '')
+            if isinstance(mc, str):
+                return '【当前天气】' in mc or '<weather_status>' in mc
+            elif isinstance(mc, list):
+                return any(isinstance(b, dict) and ('【当前天气】' in str(b.get('text', '')) or '<weather_status>' in str(b.get('text', ''))) for b in mc)
+            return False
+        has_weather = any(_msg_has_weather(m) for m in messages[-15:])
         if not has_weather and '_weather_task' not in request_info:
             try:
                 from weather_service import get_weather_formatted, get_last_location
@@ -648,10 +652,12 @@ class InjectionEngine:
     async def _inject_weather_status(self, messages: list[dict], request_info: dict = None):
         """注入高精度实时天气（若消息中已包含【当前天气】附件则跳过，避免重复注入）"""
         try:
-            # 1. 检查消息中是否已由 Operit 附件或 main.py 处理过天气
-            for msg in messages:
+            # 1. 检查消息中是否已由 Operit 附件或 main.py 处理过天气（同时兼容 str 与多模态 list）
+            for msg in messages[-15:]:
                 c = msg.get('content', '')
                 if isinstance(c, str) and ('【当前天气】' in c or '<weather_status>' in c):
+                    return
+                elif isinstance(c, list) and any(isinstance(b, dict) and ('【当前天气】' in str(b.get('text', '')) or '<weather_status>' in str(b.get('text', ''))) for b in c):
                     return
 
             source = str(request_info.get('source', '') if request_info else '')

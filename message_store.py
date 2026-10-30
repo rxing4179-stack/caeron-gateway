@@ -335,13 +335,22 @@ async def store_incoming_messages(conversation_id: str, messages: list) -> tuple
         def _norm_text(val):
             if not val:
                 return ""
+            if isinstance(val, str) and val.lstrip().startswith('['):
+                try:
+                    parsed = json.loads(val)
+                    if isinstance(parsed, list):
+                        val = parsed
+                except Exception:
+                    pass
             if isinstance(val, list):
-                val = json.dumps(val, ensure_ascii=False)
+                text_parts = [b.get('text', '') for b in val if isinstance(b, dict) and b.get('type') == 'text']
+                val = '\n'.join(text_parts) if text_parts else '[IMAGE_ONLY]'
             from utils import clean_chat_text
             cleaned = clean_chat_text(val)
             cleaned = re.sub(r'<attachment[^>]*>', '', cleaned).replace('</attachment>', '')
             cleaned = re.sub(r'\[Time:[^\]]*\]', '', cleaned)
-            return cleaned.strip()
+            res = cleaned.strip()
+            return res if res else '[IMAGE_ONLY]'
 
         def _calc_hash(role, val):
             norm = _norm_text(val)

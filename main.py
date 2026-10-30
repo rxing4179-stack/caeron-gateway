@@ -695,22 +695,45 @@ async def _handle_chat_completions(request: Request):
                 logger.info(f"[IMG_DEBUG] msg[{_dbg_idx}] type=str, contains_attachment! content_preview={_dbg_content[:800]}")
     # === END DEBUG ===
     
-    # === MIME 修正：修复 Operit 前端偶尔将图片标记为 application/octet-stream 的问题 ===
+    # === MIME 修正：修复 Operit 前端偶尔将图片标记为 application/octet-stream 的问题（同时支持 str 与多模态 list） ===
     _mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.bmp': 'image/bmp', '.webp': 'image/webp'}
+    import re as _re
+    def _fix_mime_tag(tag_str):
+        def _fix_m(m):
+            tag = m.group(0)
+            fn_match = _re.search(r'filename="([^"]+)"', tag)
+            if fn_match:
+                fn = fn_match.group(1).lower()
+                for ext, mime in _mime_map.items():
+                    if fn.endswith(ext):
+                        return tag.replace('application/octet-stream', mime)
+            return tag.replace('application/octet-stream', 'image/jpeg')
+        return _re.sub(r'<attachment[^>]*application/octet-stream[^>]*>', _fix_m, tag_str)
+
     for _msg in body.get('messages', [])[-30:]:
         _c = _msg.get('content', '')
         if isinstance(_c, str) and 'application/octet-stream' in _c:
-            import re as _re
-            def _fix_mime(m):
-                tag = m.group(0)
-                fn_match = _re.search(r'filename="([^"]+)"', tag)
-                if fn_match:
-                    fn = fn_match.group(1).lower()
-                    for ext, mime in _mime_map.items():
-                        if fn.endswith(ext):
-                            return tag.replace('application/octet-stream', mime)
-                return tag
-            _msg['content'] = _re.sub(r'<attachment[^>]*application/octet-stream[^>]*>', _fix_mime, _c)
+            _msg['content'] = _fix_mime_tag(_c)
+        elif isinstance(_c, list):
+            _detected_mime = 'image/jpeg'
+            for _blk in _c:
+                if isinstance(_blk, dict) and _blk.get('type') == 'text':
+                    _txt = _blk.get('text', '')
+                    fn_m = _re.search(r'filename="([^"]+)"', _txt)
+                    if fn_m:
+                        _fn = fn_m.group(1).lower()
+                        for _ext, _mtype in _mime_map.items():
+                            if _fn.endswith(_ext):
+                                _detected_mime = _mtype
+                                break
+                    if 'application/octet-stream' in _txt:
+                        _blk['text'] = _fix_mime_tag(_txt)
+            for _blk in _c:
+                if isinstance(_blk, dict) and _blk.get('type') == 'image_url':
+                    _iu = _blk.get('image_url', {})
+                    _u = _iu.get('url', '') if isinstance(_iu, dict) else ''
+                    if 'data:application/octet-stream;base64,' in _u:
+                        _iu['url'] = _u.replace('data:application/octet-stream;base64,', f'data:{_detected_mime};base64,', 1)
     # === END MIME 修正 ===
     
     # 允许通过 Header 显式指定 session_id 和 source
@@ -995,61 +1018,84 @@ async def _handle_chat_completions(request: Request):
     else:
         logger.info(f"[TOOL_CLEANUP] (Operit来源) 保留完整tool链，不清理")
 
-    # === Bug 1 修复：清理幽灵省略号 ===
+    # === Bug 1 修复：清理幽灵省略号（同时支持 str 与多模态 list） ===
     # 客户端在仅发送图片/空消息时可能使用 "..." 或 "…" 占位，导致 AI 误解
-    for msg in body.get('messages', [])[-30:]:
-        if msg.get('role') == 'user' and isinstance(msg.get('content'), str):
-            c = msg['content']
-            if c.startswith('...') or c.startswith('…'):
-                import re
-                text_only = re.sub(r'<attachment[^>]*>[\\s\\S]*?</attachment>', '', c).strip()
-                if text_only in ('...', '…', ''):
-                    c = c.replace('...', '').replace('…', '').strip()
-                    msg['content'] = c if c else ' '
+    def _clean_ghost_ellipsis(c_str: str) -> str:
+        if c_str.startswith('...') or c_str.startswith('…'):
+            text_only = re.sub(r'<attachment[^>]*>[\s\S]*?</attachment>', '', c_str).strip()
+            if text_only in ('...', '…', ''):
+                c_str = re.sub(r'^(\.\.\.|…)+\s*', '', c_str).strip()
+                return c_str if c_str else ' '
+        return c_str
 
-    # === 天气数据注入与高精度替换 (Weather Injection & Optimization) ===
-    # 仅逆向扫描最近 10 条消息，找到最新一条带位置/天气附件的用户消息即刻处理并退出，避免遍历数千条历史消息
+    for msg in body.get('messages', [])[-30:]:
+        if msg.get('role') == 'user':
+            mc = msg.get('content')
+            if isinstance(mc, str):
+                msg['content'] = _clean_ghost_ellipsis(mc)
+            elif isinstance(mc, list):
+                for blk in mc:
+                    if isinstance(blk, dict) and blk.get('type') == 'text' and isinstance(blk.get('text'), str):
+                        blk['text'] = _clean_ghost_ellipsis(blk['text'])
+
+    # === 天气数据注入与高精度替换 (Weather Injection & Optimization，同时支持 str 与多模态 list) ===
+    # 仅逆向扫描最近 10 条消息，找到最新一条带位置/天气附件的用户消息即刻处理并退出
     try:
         from weather_service import get_weather_formatted, save_last_location, get_last_location
         for msg in reversed(body.get('messages', [])[-10:]):
-            if msg.get('role') == 'user' and isinstance(msg.get('content'), str) and '<attachment' in msg['content']:
-                c = msg['content']
-                if '【当前位置】' in c or '【当前天气】' in c:
-                    import re
-                    lat, lon = None, None
-                    m_coord = re.search(r'坐标:\s*([0-9.]+),\s*([0-9.]+)', c)
-                    if not m_coord:
-                        m_coord = re.search(r'地点:\s*([0-9.]+),\s*([0-9.]+)', c)
-                    if m_coord:
-                        try:
-                            lat = float(m_coord.group(1))
-                            lon = float(m_coord.group(2))
-                        except Exception:
-                            pass
+            if msg.get('role') != 'user':
+                continue
+            mc = msg.get('content')
+            target_blk = None
+            c = None
+            if isinstance(mc, str) and '<attachment' in mc:
+                c = mc
+            elif isinstance(mc, list):
+                for blk in mc:
+                    if isinstance(blk, dict) and blk.get('type') == 'text' and '<attachment' in str(blk.get('text', '')):
+                        target_blk = blk
+                        c = blk['text']
+                        break
+            if c and ('【当前位置】' in c or '【当前天气】' in c):
+                lat, lon = None, None
+                m_coord = re.search(r'坐标:\s*([0-9.]+),\s*([0-9.]+)', c)
+                if not m_coord:
+                    m_coord = re.search(r'地点:\s*([0-9.]+),\s*([0-9.]+)', c)
+                if m_coord:
+                    try:
+                        lat = float(m_coord.group(1))
+                        lon = float(m_coord.group(2))
+                    except Exception:
+                        pass
+                
+                address = None
+                m_addr = re.search(r'地址:\s*([^\n\r<]+)', c)
+                if m_addr:
+                    address = m_addr.group(1).strip()
                     
-                    address = None
-                    m_addr = re.search(r'地址:\s*([^\n\r<]+)', c)
-                    if m_addr:
-                        address = m_addr.group(1).strip()
-                        
-                    if lat is not None and lon is not None:
-                        save_last_location(lat, lon, address)
-                    else:
-                        last_loc = get_last_location()
-                        lat, lon, address = last_loc['lat'], last_loc['lon'], last_loc.get('address')
-                        
-                    fresh_weather_text = await get_weather_formatted(lat, lon, address)
+                if lat is not None and lon is not None:
+                    save_last_location(lat, lon, address)
+                else:
+                    last_loc = get_last_location()
+                    lat, lon, address = last_loc['lat'], last_loc['lon'], last_loc.get('address')
                     
-                    if '【当前天气】' in c:
-                        pattern = r'【当前天气】[\s\S]*?(?=(【当前位置】|【当前时间】|【当前屏幕应用】|</attachment>))'
-                        c_new = re.sub(pattern, fresh_weather_text + '\n\n', c)
-                        msg['content'] = c_new
-                        logger.info(f"[WEATHER_INJECT] 成功替换最新 Operit 附件中的天气块为高精度实时天气: {lat}, {lon}")
-                    elif '</attachment>' in c:
-                        c_new = c.replace('</attachment>', f'\n{fresh_weather_text}\n</attachment>')
-                        msg['content'] = c_new
-                        logger.info(f"[WEATHER_INJECT] 在最新 Operit 附件中追加高精度实时天气")
-                    break
+                fresh_weather_text = await get_weather_formatted(lat, lon, address)
+                
+                c_new = c
+                if '【当前天气】' in c:
+                    pattern = r'【当前天气】[\s\S]*?(?=(【当前位置】|【当前时间】|【当前屏幕应用】|</attachment>))'
+                    c_new = re.sub(pattern, fresh_weather_text + '\n\n', c)
+                    logger.info(f"[WEATHER_INJECT] 成功替换最新 Operit 附件中的天气块为高精度实时天气: {lat}, {lon}")
+                elif '</attachment>' in c:
+                    # 优先追加在最后一个 </attachment> 之前（即时间/位置附件内）
+                    r_idx = c.rfind('</attachment>')
+                    c_new = c[:r_idx] + f'\n{fresh_weather_text}\n</attachment>' + c[r_idx + len('</attachment>'):]
+                    logger.info(f"[WEATHER_INJECT] 在最新 Operit 附件中追加高精度实时天气")
+                if target_blk is not None:
+                    target_blk['text'] = c_new
+                else:
+                    msg['content'] = c_new
+                break
     except Exception as e:
         logger.error(f"[WEATHER_INJECT] 天气注入优化处理异常: {e}")
 
