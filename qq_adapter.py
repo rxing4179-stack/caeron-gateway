@@ -533,6 +533,15 @@ async def test_onebot_endpoint(action: str = "get_version_info", user_id: Option
     return {"action": action, "params": params, "response": res}
 
 
+
+def fix_broken_newlines(text: str) -> str:
+    """合并模型在句中或词中误输出的硬换行（前面不是句末标点或右括号的单换行）"""
+    if not text or not isinstance(text, str):
+        return text or ""
+    text = re.sub(r'\r?\n+\s*([，。？！、；：”’）》】\.,\?!])', r'\1', text)
+    text = re.sub(r'(?<![。？！…~～\]）”」!?\n])\r?\n(?!\r?\n)', '', text)
+    return text
+
 def _dedup_reply(reply: str) -> str:
     """检测并移除句子级别的重复模式
     
@@ -592,7 +601,8 @@ async def send_to_gateway(session_id: str, source: str, messages: list):
                 reply = strip_exec_tags(raw_reply)
                 reply = strip_thinking(reply)
                 reply = re.sub(r'\[(QQ|Operit|群聊|私聊|系统|QQ·私聊|QQ·群聊)[^\]]*\]\s*', '', reply)
-                reply = _dedup_reply(reply.strip())
+                reply = fix_broken_newlines(reply.strip())
+                reply = _dedup_reply(reply)
                 return reply
             else:
                 last_err = f"HTTP {resp.status_code}"
@@ -631,6 +641,7 @@ async def split_and_send(target_type: str, target_id: int, reply: str):
     # 1. 过滤 exec 标签与 thinking 标签
     reply = strip_exec_tags(reply)
     reply = strip_thinking(reply)
+    reply = fix_broken_newlines(reply)
     # 2. 全局过滤来源前缀标签（不限行首）
     reply = re.sub(r'\[(QQ|Operit|群聊|私聊|系统|QQ·私聊|QQ·群聊)[^\]]*\]\s*', '', reply)
     # 3. 全局过滤各种格式的时间戳（不限行首）

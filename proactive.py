@@ -365,7 +365,7 @@ async def trigger_proactive(silence_minutes: float):
             recent_sents = await get_recent_sent_summaries(limit=5)
             recent_sent_block = ""
             if recent_sents:
-                recent_sent_lines = "\n".join(f"  - {s[:60]}" for s in recent_sents)
+                recent_sent_lines = "\n".join(f"  - {s.replace(chr(10), '')[:60]}" for s in recent_sents)
                 recent_sent_block = f"""
 【你最近已经发过的主动消息（严禁重复！必须换一个完全不同的话题）】
 {recent_sent_lines}
