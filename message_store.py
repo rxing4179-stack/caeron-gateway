@@ -78,7 +78,7 @@ async def generate_conversation_id(messages: list) -> str:
         try:
             db = await get_db()
             cursor = await db.execute(
-                "SELECT conversation_id, created_at FROM messages WHERE role = 'user' AND conversation_id NOT LIKE 'qq-%' ORDER BY id DESC LIMIT 1"
+                "SELECT conversation_id, created_at FROM messages WHERE role = 'user' AND conversation_id NOT LIKE 'qq-%' AND conversation_id NOT LIKE 'hist_%' ORDER BY created_at DESC, id DESC LIMIT 1"
             )
             row = await cursor.fetchone()
             if row:
@@ -142,7 +142,7 @@ async def generate_conversation_id(messages: list) -> str:
                 anchor_content = json.dumps(anchor_content, ensure_ascii=False)
             
             cursor = await db.execute(
-                "SELECT conversation_id FROM messages WHERE role = 'user' AND content = ? AND conversation_id NOT LIKE 'qq-%' ORDER BY id DESC LIMIT 1",
+                "SELECT conversation_id FROM messages WHERE role = 'user' AND content = ? AND conversation_id NOT LIKE 'qq-%' AND conversation_id NOT LIKE 'hist_%' ORDER BY created_at DESC, id DESC LIMIT 1",
                 (anchor_content,)
             )
             row = await cursor.fetchone()
@@ -837,12 +837,12 @@ async def store_assistant_response(conversation_id: str, content: str, source: s
             # 删除旧的 memory 记录和 memory_fragments
             await db.execute('''
                 DELETE FROM memory_fragments WHERE source_dialogue_id IN (
-                    SELECT id FROM memories WHERE category = 'dialogue' ORDER BY id DESC LIMIT 1
+                    SELECT id FROM memories WHERE category = 'dialogue' ORDER BY created_at DESC, id DESC LIMIT 1
                 )
             ''')
             await db.execute('''
                 DELETE FROM memories WHERE id IN (
-                    SELECT id FROM memories WHERE category = 'dialogue' ORDER BY id DESC LIMIT 1
+                    SELECT id FROM memories WHERE category = 'dialogue' ORDER BY created_at DESC, id DESC LIMIT 1
                 )
             ''')
         else:
@@ -955,7 +955,7 @@ async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_conte
             
             # 取最近 8 轮对话记忆
             cursor = await db.execute(
-                "SELECT id, content FROM memories WHERE category = 'dialogue' ORDER BY id DESC LIMIT 8"
+                "SELECT id, content FROM memories WHERE category = 'dialogue' ORDER BY created_at DESC, id DESC LIMIT 8"
             )
             rows = await cursor.fetchall()
             if rows:

@@ -183,7 +183,7 @@ async def extract_milestones(dialogue_text: str, dialogue_ids: list[int], source
             active_rows = await cursor.fetchall()
             active_list = [dict(r) for r in active_rows]
             
-            if len(active_list) >= 15:
+            if month_tag >= '2026-04' and len(active_list) >= 15:
                 # 触发全月末位淘汰复盘
                 logger.info(f"[Milestones] 当月 {month_tag} 已满 15 条，触发末位淘汰复盘...")
                 await prune_monthly_milestones(db, month_tag, active_list, {
@@ -244,13 +244,13 @@ async def prune_monthly_milestones(db, month_tag: str, active_list: list[dict], 
         "model": "deepseek-ai/DeepSeek-V3",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
-        "max_tokens": 512,
+        "max_tokens": 2000,
         "response_format": {"type": "json_object"}
     }
     
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload, headers=headers, timeout=30.0)
+            resp = await client.post(url, json=payload, headers=headers, timeout=120.0)
             resp.raise_for_status()
             res_json = resp.json()
             reply_text = res_json['choices'][0]['message']['content'].strip()

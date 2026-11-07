@@ -33,7 +33,7 @@ async def check_echo_user(reply_text: str) -> tuple[bool, str]:
         cursor = await db.execute('''
             SELECT content FROM unified_messages 
             WHERE role = 'user' 
-            ORDER BY id DESC LIMIT 20
+            ORDER BY timestamp DESC, id DESC LIMIT 20
         ''')
         u_rows = await cursor.fetchall()
         await db.close()
