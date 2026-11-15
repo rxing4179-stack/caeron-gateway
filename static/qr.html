@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QQ (NapCat) 实时扫码登录</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(circle at top, #1e293b 0%, var(--bg) 65%);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      padding: 20px;
+    }
+    .card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 26px 24px 22px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+      text-align: center;
+    }
+    h1 {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .subtitle {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 18px;
+      line-height: 1.5;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 12px;
+      padding: 4px 11px;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.12);
+      color: var(--accent);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      margin-bottom: 16px;
+    }
+    .badge.ok {
+      background: rgba(34, 197, 94, 0.12);
+      color: var(--ok);
+      border-color: rgba(34, 197, 94, 0.3);
+    }
+    .badge.warn {
+      background: rgba(245, 158, 11, 0.12);
+      color: var(--warn);
+      border-color: rgba(245, 158, 11, 0.3);
+    }
+    .badge.err {
+      background: rgba(239, 68, 68, 0.12);
+      color: var(--err);
+      border-color: rgba(239, 68, 68, 0.3);
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: pulse 1.6s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.8); }
+    }
+    .qr-box {
+      width: 260px;
+      height: 260px;
+      margin: 0 auto 18px;
+      background: #ffffff;
+      border-radius: 14px;
+      padding: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.08);
+    }
+    .qr-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      image-rendering: pixelated;
+      display: block;
+    }
+    .placeholder {
+      color: #64748b;
+      font-size: 13px;
+    }
+    .stats {
+      background: rgba(15, 23, 42, 0.45);
+      border: 1px solid rgba(51, 65, 85, 0.7);
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 13px;
+      text-align: left;
+      display: grid;
+      gap: 7px;
+      margin-bottom: 16px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+    .label { color: var(--muted); }
+    .val { font-variant-numeric: tabular-nums; font-weight: 500; }
+    .actions {
+      display: flex;
+      gap: 10px;
+    }
+    button {
+      flex: 1;
+      border: none;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--accent);
+      color: #082f49;
+      transition: opacity 0.15s, transform 0.1s;
+    }
+    button:hover { opacity: 0.92; }
+    button:active { transform: scale(0.98); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .tip {
+      margin-top: 14px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>小沈 QQ 实时扫码登录</h1>
+    <p class="subtitle">目标账号：3621487982<br />每 3 秒自动检查，二维码过期生成新图后自动无闪烁替换</p>
+
+    <div id="statusBadge" class="badge">
+      <span class="dot"></span>
+      <span id="statusText">正在连接服务器拉取二维码...</span>
+    </div>
+
+    <div class="qr-box">
+      <img id="qrImg" alt="NapCat 登录二维码" style="display:none;" />
+      <span id="placeholder" class="placeholder">加载中...</span>
+    </div>
+
+    <div class="stats">
+      <div class="row">
+        <span class="label">最近检查时间</span>
+        <span id="lastCheckTime" class="val">--:--:--</span>
+      </div>
+      <div class="row">
+        <span class="label">二维码更新时间</span>
+        <span id="lastUpdateTime" class="val">--:--:--</span>
+      </div>
+      <div class="row">
+        <span class="label">当前码已展示</span>
+        <span id="ageText" class="val">-- 秒</span>
+      </div>
+      <div class="row">
+        <span class="label">自动换码次数</span>
+        <span id="changeCount" class="val">0 次</span>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="refreshBtn" type="button">立即刷新检查</button>
+    </div>
+
+    <p class="tip">请用手机 QQ（登录 3621487982 的那一端）扫描上方二维码并确认授权。</p>
+  </main>
+
+  <script>
+    const BASE_URL = (location.protocol === 'http:' || location.protocol === 'https:')
+      ? ''
+      : 'http://1.14.59.116:8080';
+    const QR_ENDPOINT = BASE_URL + '/napcat/qr';
+    const POLL_INTERVAL_MS = 3000;
+
+    const qrImg = document.getElementById('qrImg');
+    const placeholder = document.getElementById('placeholder');
+    const statusBadge = document.getElementById('statusBadge');
+    const statusText = document.getElementById('statusText');
+    const lastCheckTimeEl = document.getElementById('lastCheckTime');
+    const lastUpdateTimeEl = document.getElementById('lastUpdateTime');
+    const ageTextEl = document.getElementById('ageText');
+    const changeCountEl = document.getElementById('changeCount');
+    const refreshBtn = document.getElementById('refreshBtn');
+
+    let lastBase64 = '';
+    let lastUpdateMs = 0;
+    let changeCount = 0;
+    let inFlight = false;
+    let fallbackMode = false;
+    let pollTimer = null;
+
+    function fmtTime(d = new Date()) {
+      return d.toLocaleTimeString('zh-CN', { hour12: false });
+    }
+
+    function setBadge(kind, text) {
+      statusBadge.className = 'badge' + (kind ? ' ' + kind : '');
+      statusText.textContent = text;
+    }
+
+    function arrayBufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary);
+    }
+
+    function refreshViaImageFallback(manual) {
+      const url = QR_ENDPOINT + '?t=' + Date.now();
+      const preloader = new Image();
+      preloader.onload = () => {
+        const isInitial = !lastUpdateMs;
+        qrImg.src = url;
+        qrImg.style.display = 'block';
+        placeholder.style.display = 'none';
+        lastUpdateMs = Date.now();
+        lastUpdateTimeEl.textContent = fmtTime(new Date(lastUpdateMs));
+        changeCountEl.textContent = '直连模式(4秒自动重载)';
+        setBadge('warn', manual ? '已手动刷新（本地文件兼容模式）' : '本地文件兼容模式：每 4 秒平滑拉取最新码');
+        updateAge();
+        inFlight = false;
+        refreshBtn.disabled = false;
+        if (isInitial) {
+          clearInterval(pollTimer);
+          pollTimer = setInterval(() => checkQr(false), 4000);
+        }
+      };
+      preloader.onerror = () => {
+        setBadge('err', '无法连接服务器或二维码未生成');
+        inFlight = false;
+        refreshBtn.disabled = false;
+      };
+      preloader.src = url;
+    }
+
+    async function checkQr(manual = false) {
+      if (inFlight) return;
+      inFlight = true;
+      if (manual) refreshBtn.disabled = true;
+      lastCheckTimeEl.textContent = fmtTime();
+
+      if (fallbackMode) {
+        refreshViaImageFallback(manual);
+        return;
+      }
+
+      try {
+        const resp = await fetch(QR_ENDPOINT + '?t=' + Date.now(), { cache: 'no-store' });
+        if (!resp.ok) {
+          setBadge('err', '拉取失败 HTTP ' + resp.status);
+          return;
+        }
+        const buf = await resp.arrayBuffer();
+        const b64 = arrayBufferToBase64(buf);
+        const changed = b64 !== lastBase64;
+        if (changed) {
+          const isInitial = lastBase64 === '';
+          lastBase64 = b64;
+          qrImg.src = 'data:image/png;base64,' + b64;
+          qrImg.style.display = 'block';
+          placeholder.style.display = 'none';
+          lastUpdateMs = Date.now();
+          lastUpdateTimeEl.textContent = fmtTime(new Date(lastUpdateMs));
+          if (!isInitial) {
+            changeCount += 1;
+            changeCountEl.textContent = changeCount + ' 次';
+            setBadge('ok', '检测到新二维码，已自动更新！');
+          } else {
+            setBadge('ok', '实时监控中（二维码已是最新）');
+          }
+          updateAge();
+        } else {
+          setBadge('ok', manual ? '已检查：当前二维码仍是最新' : '实时监控中（二维码未过期）');
+        }
+      } catch (err) {
+        // file:// 下 fetch 跨源可能被 CORS 拦截，自动切换为 Image 无闪烁模式
+        if (BASE_URL) {
+          fallbackMode = true;
+          refreshViaImageFallback(manual);
+          return;
+        }
+        setBadge('err', '请求失败：' + (err && err.message ? err.message : '网络异常'));
+      } finally {
+        if (!fallbackMode) {
+          inFlight = false;
+          refreshBtn.disabled = false;
+        }
+      }
+    }
+
+    function updateAge() {
+      if (!lastUpdateMs) {
+        ageTextEl.textContent = '-- 秒';
+        return;
+      }
+      const sec = Math.max(0, Math.floor((Date.now() - lastUpdateMs) / 1000));
+      ageTextEl.textContent = sec + ' 秒';
+    }
+
+    refreshBtn.addEventListener('click', () => checkQr(true));
+
+    checkQr(false);
+    pollTimer = setInterval(() => checkQr(false), POLL_INTERVAL_MS);
+    setInterval(updateAge, 1000);
+  </script>
+</body>
+</html>
