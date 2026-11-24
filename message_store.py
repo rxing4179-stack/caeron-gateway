@@ -492,6 +492,14 @@ async def store_incoming_messages(conversation_id: str, messages: list) -> tuple
     finally:
         await db.close()
 
+    # 防呆保护：若因会话ID变更/重新同步导致单次涌入大量历史消息 (>10条)，
+    # 绝不把陈年历史盖上当前时间戳批量灌入 unified_messages 或触发假轮总，仅保留最新 1 条真实用户消息
+    if len(new_messages) > 10:
+        logger.warning(f"[STORE_GUARD] 检测到批量历史重同步 (共 {len(new_messages)} 条, 待同步用户消息 {len(unified_to_save)} 条)，仅写入最新 1 条用户消息至 unified_messages 并跳过历史轮总计数")
+        unified_to_save = unified_to_save[-1:]
+        new_messages = new_messages[-1:]
+        stored = len(new_messages)
+
     for msg in unified_to_save:
         await store_unified_message('operit', 'main', msg['role'], msg.get('content', ''))
 
