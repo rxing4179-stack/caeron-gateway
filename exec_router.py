@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 # 服务路由表：service_name -> 本地端口
 ROUTER_TABLE: Dict[str, int] = {
     "life_hub": 8081,
-    "simlife": 8082,
     "memory": 8081,
 }
 

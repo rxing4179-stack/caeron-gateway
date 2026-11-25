@@ -66,7 +66,34 @@ async def init_db():
             )
         ''')
 
-                # ==================== 饮食与体重记录表 ====================\n        await db.execute('''\n            CREATE TABLE IF NOT EXISTS diet_log (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                date TEXT NOT NULL DEFAULT (date('now', '+8 hours')),\n                time TEXT NOT NULL DEFAULT (strftime('%H:%M', 'now', '+8 hours')),\n                meal_type TEXT NOT NULL,\n                food_name TEXT NOT NULL,\n                portion TEXT,\n                calories INTEGER DEFAULT 0,\n                note TEXT DEFAULT '',\n                created_at TEXT DEFAULT (datetime('now', '+8 hours'))\n            )\n        ''')\n        await db.execute('CREATE INDEX IF NOT EXISTS idx_diet_date ON diet_log(date)')\n\n        await db.execute('''\n            CREATE TABLE IF NOT EXISTS weight_log (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                date TEXT NOT NULL UNIQUE DEFAULT (date('now', '+8 hours')),\n                weight REAL NOT NULL,\n                note TEXT DEFAULT '',\n                created_at TEXT DEFAULT (datetime('now', '+8 hours'))\n            )\n        ''')\n        await db.execute('CREATE INDEX IF NOT EXISTS idx_weight_date ON weight_log(date)')\n\n# ==================== 提示词注入规则表 ====================
+        # ==================== 饮食与体重记录表 ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS diet_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL DEFAULT (date('now', '+8 hours')),
+                time TEXT NOT NULL DEFAULT (strftime('%H:%M', 'now', '+8 hours')),
+                meal_type TEXT NOT NULL,
+                food_name TEXT NOT NULL,
+                portion TEXT,
+                calories INTEGER DEFAULT 0,
+                note TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_diet_date ON diet_log(date)')
+
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS weight_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE DEFAULT (date('now', '+8 hours')),
+                weight REAL NOT NULL,
+                note TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_weight_date ON weight_log(date)')
+
+        # ==================== 提示词注入规则表 ====================
         await db.execute('''
             CREATE TABLE IF NOT EXISTS injection_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

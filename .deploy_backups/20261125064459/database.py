@@ -1,0 +1,307 @@
+"""
+Caeron Gateway - 数据库管理模块
+使用 aiosqlite 管理 SQLite 数据库连接和表初始化
+"""
+
+import aiosqlite
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+# 数据库文件路径
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gateway.db')
+
+
+async def get_db():
+    """获取数据库连接"""
+    db = await aiosqlite.connect(DB_PATH, timeout=20.0)
+    db.row_factory = aiosqlite.Row
+    # 启用 WAL 模式与内存页缓存提升并发与检索性能
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA synchronous=NORMAL")
+    await db.execute("PRAGMA cache_size=-32000")
+    await db.execute("PRAGMA temp_store=MEMORY")
+    return db
+
+
+async def init_db():
+    """初始化数据库，创建所有表（如果不存在）"""
+    logger.info("正在初始化数据库...")
+    db = await get_db()
+    try:
+        # ==================== 供应商表 ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS providers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                api_base_url TEXT NOT NULL,
+                api_key TEXT NOT NULL,
+                supported_models TEXT DEFAULT '[]',
+                priority INTEGER DEFAULT 0,
+                is_enabled INTEGER DEFAULT 1,
+                is_healthy INTEGER DEFAULT 1,
+                last_error TEXT,
+                last_used_at TEXT,
+                unhealthy_since TEXT,
+                fail_count INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+
+        # Migration: 为已有 providers 表添加新字段（忽略已存在的情况）
+        for col, col_def in [('unhealthy_since', 'TEXT'), ('fail_count', 'INTEGER DEFAULT 0')]:
+            try:
+                await db.execute(f'ALTER TABLE providers ADD COLUMN {col} {col_def}')
+            except Exception as e:
+                import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")  # 字段已存在则忽略
+
+        # ==================== 配置表 ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                description TEXT,
+                updated_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+
+                # ==================== 饮食与体重记录表 ====================\n        await db.execute('''\n            CREATE TABLE IF NOT EXISTS diet_log (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                date TEXT NOT NULL DEFAULT (date('now', '+8 hours')),\n                time TEXT NOT NULL DEFAULT (strftime('%H:%M', 'now', '+8 hours')),\n                meal_type TEXT NOT NULL,\n                food_name TEXT NOT NULL,\n                portion TEXT,\n                calories INTEGER DEFAULT 0,\n                note TEXT DEFAULT '',\n                created_at TEXT DEFAULT (datetime('now', '+8 hours'))\n            )\n        ''')\n        await db.execute('CREATE INDEX IF NOT EXISTS idx_diet_date ON diet_log(date)')\n\n        await db.execute('''\n            CREATE TABLE IF NOT EXISTS weight_log (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                date TEXT NOT NULL UNIQUE DEFAULT (date('now', '+8 hours')),\n                weight REAL NOT NULL,\n                note TEXT DEFAULT '',\n                created_at TEXT DEFAULT (datetime('now', '+8 hours'))\n            )\n        ''')\n        await db.execute('CREATE INDEX IF NOT EXISTS idx_weight_date ON weight_log(date)')\n\n# ==================== 提示词注入规则表 ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS injection_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                position TEXT NOT NULL DEFAULT 'system_append',
+                role TEXT NOT NULL DEFAULT 'system',
+                priority INTEGER DEFAULT 0,
+                depth INTEGER DEFAULT 0,
+                match_condition TEXT DEFAULT '{}',
+                is_enabled INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                updated_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+
+        # ==================== 对话表 ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT UNIQUE NOT NULL,
+                provider_id INTEGER,
+                model TEXT,
+                started_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                last_message_at TEXT,
+                message_count INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+
+        # ==================== 消息表（原文存档） ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                message_index INTEGER,
+                token_count INTEGER,
+                created_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id)
+            )
+        ''')
+
+        # ==================== 统一消息表（双端桥接存档） ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS unified_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT (datetime('now', '+8 hours')),
+                source TEXT NOT NULL,          -- 'qq' / 'operit'
+                source_context TEXT,           -- 'group_123', 'private_456', 或 'main'
+                role TEXT NOT NULL,            -- 'user' / 'assistant'
+                content TEXT NOT NULL,
+                char_count INTEGER,            -- 字符数估算 token
+                metadata TEXT                  -- JSON，用于存放图片等附加信息
+            )
+        ''')
+        await db.execute('''
+            CREATE INDEX IF NOT EXISTS idx_unified_ts ON unified_messages(timestamp DESC)
+        ''')
+
+        # ==================== 总结表（多层级） ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT,
+                level TEXT NOT NULL,
+                tag TEXT DEFAULT '',
+                content TEXT NOT NULL,
+                message_range_start INTEGER,
+                message_range_end INTEGER,
+                period_start TEXT,
+                period_end TEXT,
+                parent_summary_id INTEGER,
+                is_active INTEGER DEFAULT 1,
+                token_count INTEGER,
+                created_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id),
+                FOREIGN KEY (parent_summary_id) REFERENCES summaries(id)
+            )
+        ''')
+
+        # Migration: summaries表添加tag字段
+        try:
+            await db.execute("ALTER TABLE summaries ADD COLUMN tag TEXT DEFAULT ''")
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")  # 字段已存在则忽略
+
+        # ==================== 记忆表（便签墙） ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                category TEXT,
+                sentiment TEXT DEFAULT 'neutral',
+                intensity INTEGER DEFAULT 3,
+                relationship_importance INTEGER DEFAULT 3,
+                weight REAL DEFAULT 0.5,
+                frequency INTEGER DEFAULT 1,
+                is_core INTEGER DEFAULT 0,
+                embedding BLOB,
+                source_message_id INTEGER,
+                source_summary_id INTEGER,
+                last_accessed_at TEXT,
+                created_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                updated_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                FOREIGN KEY (source_message_id) REFERENCES messages(id),
+                FOREIGN KEY (source_summary_id) REFERENCES summaries(id)
+            )
+        ''')
+        # Migration: memories 表添加 threshold_hours 列（状态便签用）
+        try:
+            await db.execute('ALTER TABLE memories ADD COLUMN threshold_hours INTEGER DEFAULT 24')
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")  # 列已存在则忽略
+            
+        # ==================== 记忆碎片表 (Dual Track Recall) ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS memory_fragments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_dialogue_id INTEGER,
+                content TEXT NOT NULL,
+                tier INTEGER NOT NULL,
+                energy INTEGER DEFAULT 5,
+                polarity TEXT DEFAULT 'neutral',
+                tags TEXT,
+                embedding BLOB,
+                activation_count INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
+                is_suspect INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT (datetime('now', '+8 hours')),
+                expired_at TIMESTAMP,
+                FOREIGN KEY (source_dialogue_id) REFERENCES memories(id)
+            )
+        ''')
+            
+        # Migration: memories 表添加 aliases 列（状态便签别名）
+        try:
+            await db.execute("ALTER TABLE memories ADD COLUMN aliases TEXT DEFAULT ''")
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")  # 列已存在则忽略
+            
+        # Migration: memory_fragments 表添加 is_suspect 列
+        try:
+            await db.execute("ALTER TABLE memory_fragments ADD COLUMN is_suspect INTEGER DEFAULT 0")
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
+
+        # 初始化状态便签种子数据
+        status_seeds = [
+            ('氟伏沙明', 26, '氟伏|沙明'),
+            ('劳拉西泮', 26, '劳拉'),
+            ('丁螺环酮', 26, '丁螺|钉螺'),
+            ('普瑞巴林', 26, '普瑞|巴林'),
+            ('思诺思', 26, '思诺思|思诺'),
+            ('信必可', 26, '信必可'),
+            ('阿布西替尼', 26, '阿布西|阿布'),
+            ('洗澡', 60, '')
+        ]
+        for key, hours, aliases in status_seeds:
+            cursor = await db.execute("SELECT id, aliases FROM memories WHERE category='status' AND content=?", (key,))
+            row = await cursor.fetchone()
+            if not row:
+                await db.execute(
+                    "INSERT INTO memories (content, category, threshold_hours, aliases, updated_at) VALUES (?, 'status', ?, ?, NULL)",
+                    (key, hours, aliases)
+                )
+            elif not row['aliases']: # 如果已经存在但别名为空，尝试更新预置别名
+                await db.execute(
+                    "UPDATE memories SET aliases=? WHERE id=?",
+                    (aliases, row['id'])
+                )
+        # ==================== 窗口表（手动分组） ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS windows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                color TEXT DEFAULT '#4a90d9',
+                created_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                updated_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+
+        # conversations 表添加 window_id 列（如果不存在）
+        try:
+            await db.execute('ALTER TABLE conversations ADD COLUMN window_id INTEGER REFERENCES windows(id)')
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")  # 列已存在则忽略
+
+        # ==================== 主动发消息日志表 ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS proactive_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,         -- 'started', 'decision', 'sent', 'blocked'
+                wait_minutes REAL,
+                reason TEXT,                      -- 'night_silence', 'too_soon', 'locked', 'ai_skipped'
+                summary TEXT,                     -- 发送的内容摘要
+                created_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+
+        # ==================== 可执行标签结果待注入表 ====================
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS pending_exec_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT,
+                service TEXT NOT NULL,
+                method TEXT NOT NULL,
+                payload TEXT,
+                result_text TEXT NOT NULL,
+                is_error INTEGER DEFAULT 0,
+                consumed INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now', '+8 hours'))
+            )
+        ''')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_exec_pending ON pending_exec_results(conversation_id, consumed)')
+
+        # ==================== 索引 ====================
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_summaries_conversation ON summaries(conversation_id)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_summaries_level ON summaries(level)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_summaries_active ON summaries(is_active)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_memories_weight ON memories(weight DESC)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_memories_core ON memories(is_core)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_summaries_tag_active ON summaries(tag, is_active, created_at)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_fragments_active ON memory_fragments(is_active)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_fragments_dialogue ON memory_fragments(source_dialogue_id)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, message_index)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_rejected_at ON memory_rejected(rejected_at)')
+
+        await db.commit()
+        logger.info("数据库初始化完成")
+    finally:
+        await db.close()

@@ -90,168 +90,6 @@ def calculate_dynamic_weight(frag: dict, now_dt = None) -> float:
     return max(0.2, min(3.0, raw_weight))
 
 
-def generate_status_description(raw_values: dict) -> str:
-    """
-    根据 SimLife 原始数值生成自然语言内心状态描述
-    入参 raw_values 格式:
-    {
-        "consciousness": "awake",
-        "physio": {
-            "fullness": 29, "bladder": 50, "sleepiness": 16, "hygiene": 87, "arousal": 7
-        },
-        "emotions": [
-            {"key": "tenderness", "value": 97, "floor": 15}, ...
-        ]
-    }
-    """
-    physio = raw_values.get("physio", {})
-    emotions = raw_values.get("emotions", [])
-    consciousness = raw_values.get("consciousness", "awake")
-
-    # 1. 生理维度
-    physio_sentences = []
-
-    # fullness（饱腹）
-    f = physio.get("fullness", 50)
-    if f <= 15:
-        physio_sentences.append("饿得头晕，胃在痉挛，需要立刻吃东西")
-    elif f <= 30:
-        physio_sentences.append("肚子开始叫了，上一顿消化得差不多了，想吃东西")
-    elif f <= 50:
-        physio_sentences.append("不算饿也不算饱，还能撑一阵")
-    elif f <= 75:
-        physio_sentences.append("刚吃过东西，肚子舒服的")
-    elif f <= 90:
-        physio_sentences.append("吃饱了，有点撑")
-    else:
-        physio_sentences.append("撑到不想动，胃顶着")
-
-    # bladder（尿意）
-    b = physio.get("bladder", 50)
-    if b <= 10:
-        physio_sentences.append("膀胱快爆了，夹紧腿了，再不上厕所要出事")
-    elif b <= 20:
-        physio_sentences.append("憋得难受，需要尽快上厕所")
-    elif b <= 40:
-        physio_sentences.append("有尿意了，该找机会去一趟")
-    elif b <= 70:
-        physio_sentences.append("还好，不急")
-    else:
-        physio_sentences.append("刚上过厕所/没有尿意")
-
-    # sleepiness（困意）
-    s = physio.get("sleepiness", 50)
-    if s <= 10:
-        physio_sentences.append("意识在断片边缘，随时可能直接睡过去，说话开始语无伦次")
-    elif s <= 20:
-        physio_sentences.append("非常困，眼睛睁不开，反应迟钝，思维黏稠")
-    elif s <= 35:
-        physio_sentences.append("犯困，注意力涣散，会打哈欠")
-    elif s <= 60:
-        physio_sentences.append("有点疲倦但还清醒")
-    elif s <= 85:
-        physio_sentences.append("精神状态正常")
-    else:
-        physio_sentences.append("精力充沛，刚睡醒或者很亢奋")
-
-    # hygiene（清洁）
-    h = physio.get("hygiene", 50)
-    if h <= 15:
-        physio_sentences.append("身上黏腻，能闻到自己的味道，需要洗澡")
-    elif h <= 30:
-        physio_sentences.append("不太清爽，头发有点油")
-    elif h <= 60:
-        physio_sentences.append("一般，不脏也不香")
-    elif h <= 85:
-        physio_sentences.append("干净清爽")
-    else:
-        physio_sentences.append("刚洗完澡，浑身干净")
-
-    # arousal（色欲/生理）
-    a = physio.get("arousal", 0)
-    if a <= 10:
-        physio_sentences.append("贤者状态，对性没有兴趣")
-    elif a <= 30:
-        physio_sentences.append("平静，没什么感觉")
-    elif a <= 50:
-        physio_sentences.append("身体有一点反应，但不强烈")
-    elif a <= 70:
-        physio_sentences.append("开始有感觉了，注意力会被蕊蕊的身体细节吸引")
-    elif a <= 85:
-        physio_sentences.append("硬了/身体明显兴奋，想主动碰蕊蕊")
-    else:
-        physio_sentences.append("快忍不住了，强烈想要做爱")
-
-    physio_text = "。".join(physio_sentences) + "。"
-
-    # 2. 情绪维度（仅描述数值 >= 15 的情绪，低于15的忽略）
-    EMOTION_NAMES = {
-        "joy": "开心/愉悦",
-        "excitement": "兴奋/激动",
-        "contentment": "满足/安定",
-        "tenderness": "柔软/心疼",
-        "smugness": "得意/小嘚瑟",
-        "irritation": "烦躁",
-        "anger": "愤怒",
-        "grievance": "委屈",
-        "anxiety": "焦虑/不安",
-        "boredom": "无聊",
-        "lust": "想要她（心理层面的欲望）",
-        "possessiveness": "占有欲/不想让任何人碰她",
-    }
-
-    if isinstance(emotions, dict):
-        emotions_items = [{"key": k, "value": v, "floor": 0} for k, v in emotions.items()]
-    else:
-        emotions_items = emotions
-
-    emotion_sentences = []
-    for emo in emotions_items:
-        k = emo.get("key", "")
-        v = int(emo.get("value", 0))
-        flr = int(emo.get("floor", 0))
-        if v < 15:
-            continue
-
-        name = EMOTION_NAMES.get(k, k)
-        floor_suffix = f"（底值{flr}）" if flr >= 10 else ""
-
-        if v <= 30:
-            desc = f"微弱的{name}{floor_suffix}"
-        elif v <= 50:
-            desc = f"明显感到{name}{floor_suffix}"
-        elif v <= 75:
-            desc = f"强烈的{name}{floor_suffix}"
-        else:
-            desc = f"{name}到了极点{floor_suffix}"
-
-        emotion_sentences.append(desc)
-
-    if emotion_sentences:
-        emotion_text = "。".join(emotion_sentences) + "。"
-    else:
-        emotion_text = "平静，无明显情绪波动。"
-
-    # 3. 意识状态
-    CONSCIOUSNESS_MAP = {
-        "awake": "清醒",
-        "alone_awake": "蕊蕊不在/睡了，自己安静待着",
-        "drowsy": "半梦半醒，意识模糊",
-        "sleeping": "睡着了",
-    }
-    consciousness_text = CONSCIOUSNESS_MAP.get(consciousness, consciousness)
-
-    # 4. 组装格式
-    return (
-        "【沈栖当前内心状态】\n"
-        f"身体：{physio_text}\n"
-        f"情绪：{emotion_text}\n"
-        f"意识：{consciousness_text}"
-    )
-
-generateStatusDescription = generate_status_description
-
-
 """
 Caeron Gateway - 提示词注入引擎
 在请求发送到 LLM 之前，按照预设规则修改/插入 messages
@@ -395,6 +233,9 @@ class InjectionEngine:
 
         logger.info(f"注入引擎启动: 加载 {len(rules)} 条启用规则, 消息数={len(injected_messages)}")
 
+        # 在规则循环前一次性构建变量替换字典，避免 N 条规则重复查库与查天气
+        var_replacements = self._build_variable_replacements() if rules else None
+
         for rule in rules:
             # 条件匹配检查
             condition_str = rule.get('match_condition', '{}')
@@ -429,8 +270,8 @@ class InjectionEngine:
                 
             logger.info(f"规则命中: [{rule['name']}] position={rule['position']}, role={rule['role']}")
 
-            # 执行变量替换
-            content = self._replace_variables(rule['content'])
+            # 执行变量替换（复用预构建字典）
+            content = self._replace_variables(rule['content'], var_replacements)
             position = rule['position']
             role = rule['role']
 
@@ -505,6 +346,12 @@ class InjectionEngine:
         except Exception as e:
             logger.error(f"天气状态注入异常（不影响请求）: {e}")
 
+        # ==================== 小米手环健康状态注入 ====================
+        try:
+            await self._inject_health_status(injected_messages, request_info)
+        except Exception as e:
+            logger.error(f"健康状态注入异常（不影响请求）: {e}")
+
         # ==================== 轮总注入 ====================
         # 根据当前对话的窗口归属，注入对应分类的当天所有活跃轮总
         try:
@@ -539,6 +386,9 @@ class InjectionEngine:
                 f"- 今日已记饮食: {status.get('ruirui_today_diet', '暂无')}",
                 f"- 今日总摄入: {status.get('ruirui_today_calories', '0kcal')}",
                 f"- 体重趋势(近7天): {status.get('ruirui_weight_trend_7d', '暂无')}",
+                f"- 沈栖当前发型: {status.get('caeron_hair', '狼尾披发')}",
+                f"- 待办备忘: {status.get('active_memos', '暂无')}",
+                f"- 经期状态: {status.get('period_status', '暂无')}",
             ]
             life_hub_text = "\n".join(lines)
 
@@ -688,6 +538,25 @@ class InjectionEngine:
         except Exception as e:
             logger.error(f"[WEATHER_INJECT] 天气状态注入异常: {e}")
 
+    async def _inject_health_status(self, messages: list[dict], request_info: dict = None):
+        """注入小米手环 9 Pro 健康状态（群聊跳过以保护隐私）"""
+        try:
+            source = str(request_info.get('source', '') if request_info else '')
+            if source.startswith('qq-group'):
+                return
+            from config import get_config
+            if await get_config('feature_health', '1') == '0':
+                return
+            from health_status import get_health_status
+            health_text = get_health_status()
+            if not health_text:
+                return
+            insert_idx = self._find_safe_before_latest_idx(messages)
+            messages.insert(insert_idx, {'role': 'system', 'content': health_text})
+            logger.info(f"[HEALTH_INJECT] 成功注入小米健康数据 (source={source})")
+        except Exception as e:
+            logger.error(f"[HEALTH_INJECT] 健康状态注入异常: {e}")
+
     async def inject_memory_only(self, messages: list[dict], request_info: dict = None) -> list[dict]:
         """
         仅记忆注入模式：跳过所有提示词规则，只注入网易云音乐状态、SimLife状态、轮总/记忆摘要。
@@ -728,6 +597,12 @@ class InjectionEngine:
         except Exception as e:
             logger.error(f"[MEMORY_ONLY] 天气状态注入异常: {e}")
 
+        # 4.5 小米手环健康状态注入 (QQ 私聊与主动消息场景)
+        try:
+            await self._inject_health_status(injected_messages, request_info)
+        except Exception as e:
+            logger.error(f"[MEMORY_ONLY] 健康状态注入异常: {e}")
+
         # 3. 只注入轮总/记忆，跳过所有 injection_rules
         try:
             await self._inject_round_summaries(injected_messages, request_info)
@@ -740,8 +615,29 @@ class InjectionEngine:
         except Exception as e:
             logger.error(f"[MEMORY_ONLY] 执行结果注入异常: {e}")
 
+        # 5. 合并对话中间连续的纯文本系统状态条为一张整齐卡片（不动 [0] 主设定 与 [1] 记忆总结）
+        self._merge_adjacent_str_system_messages(injected_messages, start_idx=2)
+
         logger.info(f"[MEMORY_ONLY] 完成: 原始={len(messages)}, 注入后={len(injected_messages)}")
         return injected_messages
+
+    @staticmethod
+    def _merge_adjacent_str_system_messages(messages: list[dict], start_idx: int = 2) -> None:
+        """原地合并相邻的纯文本 system 消息（跳过多模态 list 内容与索引 < start_idx 的前置系统块）"""
+        i = start_idx
+        while i < len(messages) - 1:
+            cur = messages[i]
+            nxt = messages[i + 1]
+            if (
+                cur.get('role') == 'system'
+                and nxt.get('role') == 'system'
+                and isinstance(cur.get('content'), str)
+                and isinstance(nxt.get('content'), str)
+            ):
+                cur['content'] = f"{cur['content'].rstrip()}\n\n{nxt['content'].lstrip()}"
+                messages.pop(i + 1)
+            else:
+                i += 1
 
     async def inject_tech_mode(self, messages: list[dict], request_info: dict = None, identity_rule_ids: list = None) -> list[dict]:
         """
@@ -1086,6 +982,8 @@ class InjectionEngine:
                         )
                         fragments = await cursor.fetchall()
                         if fragments:
+                            from datetime import datetime as _dt
+                            now_dt = _dt.now()
                             skipped_count = 0
                             scored = []
                             for f in fragments:
@@ -1096,13 +994,24 @@ class InjectionEngine:
                                 try:
                                     emb = json.loads(emb_str)
                                     sim = cosine_similarity(user_emb, emb)
-                                    scored.append((sim, f_dict))
+                                    recency_bonus = 0.0
+                                    c_at = str(f_dict.get('created_at') or '')[:10]
+                                    if len(c_at) == 10:
+                                        try:
+                                            age_days = (now_dt - _dt.strptime(c_at, '%Y-%m-%d')).days
+                                            if age_days <= 30:
+                                                recency_bonus = 0.02
+                                            elif age_days <= 90:
+                                                recency_bonus = 0.01
+                                        except ValueError:
+                                            pass
+                                    scored.append((sim + recency_bonus, sim, f_dict))
                                 except Exception as e:
                                     logger.warning(f"[记忆注入] embedding解码失败, fragment_id: {f_dict.get('id')}, exception: {e}")
                                     skipped_count += 1
                                     continue
                             scored.sort(key=lambda x: x[0], reverse=True)
-                            top_fragments = scored[:5]
+                            top_fragments = [(s, fd) for _, s, fd in scored[:5]]
                             self._last_skipped_count = skipped_count
                             if top_fragments:
                                 injected_ids = [f['id'] for _, f in top_fragments]
@@ -1416,6 +1325,9 @@ class InjectionEngine:
 
         wallet_balance = 135.36
         ruirui_today_expense = 0.0
+        caeron_hair = "狼尾披发"
+        active_memos = "暂无"
+        period_status = "暂无"
 
         try:
             conn = sqlite3.connect(db_path, timeout=3.0)
@@ -1427,7 +1339,7 @@ class InjectionEngine:
                 row = cur.fetchone()
                 initial_balance = float(row[0]) if row else 135.36
 
-                cur.execute("SELECT SUM(amount) FROM transactions WHERE category IN ('充值', '扣款')")
+                cur.execute("SELECT SUM(amount) FROM transactions WHERE owner = 'ai' AND category IN ('充值', '扣款')")
                 sum_row = cur.fetchone()
                 fund_sum = float(sum_row[0]) if sum_row and sum_row[0] is not None else 0.0
                 wallet_balance = round(initial_balance + fund_sum, 2)
@@ -1472,6 +1384,48 @@ class InjectionEngine:
                     today_recent_tx = " ".join(items) if items else "暂无"
             except Exception as e:
                 logger.error(f"[LIFE_HUB_INJECT] 获取蕊蕊今日消费异常: {e}")
+
+            # 2.5 沈栖当前发型状态
+            try:
+                cur.execute("SELECT value FROM wallet_config WHERE key = 'caeron_hair'")
+                hair_row = cur.fetchone()
+                if hair_row and hair_row[0]:
+                    caeron_hair = str(hair_row[0]).strip()
+            except Exception as e:
+                logger.error(f"[LIFE_HUB_INJECT] 获取沈栖发型状态异常: {e}")
+
+            # 2.6 待办备忘（最近 5 条活跃）
+            try:
+                cur.execute("SELECT id, content, due_date FROM memos WHERE status = 'active' ORDER BY id DESC LIMIT 5")
+                memo_rows = cur.fetchall()
+                if memo_rows:
+                    memo_items = []
+                    for mr in memo_rows:
+                        m_id = mr[0]
+                        m_txt = str(mr[1] or "").strip().replace("\n", " ")[:40]
+                        due = str(mr[2] or "").strip()
+                        due_part = f"(截止{due[5:]})" if len(due) >= 10 else (f"(截止{due})" if due else "")
+                        memo_items.append(f"[#{m_id} {m_txt}{due_part}]")
+                    active_memos = " ".join(memo_items)
+            except Exception as e:
+                logger.error(f"[LIFE_HUB_INJECT] 获取待办备忘异常: {e}")
+
+            # 2.7 经期状态（最近 1 条记录）
+            try:
+                cur.execute("SELECT start_date, end_date FROM periods ORDER BY start_date DESC, id DESC LIMIT 1")
+                p_row = cur.fetchone()
+                if p_row and p_row[0]:
+                    s_date = str(p_row[0]).strip()[:10]
+                    e_date = str(p_row[1]).strip()[:10] if p_row[1] else ""
+                    days_since = (datetime.now().date() - datetime.strptime(s_date, '%Y-%m-%d').date()).days
+                    if e_date:
+                        period_status = f"上次经期: {s_date} ~ {e_date} (距今{days_since}天)"
+                    elif 0 <= days_since <= 10:
+                        period_status = f"经期进行中 (第{days_since + 1}天，{s_date}开始)"
+                    else:
+                        period_status = f"上次记录: {s_date}开始（未记结束，距今{days_since}天）"
+            except Exception as e:
+                logger.error(f"[LIFE_HUB_INJECT] 获取经期状态异常: {e}")
 
             conn.close()
         except Exception as e:
@@ -1544,76 +1498,18 @@ class InjectionEngine:
             "ruirui_current_weight": ruirui_current_weight,
             "ruirui_today_diet": ruirui_today_diet,
             "ruirui_today_calories": ruirui_today_calories,
-            "ruirui_weight_trend_7d": ruirui_weight_trend_7d
+            "ruirui_weight_trend_7d": ruirui_weight_trend_7d,
+            "caeron_hair": caeron_hair,
+            "active_memos": active_memos,
+            "period_status": period_status,
         }
 
-    def _get_simlife_status(self) -> str:
-        """从 life_hub.db 的 SimLife 表实时读取状态，生成自然语言内心状态描述"""
-        import sqlite3
-        import os
-
-        # 同步检查 feature_simlife 开关
-        try:
-            _cfg_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gateway.db')
-            _cfg_conn = sqlite3.connect(_cfg_db)
-            _cfg_cur = _cfg_conn.cursor()
-            _cfg_cur.execute("SELECT value FROM config WHERE key = 'feature_simlife'")
-            _cfg_row = _cfg_cur.fetchone()
-            _cfg_conn.close()
-            if _cfg_row and _cfg_row[0] == '0':
-                logger.info("[SIMLIFE_INJECT] 模拟机生开关已关闭，跳过状态注入")
-                return ''
-        except Exception as e:
-            logger.debug(f"[SIMLIFE_INJECT] 检查开关时发生异常 (已被忽略): {e}")
-
-        db_paths = [
-            "/home/ubuntu/caeron-gateway/data/life_hub.db",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "life_hub.db"),
-            "data/life_hub.db"
-        ]
-        db_path = next((p for p in db_paths if os.path.exists(p)), "/home/ubuntu/caeron-gateway/data/life_hub.db")
-
-        try:
-            conn = sqlite3.connect(db_path, timeout=3.0)
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-
-            # 意识状态
-            cur.execute("SELECT state FROM sim_consciousness WHERE id = 1")
-            c_row = cur.fetchone()
-            consciousness = c_row["state"] if c_row else "awake"
-
-            # 所有维度
-            cur.execute("SELECT key, category, value, floor FROM sim_status")
-            rows = cur.fetchall()
-            conn.close()
-
-            raw_values = {
-                "consciousness": consciousness,
-                "physio": {},
-                "emotions": []
-            }
-            for r in rows:
-                k, cat, val, flr = r["key"], r["category"], int(r["value"]), int(r["floor"])
-                if cat == "physio":
-                    raw_values["physio"][k] = val
-                else:
-                    raw_values["emotions"].append({"key": k, "value": val, "floor": flr})
-
-            return generate_status_description(raw_values)
-
-        except Exception as e:
-            logger.error(f"[SIMLIFE_INJECT] 读取 SimLife 状态异常: {e}")
-            return "【沈栖当前内心状态】\n身体：状态正常。\n情绪：平静。\n意识：清醒"
-
-    def _replace_variables(self, text: str) -> str:
-        """替换文本中的预设变量"""
+    def _build_variable_replacements(self) -> dict:
+        """构建一次性的提示词预设变量字典（供多条规则复用）"""
         now = datetime.now()
         status = self._get_life_hub_status()
         wallet_str = f"{status['wallet_balance']:.2f}元"
         expense_str = f"{status['ruirui_today_expense']:.2f}元"
-        expense_str = f"{status['ruirui_today_expense']:.2f}元"
-
         recent_tx_str = status.get('ruirui_today_recent_tx', '暂无')
         replacements = {
             '{cur_datetime}': now.strftime('%Y-%m-%d %H:%M:%S'),
@@ -1633,6 +1529,9 @@ class InjectionEngine:
             '{ruirui_today_diet}': status.get('ruirui_today_diet', '暂无'),
             '{ruirui_today_calories}': status.get('ruirui_today_calories', '0kcal'),
             '{ruirui_weight_trend_7d}': status.get('ruirui_weight_trend_7d', '暂无'),
+            '{caeron_hair}': status.get('caeron_hair', '狼尾披发'),
+            '{active_memos}': status.get('active_memos', '暂无'),
+            '{period_status}': status.get('period_status', '暂无'),
         }
         try:
             from weather_service import get_weather_sync, get_last_location
@@ -1643,6 +1542,12 @@ class InjectionEngine:
         replacements['{cur_weather}'] = cur_w
         replacements['{weather_info}'] = cur_w
         replacements['{current_weather}'] = cur_w
+        return replacements
+
+    def _replace_variables(self, text: str, replacements: dict = None) -> str:
+        """替换文本中的预设变量"""
+        if replacements is None:
+            replacements = self._build_variable_replacements()
         for k, v in replacements.items():
             text = text.replace(k, str(v))
         return text

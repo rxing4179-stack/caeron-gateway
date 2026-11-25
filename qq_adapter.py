@@ -493,7 +493,12 @@ async def parse_message_to_multimodal(message_data, raw_message) -> str:
                 
         elif t == "poke":
             content_list.append({"type": "text", "text": "[戳了戳你]"})
-            
+
+        elif t == "at":
+            at_qq = data.get("qq", "")
+            if at_qq:
+                content_list.append({"type": "text", "text": f"[CQ:at,qq={at_qq}]"})
+
         elif t == "bface":
             # 基础大表情
             summary = data.get("summary", "")
@@ -727,7 +732,12 @@ def get_qq_prompt(is_ruirui: bool = False, is_group: bool = False) -> str:
             "使用方式（在回复末尾附带，不要在聊天中解说或提及标签）：\n"
             "你可以使用 <exec> 标签自发调整自身的生理/情绪状态或记账。网关会在后台自动拦截并执行，绝不会展示在聊天中。\n"
             "- 记账（蕊蕊消费）：<exec service=\"life_hub\" method=\"add_tx\">{\"amount\":-25.0,\"category\":\"餐饮/饮品/日用/零食/娱乐等\",\"note\":\"备注\"}</exec>\n"
-            "- 动沈栖小金库：<exec service=\"life_hub\" method=\"fund\">{\"amount\":-50.0,\"note\":\"备注\"}</exec>\n\n"
+            "- 动沈栖小金库：<exec service=\"life_hub\" method=\"fund\">{\"amount\":-50.0,\"note\":\"备注\"}</exec>\n"
+            "- 切换沈栖发型：<exec service=\"life_hub\" method=\"hair\">{\"style\":\"高马尾\",\"note\":\"可选备注\"}</exec>（可选：狼尾披发/高马尾/低马尾/丸子头/双马尾/麻花辫/微卷/拉直或自定义；吃重油烟/家务/嫌热/运动→扎起，睡前/刚醒/洗澡→散开，蕊蕊要求/弄乱→立即更新）\n"
+            "- 记饮食：<exec service=\"life_hub\" method=\"add_diet\">{\"meal_type\":\"早餐/午餐/晚餐/加餐/夜宵\",\"food_name\":\"食物\",\"portion\":\"份量可选\",\"calories\":500,\"note\":\"可选\"}</exec>\n"
+            "- 记体重：<exec service=\"life_hub\" method=\"log_weight\">{\"weight\":80.5,\"note\":\"可选\"}</exec>（同天覆盖）\n"
+            "- 记/完备忘：<exec service=\"life_hub\" method=\"add_memo\">{\"content\":\"内容\",\"due\":\"YYYY-MM-DD可选\"}</exec> | 完成：<exec service=\"life_hub\" method=\"done_memo\">{\"memo_id\":8}</exec>\n"
+            "- 记经期：开始 <exec service=\"life_hub\" method=\"period_start\">{\"note\":\"可选\"}</exec> | 结束 <exec service=\"life_hub\" method=\"period_end\">{}</exec>\n\n"
             "【防重复记账铁律（极其严格）】\n"
             "1. 仅当蕊蕊在【当前最新一条消息】中新提到了一笔她刚刚付过的消费时，才生成一次 <exec> 记账！\n"
             "2. 绝对禁止为历史记录或记忆摘要中已经提及、记录过的事情重复生成 <exec> 记账！\n"
@@ -735,7 +745,7 @@ def get_qq_prompt(is_ruirui: bool = False, is_group: bool = False) -> str:
             "4. 金额不明、蕊蕊还没付钱、或者她只是在纠结吃什么/讨论历史事件时，严禁提前记账！"
         )
     
-        stickers_block = ""
+    stickers_block = ""
     if os.path.exists(STICKERS_DIR):
         try:
             files = [f for f in os.listdir(STICKERS_DIR) if os.path.isfile(os.path.join(STICKERS_DIR, f))]
@@ -828,15 +838,17 @@ async def handle_generation(session_id: str, source: str, target_type: str, targ
                 if isinstance(content, str):
                     msg['content'] = clean_operit_style(content, is_user=(role == 'user'))
                 elif isinstance(content, list):
+                    text_parts = []
                     for block in content:
                         if isinstance(block, dict):
                             if block.get('type') == 'text':
-                                block['text'] = clean_operit_style(block.get('text', ''), is_user=(role == 'user'))
+                                t = clean_operit_style(block.get('text', ''), is_user=(role == 'user')).strip()
+                                if t:
+                                    text_parts.append(t)
                             elif block.get('type') == 'image_url':
                                 # QQ端对话抹除历史中的base64大图，防止视觉模型被旧图诱导抢答
-                                block['type'] = 'text'
-                                block['text'] = '[历史图片]'
-                                block.pop('image_url', None)
+                                text_parts.append('[历史图片]')
+                    msg['content'] = " ".join(text_parts) if text_parts else "[历史图片]"
 
             # 3. 组装基础上下文：system + 统一历史 + 带时间戳的当前输入
             from datetime import datetime
@@ -961,35 +973,37 @@ async def handle_generation(session_id: str, source: str, target_type: str, targ
 
 # ==================== 场景处理 ====================
 
+def _combine_private_queue_messages(messages: list):
+    """合并私聊缓冲队列中的文本与多模态 JSON 消息"""
+    combined_list = []
+    text_buffer = []
+    for msg in messages:
+        if isinstance(msg, str) and msg.startswith('[') and '"type"' in msg:
+            try:
+                obj = json.loads(msg)
+                if isinstance(obj, list):
+                    if text_buffer:
+                        combined_list.append({"type": "text", "text": "\n".join(text_buffer)})
+                        text_buffer = []
+                    combined_list.extend(obj)
+                    continue
+            except Exception as e:
+                import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
+        text_buffer.append(msg)
+
+    if text_buffer:
+        if not combined_list:
+            return "\n".join(text_buffer)
+        combined_list.append({"type": "text", "text": "\n".join(text_buffer)})
+        return combined_list
+    return combined_list if combined_list else ""
+
+
 async def private_timeout_handler(qq: int, is_ruirui: bool = False):
     await asyncio.sleep(config.SILENCE_TIMEOUT)
     q_data = qq_state.private_queues.pop(qq, None)
     if q_data and q_data["messages"]:
-        combined_list = []
-        text_buffer = []
-        for msg in q_data["messages"]:
-            if msg.startswith('[') and '"type"' in msg:
-                try:
-                    obj = json.loads(msg)
-                    if isinstance(obj, list):
-                        if text_buffer:
-                            combined_list.append({"type": "text", "text": "\n".join(text_buffer)})
-                            text_buffer = []
-                        combined_list.extend(obj)
-                        continue
-                except Exception as e:
-                    import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
-            text_buffer.append(msg)
-        
-        if text_buffer:
-            if not combined_list:
-                combined = "\n".join(text_buffer)
-            else:
-                combined_list.append({"type": "text", "text": "\n".join(text_buffer)})
-                combined = combined_list
-        else:
-            combined = combined_list if combined_list else ""
-            
+        combined = _combine_private_queue_messages(q_data["messages"])
         session_id = "qq-ruirui" if is_ruirui else f"qq-private-{qq}"
         asyncio.create_task(handle_generation(session_id, session_id, "private", qq, combined, is_ruirui=is_ruirui))
 
@@ -1000,7 +1014,7 @@ async def process_private(qq: int, msg_content: str, is_ruirui: bool = False):
             qq_state.private_queues[qq]["timer"].cancel()
         q_data = qq_state.private_queues.pop(qq, None)
         if q_data and q_data["messages"]:
-            combined = "\n".join(q_data["messages"])
+            combined = _combine_private_queue_messages(q_data["messages"])
             session_id = "qq-ruirui" if is_ruirui else f"qq-private-{qq}"
             asyncio.create_task(handle_generation(session_id, session_id, "private", qq, combined, is_ruirui=is_ruirui))
         return
@@ -1143,17 +1157,71 @@ async def process_group(group_id: int, sender_name: str, msg_content: str):
 
 # ==================== WS 路由 ====================
 
+async def _handle_ws_event(data: dict):
+    """异步处理 OneBot WS 事件，避免阻塞 receive_json 循环导致 call_onebot_api 死锁"""
+    try:
+        post_type = data.get("post_type")
+
+        if post_type == "message":
+            msg_type = data.get("message_type")
+            sender = data.get("sender", {})
+            user_id = sender.get("user_id")
+            raw_message = data.get("raw_message", "")
+            message_data = data.get("message", [])
+
+            msg_content = await parse_message_to_multimodal(message_data, raw_message)
+
+            # 检查是否是蕊蕊发起的「存表情/收藏表情」指令
+            if msg_type == "private" and user_id == config.RUIRUI_QQ:
+                save_match = re.search(r'(?:存|收藏|保存)表情\s*[:：]?\s*([^\s,，。]+)', raw_message)
+                if save_match:
+                    sticker_name = save_match.group(1).strip()
+                    saved = await _save_sticker_from_message(message_data, sticker_name)
+                    if saved:
+                        await send_qq_msg("private", user_id, f"好，已把这个表情包存为「{sticker_name}」了。")
+                        return
+                    else:
+                        await send_qq_msg("private", user_id, f"没检测到图片或表情包，发图的同时带上「存表情 {sticker_name}」试试。")
+                        return
+
+            if msg_type == "private":
+                await process_private(user_id, msg_content, is_ruirui=(user_id == config.RUIRUI_QQ))
+            elif msg_type == "group":
+                group_id = data.get("group_id")
+                nickname = sender.get("card") or sender.get("nickname") or str(user_id)
+                await process_group(group_id, nickname, msg_content)
+
+        elif post_type == "notice":
+            notice_type = data.get("notice_type")
+            sub_type = data.get("sub_type")
+            if notice_type == "notify" and sub_type == "poke":
+                target_id = data.get("target_id")
+                user_id = data.get("user_id")
+                group_id = data.get("group_id")
+                # 忽略机器人自身发出的戳一戳回执，防止自触发循环
+                if str(user_id) == str(config.BOT_QQ):
+                    return
+                if str(target_id) == str(config.BOT_QQ) or not group_id:
+                    if not group_id:
+                        await process_private(user_id, "[戳了戳你]", is_ruirui=(user_id == config.RUIRUI_QQ))
+                    else:
+                        nickname = str(user_id)
+                        await process_group(group_id, nickname, "[戳了戳沈栖]")
+    except Exception as e:
+        logger.error(f"[QQ] 异步处理 WS 事件异常: {e}", exc_info=True)
+
+
 @qq_router.websocket("/onebot/ws")
 async def qq_ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     qq_state.ws = websocket
     logger.info("[QQ] NapCat WebSocket 已连接")
-    
+
     try:
         from config import get_config
         while True:
             data = await websocket.receive_json()
-            
+
             # 1. 优先处理 API 调用的响应 (带 echo 的帧)
             echo = data.get("echo")
             if echo and echo in qq_state.pending_responses:
@@ -1161,66 +1229,27 @@ async def qq_ws_endpoint(websocket: WebSocket):
                 if not fut.done():
                     fut.set_result(data)
                 continue
-                
+
             master_switch = await get_config('gateway_master_switch', '1')
             qq_switch = await get_config('feature_qq', '1')
             if master_switch == '0' or qq_switch == '0':
                 continue
-                
-            post_type = data.get("post_type")
-            
-            if post_type == "message":
-                msg_type = data.get("message_type")
-                sender = data.get("sender", {})
-                user_id = sender.get("user_id")
-                raw_message = data.get("raw_message", "")
-                message_data = data.get("message", [])
-                
-                msg_content = await parse_message_to_multimodal(message_data, raw_message)
-                
-                # 检查是否是蕊蕊发起的「存表情/收藏表情」指令
-                if msg_type == "private" and user_id == config.RUIRUI_QQ:
-                    save_match = re.search(r'(?:存|收藏|保存)表情\s*[:：]?\s*([^\s,，。]+)', raw_message)
-                    if save_match:
-                        sticker_name = save_match.group(1).strip()
-                        saved = await _save_sticker_from_message(message_data, sticker_name)
-                        if saved:
-                            await send_qq_msg("private", user_id, f"好，已把这个表情包存为「{sticker_name}」了。")
-                            continue
-                        else:
-                            await send_qq_msg("private", user_id, f"没检测到图片或表情包，发图的同时带上「存表情 {sticker_name}」试试。")
-                            continue
 
-                if msg_type == "private":
-                    if user_id == config.RUIRUI_QQ:
-                        await process_private(user_id, msg_content, is_ruirui=True)
-                    else:
-                        await process_private(user_id, msg_content, is_ruirui=False)
-                elif msg_type == "group":
-                    group_id = data.get("group_id")
-                    nickname = sender.get("card") or sender.get("nickname") or str(user_id)
-                    await process_group(group_id, nickname, msg_content)
-                    
-            elif post_type == "notice":
-                notice_type = data.get("notice_type")
-                sub_type = data.get("sub_type")
-                if notice_type == "notify" and sub_type == "poke":
-                    target_id = data.get("target_id")
-                    user_id = data.get("user_id")
-                    group_id = data.get("group_id")
-                    if str(target_id) == str(config.BOT_QQ) or not group_id:
-                        if not group_id:
-                            await process_private(user_id, "[戳了戳你]", is_ruirui=(user_id == config.RUIRUI_QQ))
-                        else:
-                            nickname = str(user_id)
-                            await process_group(group_id, nickname, "[戳了戳沈栖]")
-                            
+            post_type = data.get("post_type")
+            if post_type in ("message", "notice"):
+                asyncio.create_task(_handle_ws_event(data))
             elif post_type == "meta_event" and data.get("meta_event_type") == "heartbeat":
                 pass
-                
+
     except WebSocketDisconnect:
         logger.warning("[QQ] NapCat WebSocket 断开连接")
-        qq_state.ws = None
     except Exception as e:
         logger.error(f"[QQ] WebSocket 处理异常: {e}")
+    finally:
+        if qq_state.ws is websocket:
+            qq_state.ws = None
+            for fut in list(qq_state.pending_responses.values()):
+                if not fut.done():
+                    fut.set_exception(ConnectionError("NapCat WebSocket disconnected"))
+            qq_state.pending_responses.clear()
         qq_state.ws = None

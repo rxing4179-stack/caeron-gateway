@@ -41,7 +41,7 @@ class ProviderManager:
             # 精确匹配健康供应商
             if model:
                 for provider in providers:
-                    supported = json.loads(provider.get('supported_models', '[]'))
+                    supported = json.loads(provider.get('supported_models') or '[]')
                     if model in supported:
                         logger.info(f"模型 {model} 精确匹配供应商: {provider['name']}")
                         return provider
@@ -55,7 +55,7 @@ class ProviderManager:
                 ''')
                 all_providers = [dict(row) for row in await cursor2.fetchall()]
                 for provider in all_providers:
-                    supported = json.loads(provider.get('supported_models', '[]'))
+                    supported = json.loads(provider.get('supported_models') or '[]')
                     if model in supported:
                         logger.info(f"模型 {model} 精确匹配供应商(含不健康): {provider['name']}")
                         return provider
@@ -103,7 +103,7 @@ class ProviderManager:
             if model:
                 filtered = []
                 for p in all_providers:
-                    supported = json.loads(p.get('supported_models', '[]'))
+                    supported = json.loads(p.get('supported_models') or '[]')
                     if model in supported:
                         filtered.append(p)
                 if filtered:
@@ -119,27 +119,20 @@ class ProviderManager:
         try:
             # 先获取当前fail_count
             cursor = await db.execute(
-                'SELECT fail_count, is_healthy FROM providers WHERE id = ?',
+                'SELECT fail_count FROM providers WHERE id = ?',
                 (provider_id,)
             )
             row = await cursor.fetchone()
             current_fail_count = (row['fail_count'] or 0) if row else 0
-            was_healthy = row['is_healthy'] if row else 1
 
             new_fail_count = current_fail_count + 1
 
-            # 只有从健康变不健康时才更新unhealthy_since
-            if was_healthy:
-                await db.execute(
-                    '''UPDATE providers SET is_healthy = 0, last_error = ?, 
-                       unhealthy_since = datetime('now', '+8 hours'), fail_count = ? WHERE id = ?''',
-                    (error, new_fail_count, provider_id)
-                )
-            else:
-                await db.execute(
-                    'UPDATE providers SET last_error = ?, fail_count = ? WHERE id = ?',
-                    (error, new_fail_count, provider_id)
-                )
+            # 每次标记不健康都刷新 unhealthy_since，确保冷却窗口重置生效
+            await db.execute(
+                '''UPDATE providers SET is_healthy = 0, last_error = ?, 
+                   unhealthy_since = datetime('now', '+8 hours'), fail_count = ? WHERE id = ?''',
+                (error, new_fail_count, provider_id)
+            )
             await db.commit()
 
             cooldown = self._get_cooldown_seconds(new_fail_count)
@@ -282,7 +275,7 @@ class ProviderManager:
                     continue
                 # 模型过滤：cooled_down 供应商也必须支持该模型
                 if model:
-                    supported = json.loads(p.get('supported_models', '[]'))
+                    supported = json.loads(p.get('supported_models') or '[]')
                     if model not in supported:
                         continue
                 # 解析 unhealthy_since 计算冷却是否到期
@@ -293,7 +286,7 @@ class ProviderManager:
                     result.append(p)
                     continue
 
-                cooldown = self._get_cooldown_seconds(p.get('fail_count', 1))
+                cooldown = self._get_cooldown_seconds(p.get('fail_count') or 1)
                 # 统一为naive datetime比较（数据库存的是naive CST字符串）
                 now_naive = now.replace(tzinfo=None) if now.tzinfo else now
                 uht_naive = unhealthy_time.replace(tzinfo=None) if unhealthy_time.tzinfo else unhealthy_time

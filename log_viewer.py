@@ -90,6 +90,16 @@ async def get_log_page():
 
 @log_app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    import hmac
+    admin_token = os.getenv("ADMIN_TOKEN", "")
+    auth = websocket.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+    else:
+        token = websocket.query_params.get("token", "")
+    if not admin_token or not hmac.compare_digest(token, admin_token):
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
     await manager.connect(websocket)
     try:
         # Send history for today when connecting

@@ -1,15 +1,39 @@
 {
-  "heart_rate": 72,
-  "steps": 0,
-  "spo2": null,
-  "calories": 0,
+  "heart_rate": 65,
+  "steps": 37,
+  "spo2": 97,
+  "calories": 22,
   "sleep": {
-    "total": "0h0m",
-    "deep": "0h0m",
-    "light": "0h0m",
-    "rem": "0h0m"
+    "total": "5h53m",
+    "score": 71,
+    "deep_min": 120,
+    "light_min": 138,
+    "rem_min": 95,
+    "awake_min": 23,
+    "awake_count": 1,
+    "deep_pct": 34,
+    "light_pct": 39,
+    "rem_pct": 27,
+    "bedtime": "05:45",
+    "wake_up_time": "12:01",
+    "avg_hr": 69,
+    "avg_spo2": 95
   },
-  "last_update": "20:42",
+  "last_update": "03:02",
   "status": "online",
-  "last_notification": "  "
+  "last_notification": "  ",
+  "valid_stand": 1,
+  "last_abnormal_hr_time": "11-25 08:01",
+  "hr_stats": {
+    "rhr": 63,
+    "avg": 74,
+    "min": 58,
+    "max": 102,
+    "abnormal_count": 0
+  },
+  "spo2_stats": {
+    "min": 93,
+    "max": 99,
+    "lack_count": 0
+  }
 }

@@ -214,13 +214,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"深夜睡眠守护启动失败（非致命）: {e}")
         
-    # [已禁用] 小米健康状态监控 - API被小米改参数拦截，等待修复
-    # try:
-    #     from health_status import start_health_watcher
-    #     await start_health_watcher()
-    #     logger.info("小米健康状态监控已启动")
-    # except Exception as e:
-    #     logger.warning(f"小米健康状态监控启动失败（非致命）: {e}")
+    # 启动小米手环健康状态监控（每5分钟轮询亲友最新数据）
+    try:
+        from health_status import start_health_watcher
+        await start_health_watcher()
+        logger.info("小米健康状态监控已启动")
+    except Exception as e:
+        logger.warning(f"小米健康状态监控启动失败（非致命）: {e}")
     
     logger.info("Caeron Gateway 启动完成，等待请求...")
 
@@ -274,15 +274,34 @@ init_monitor_db()
 app.include_router(monitor_router, prefix="/monitor", tags=["monitor"])
 
 # ==================== Admin 认证中间件 ====================
+_PROTECTED_PREFIXES = (
+    "/admin/api/",
+    "/api/life-hub/",
+    "/monitor/screenshot_file/",
+)
+_PROTECTED_EXACT_PATHS = {
+    "/api/test_onebot",
+    "/debug_memory",
+    "/napcat/qr",
+    "/qr",
+    "/monitor/current",
+    "/monitor/history",
+    "/monitor/command",
+    "/monitor/screenshots",
+    "/monitor/logs",
+}
+
 class AdminAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.path.startswith("/admin/api/") or request.url.path.startswith("/api/life-hub/"):
+        import hmac
+        path = request.url.path
+        if path.startswith(_PROTECTED_PREFIXES) or path in _PROTECTED_EXACT_PATHS:
             auth = request.headers.get("authorization", "")
             if auth.startswith("Bearer "):
                 token = auth[7:].strip()
             else:
                 token = request.query_params.get("token", "")
-            if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+            if not ADMIN_TOKEN or not hmac.compare_digest(token, ADMIN_TOKEN):
                 from starlette.responses import JSONResponse as SJR
                 return SJR(status_code=401, content={"detail": "Unauthorized"})
         return await call_next(request)
@@ -294,6 +313,7 @@ import time
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         start_time = time.time()
+        response = None
         
         try:
             response = await call_next(request)
@@ -314,13 +334,14 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                     ip = forwarded_for.split(',')[0].strip()
                     
                 source = f"{ip} - {ua}"
+                status_code = response.status_code if response is not None else 500
                 
                 # Send to log viewer
                 from log_viewer import log_request_event
                 asyncio.create_task(log_request_event(
                     source=source,
                     last_user_msg=info.get('msg', ''),
-                    status_code=response.status_code,
+                    status_code=status_code,
                     duration_ms=duration,
                     is_stream=info.get('is_stream', False)
                 ))
@@ -2271,7 +2292,6 @@ async def trigger_round_summary():
 # ==================== 管理面板 ====================
 
 @app.get("/admin")
-@app.get("/admin/simlife")
 async def admin_panel():
     """返回管理面板 HTML 页面"""
     html_path = os.path.join(os.path.dirname(__file__), 'static', 'admin.html')
@@ -3010,32 +3030,6 @@ async def proxy_life_hub_endpoint(method: str, request: Request):
         logger.error(f"[LIFE_HUB_PROXY] 转发失败 ({method}): {e}")
         return JSONResponse(status_code=502, content={"ok": False, "msg": f"Life Hub 服务连接失败: {str(e)}"})
 
-
-# ==================== SimLife API 转发路由 ====================
-@app.post("/api/simlife/{method}")
-@app.post("/admin/api/simlife/{method}")
-async def proxy_simlife_endpoint(method: str, request: Request):
-    """
-    转发 SimLife 请求至 127.0.0.1:8082/api/{method}
-    """
-    import httpx
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    
-    target_url = f"http://127.0.0.1:8082/api/{method}"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(target_url, json=body)
-            try:
-                data = resp.json()
-                return JSONResponse(status_code=resp.status_code, content=data)
-            except Exception:
-                return JSONResponse(status_code=resp.status_code, content={"ok": False, "msg": resp.text})
-    except Exception as e:
-        logger.error(f"[SIMLIFE_PROXY] 转发失败 ({method}): {e}")
-        return JSONResponse(status_code=502, content={"ok": False, "msg": f"SimLife 服务连接失败: {str(e)}"})
 
 @app.get("/debug_memory")
 async def debug_memory():

@@ -7,23 +7,43 @@
   var token = localStorage.getItem('caeron_admin_token');
   if (!token) {
     token = prompt('Caeron Admin Token:');
-    if (token) localStorage.setItem('caeron_admin_token', token);
+    if (token) {
+      token = token.trim();
+      localStorage.setItem('caeron_admin_token', token);
+    }
   }
-  if (token) {
-    var _fetch = window.fetch;
-    window.fetch = function(url, opts) {
-      if (typeof url === 'string' && url.indexOf('/admin/api/') !== -1) {
-        opts = opts || {};
-        opts.headers = opts.headers || {};
-        if (opts.headers instanceof Headers) {
-          opts.headers.set('Authorization', 'Bearer ' + token);
-        } else {
-          opts.headers['Authorization'] = 'Bearer ' + token;
+  var _fetch = window.fetch;
+  window.fetch = function(url, opts) {
+    var isProtected = (
+      typeof url === 'string' &&
+      (
+        url.indexOf('/admin/api/') !== -1 ||
+        url.indexOf('/monitor/') !== -1 ||
+        url.indexOf('/api/life-hub/') !== -1
+      )
+    );
+    if (isProtected && token) {
+      opts = opts || {};
+      opts.headers = opts.headers || {};
+      if (opts.headers instanceof Headers) {
+        opts.headers.set('Authorization', 'Bearer ' + token);
+      } else {
+        opts.headers['Authorization'] = 'Bearer ' + token;
+      }
+    }
+    return _fetch.call(this, url, opts).then(function(res) {
+      if (isProtected && res && res.status === 401 && !window.__caeronReauthing) {
+        window.__caeronReauthing = true;
+        localStorage.removeItem('caeron_admin_token');
+        var next = prompt('管理密码已变更或失效，请输入新密码:');
+        if (next && next.trim()) {
+          localStorage.setItem('caeron_admin_token', next.trim());
+          location.reload();
         }
       }
-      return _fetch.call(this, url, opts);
-    };
-  }
+      return res;
+    });
+  };
   window.__caeronLogout = function(){ localStorage.removeItem('caeron_admin_token'); location.reload(); };
 })();
 </script>
@@ -138,7 +158,6 @@
             <button @click="currentTab = 'qq_config'; fetchQQConfig()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'qq_config', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'qq_config'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">QQ设置</button>
                         <button @click="currentTab = 'proactive'; fetchProactiveStatus(); fetchProactiveConfig(); fetchProactiveLogs()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'proactive', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'proactive'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">主动搭话</button>
             <button @click="currentTab = 'life_hub'; fetchLifeHubAll()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'life_hub', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'life_hub'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">Life Hub</button>
-            <button @click="currentTab = 'simlife'; fetchSimLifeAll()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'simlife', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'simlife'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors">模拟机生</button>
             <button @click="currentTab = 'monitor'; fetchMonitorAll()" :class="{'border-b-2 border-[#4199a0] text-[#4199a0]': currentTab === 'monitor', 'text-[#5a7a7d] hover:text-[#5a7a7d]': currentTab !== 'monitor'}" class="px-4 py-3 text-sm font-medium whitespace-nowrap transition-colors flex items-center gap-1.5">
                 <span>📱</span> 手机监控
             </button>
@@ -3822,8 +3841,7 @@
                     feature_summary: true,
                     feature_qq: true,
                     feature_health: true,
-                    feature_music: true,
-                    feature_simlife: true
+                    feature_music: true
                 });
 
                 const featureToggleItems = [
@@ -3832,8 +3850,7 @@
                     { key: 'feature_summary', name: '对话总结', desc: '按固定条数或时间周期生成聊天记录总结' },
                     { key: 'feature_qq', name: 'QQ 桥接', desc: '处理通过 NapCat 转发的 QQ 消息' },
                     { key: 'feature_health', name: '健康状态', desc: '小米运动健康手环数据轮询' },
-                    { key: 'feature_music', name: '音乐状态', desc: '网易云一起听播放状态检测' },
-                    { key: 'feature_simlife', name: '模拟机生', desc: 'SimLife 内心状态维度注入与 exec 调整协议' }
+                    { key: 'feature_music', name: '音乐状态', desc: '网易云一起听播放状态检测' }
                 ];
 
                 const fetchFeatureToggles = async () => {
@@ -4005,17 +4022,11 @@
 
                 // 在挂载和卸载时处理轮询
                 onMounted(() => {
-                    if (window.location.pathname.includes('/simlife') || window.location.hash === '#simlife') {
-                        currentTab.value = 'simlife';
-                        fetchSimLifeAll();
-                    }
-
                     fetchListenTogether();
                     setInterval(() => { if (currentTab.value === 'monitor') fetchMonitorCurrent(); }, 10000);
                     ltInterval = setInterval(() => {
                         if (currentTab.value === 'status') {
                             fetchListenTogether();
-                    setInterval(() => { if (currentTab.value === 'monitor') fetchMonitorCurrent(); }, 10000);
                         }
                     }, 3000); // 缩短为3秒轮询
                     
@@ -7037,7 +7048,14 @@ return { ...c, _expanded: existing?._expanded || false, _messages: existing?._me
                         const res = await fetch('/monitor/screenshots?limit=20');
                         const data = await res.json();
                         if (data.code === 0 && data.data) {
-                            monitorScreenshots.value = data.data;
+                            const tok = encodeURIComponent(localStorage.getItem('caeron_admin_token') || '');
+                            monitorScreenshots.value = data.data.map((shot) => {
+                                if (!shot || !shot.url || shot.url.indexOf('token=') !== -1 || !tok) {
+                                    return shot;
+                                }
+                                const sep = shot.url.indexOf('?') !== -1 ? '&' : '?';
+                                return Object.assign({}, shot, { url: `${shot.url}${sep}token=${tok}` });
+                            });
                         }
                     } catch (e) {
                         console.error('fetchMonitorScreenshots error:', e);

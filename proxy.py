@@ -185,6 +185,20 @@ from exec_router import ExecTagStreamFilter, extract_exec_tags, strip_exec_tags,
 
 logger = logging.getLogger(__name__)
 
+# 模块级复用 HTTP 连接池，避免每次上游请求重复 TLS 握手
+_SHARED_HTTP_CLIENT = httpx.AsyncClient(
+    limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+)
+
+
+def _dump_last_request(payload: dict) -> None:
+    """后台异步落盘调试请求包，避免阻塞事件循环"""
+    try:
+        with open("/home/ubuntu/caeron-gateway/last_request.json", "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception as e:
+        logger.debug(f"last_request dump ignored: {e}")
+
 def clean_system_prompt(content: str) -> str:
     """清理上游平台注入的系统预设，采用白名单策略保护用户角色卡，剥离其余注入"""
     if not isinstance(content, str):
@@ -443,23 +457,12 @@ async def proxy_chat_completion(request_body: dict, provider: dict, conversation
     timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
 
     logger.info(f"转发请求到 {provider['name']}: {upstream_url} (stream={is_stream})")
-    body_str = json.dumps(request_body)
-    msgs = request_body.get('messages', [])
-    role_totals = {}
-    for i, msg in enumerate(msgs):
-        content = msg.get('content', '')
-        content_str = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-        clen = len(content_str)
-        role = msg.get('role', '?')
-        role_totals[role] = role_totals.get(role, 0) + clen
-        preview = content_str[:80]
 
-    # 将最终发送给大模型的包持久化下来以供调试
+    # 后台落盘调试包，不阻塞主请求路径
     try:
-        with open("/home/ubuntu/caeron-gateway/last_request.json", "w", encoding="utf-8") as f:
-            json.dump(request_body, f, ensure_ascii=False, indent=2)
+        asyncio.create_task(asyncio.to_thread(_dump_last_request, request_body))
     except Exception as e:
-        import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
+        logger.debug(f"create_task dump ignored: {e}")
 
     if is_stream:
         return await _proxy_stream(upstream_url, headers, request_body, timeout, provider, conversation_id, source, skip_messages_table, client_host=client_host)
@@ -473,17 +476,16 @@ async def _proxy_stream(url: str, headers: dict, body: dict, timeout, provider: 
     正确处理 data: {...}\n\n 格式和 [DONE] 标记
     同时收集AI回复内容用于存储
     """
-    client = httpx.AsyncClient(timeout=timeout)
+    client = _SHARED_HTTP_CLIENT
 
     try:
         # 构建并发送流式请求
-        req = client.build_request('POST', url, json=body, headers=headers)
+        req = client.build_request('POST', url, json=body, headers=headers, timeout=timeout)
         response = await client.send(req, stream=True)
 
         if response.status_code != 200:
             error_body = await response.aread()
             await response.aclose()
-            await client.aclose()
             raise Exception(
                 f"上游返回 {response.status_code}: {error_body.decode('utf-8', errors='replace')[:500]}"
             )
@@ -676,7 +678,6 @@ async def _proxy_stream(url: str, headers: dict, body: dict, timeout, provider: 
                 yield f"data: {error_data}\n\n"
             finally:
                 await response.aclose()
-                await client.aclose()
                 # 流结束后处理可执行标签并存储剥离后的回复
                 if _conv_id and collected_chunks:
                     full_content = ''.join(collected_chunks)
@@ -709,81 +710,79 @@ async def _proxy_stream(url: str, headers: dict, body: dict, timeout, provider: 
                 'X-Provider': safe_name,
             }
         )
-    except Exception as e:
-        await client.aclose()
+    except Exception:
         raise
 
 
 async def _proxy_json(url: str, headers: dict, body: dict, timeout, provider: dict, conversation_id: str = None, source: str = 'operit', skip_messages_table: bool = False, client_host: str = '1.14.59.116:8080'):
     """非流式转发：直接转发 JSON 响应，并存储AI回复"""
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(url, json=body, headers=headers)
+    response = await _SHARED_HTTP_CLIENT.post(url, json=body, headers=headers, timeout=timeout)
 
-        if response.status_code != 200:
-            raise Exception(
-                f"上游返回 {response.status_code}: {response.text[:500]}"
-            )
+    if response.status_code != 200:
+        raise Exception(
+            f"上游返回 {response.status_code}: {response.text[:500]}"
+        )
 
-        response_data = response.json()
+    response_data = response.json()
 
-        # [IMAGE_INTERCEPT] 拦截并转存 Base64 图片
+    # [IMAGE_INTERCEPT] 拦截并转存 Base64 图片
+    try:
+        choices = response_data.get('choices', [])
+        if choices:
+            msg = choices[0].get('message', {})
+            if 'b64_json' in msg:
+                fname = save_base64_data_to_file(msg['b64_json'])
+                if fname:
+                    msg['content'] = f"\n\n![生成的图片](http://{client_host}/static/generated_images/{fname})\n\n"
+                    del msg['b64_json']
+            if 'content' in msg:
+                msg['content'] = transform_image_content(msg['content'], client_host)
+        elif 'data' in response_data and isinstance(response_data['data'], list):
+            md_imgs = []
+            for d in response_data['data']:
+                if isinstance(d, dict):
+                    if 'b64_json' in d:
+                        fname = save_base64_data_to_file(d['b64_json'])
+                        if fname:
+                            md_imgs.append(f"![生成的图片](http://{client_host}/static/generated_images/{fname})")
+                    elif 'url' in d:
+                        md_imgs.append(f"![生成的图片]({d['url']})")
+            if md_imgs:
+                response_data['choices'] = [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "\n\n".join(md_imgs)
+                    },
+                    "finish_reason": "stop"
+                }]
+    except Exception as e:
+        logger.error(f"[IMAGE_INTERCEPT] 非流式图片响应处理异常: {e}", exc_info=True)
+
+    # 处理与存储AI回复
+    if conversation_id:
         try:
             choices = response_data.get('choices', [])
             if choices:
-                msg = choices[0].get('message', {})
-                if 'b64_json' in msg:
-                    fname = save_base64_data_to_file(msg['b64_json'])
-                    if fname:
-                        msg['content'] = f"\n\n![生成的图片](http://{client_host}/static/generated_images/{fname})\n\n"
-                        del msg['b64_json']
-                if 'content' in msg:
-                    msg['content'] = transform_image_content(msg['content'], client_host)
-            elif 'data' in response_data and isinstance(response_data['data'], list):
-                md_imgs = []
-                for d in response_data['data']:
-                    if isinstance(d, dict):
-                        if 'b64_json' in d:
-                            fname = save_base64_data_to_file(d['b64_json'])
-                            if fname:
-                                md_imgs.append(f"![生成的图片](http://{client_host}/static/generated_images/{fname})")
-                        elif 'url' in d:
-                            md_imgs.append(f"![生成的图片]({d['url']})")
-                if md_imgs:
-                    response_data['choices'] = [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": "\n\n".join(md_imgs)
-                        },
-                        "finish_reason": "stop"
-                    }]
+                content = choices[0].get('message', {}).get('content', '')
+                if content:
+                    clean_content = content
+                    if '<exec' in content:
+                        exec_blocks = extract_exec_tags(content)
+                        if exec_blocks:
+                            logger.info(f"[PROXY_JSON] 捕获到 {len(exec_blocks)} 个 exec 块，启动异步路由执行")
+                            asyncio.create_task(process_and_route(exec_blocks, conversation_id))
+                        clean_content = strip_exec_tags(content)
+                    choices[0]['message']['content'] = clean_content
+                    await store_assistant_response(conversation_id, clean_content, source=source, skip_messages_table=skip_messages_table)
         except Exception as e:
-            logger.error(f"[IMAGE_INTERCEPT] 非流式图片响应处理异常: {e}", exc_info=True)
+            logger.error(f"非流式回复处理/存储失败: {e}")
 
-        # 处理与存储AI回复
-        if conversation_id:
-            try:
-                choices = response_data.get('choices', [])
-                if choices:
-                    content = choices[0].get('message', {}).get('content', '')
-                    if content:
-                        clean_content = content
-                        if '<exec' in content:
-                            exec_blocks = extract_exec_tags(content)
-                            if exec_blocks:
-                                logger.info(f"[PROXY_JSON] 捕获到 {len(exec_blocks)} 个 exec 块，启动异步路由执行")
-                                asyncio.create_task(process_and_route(exec_blocks, conversation_id))
-                            clean_content = strip_exec_tags(content)
-                        choices[0]['message']['content'] = clean_content
-                        await store_assistant_response(conversation_id, clean_content, source=source, skip_messages_table=skip_messages_table)
-            except Exception as e:
-                logger.error(f"非流式回复处理/存储失败: {e}")
-
-        safe_name = quote(provider['name'], safe='')
-        return JSONResponse(
-            content=response_data,
-            headers={'X-Provider': safe_name}
-        )
+    safe_name = quote(provider['name'], safe='')
+    return JSONResponse(
+        content=response_data,
+        headers={'X-Provider': safe_name}
+    )
 
 
 async def proxy_models(provider: dict):

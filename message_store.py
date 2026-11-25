@@ -234,7 +234,7 @@ async def ensure_conversation(conversation_id: str, model: str = None, provider_
 async def _delete_excess_messages(db, conversation_id: str, delete_from_index: int):
     # 查出要删除的 messages
     cursor = await db.execute('''
-        SELECT id, role, content, message_index FROM messages 
+        SELECT id, role, content, message_index, created_at FROM messages 
         WHERE conversation_id = ? AND message_index > ?
         ORDER BY message_index ASC
     ''', (conversation_id, delete_from_index))
@@ -613,12 +613,14 @@ async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0, f
                 ORDER BY timestamp DESC, id DESC LIMIT 150
             ''', (context_filter,))
         elif ruirui_sync:
+            from qq_config import config as _qq_cfg
+            ruirui_ctx = f"private_{_qq_cfg.RUIRUI_QQ}"
             cursor = await db.execute('''
                 SELECT source, source_context, role, content, char_count, timestamp 
                 FROM unified_messages 
-                WHERE source = 'operit' OR (source = 'qq' AND source_context LIKE 'private_%')
+                WHERE source = 'operit' OR (source = 'qq' AND source_context = ?)
                 ORDER BY timestamp DESC, id DESC LIMIT 150
-            ''')
+            ''', (ruirui_ctx,))
         elif source_filter:
             cursor = await db.execute('''
                 SELECT source, source_context, role, content, char_count, timestamp 
@@ -726,12 +728,23 @@ async def get_unified_history(char_limit: int = 15000, exclude_count: int = 0, f
                                     if "image_url" in block:
                                         del block["image_url"]
 
-                        if prefix:
-                            if content_obj and content_obj[0].get("type") == "text":
-                                content_obj[0]["text"] = prefix + content_obj[0]["text"]
-                            else:
-                                content_obj.insert(0, {"type": "text", "text": prefix})
-                        msg_content = content_obj
+                        has_img_block = any(isinstance(b, dict) and b.get("type") == "image_url" for b in content_obj)
+                        if not has_img_block:
+                            # 若列表中已无真实图片（全部为 text 或 [历史图片]），折叠为干净的纯文本字符串
+                            flat_parts = [
+                                str(b.get("text", "")).strip()
+                                for b in content_obj
+                                if isinstance(b, dict) and b.get("type") == "text" and str(b.get("text", "")).strip()
+                            ]
+                            flat_text = " ".join(flat_parts) if flat_parts else "[历史图片]"
+                            msg_content = f"{prefix}{flat_text}"
+                        else:
+                            if prefix:
+                                if content_obj and content_obj[0].get("type") == "text":
+                                    content_obj[0]["text"] = prefix + content_obj[0]["text"]
+                                else:
+                                    content_obj.insert(0, {"type": "text", "text": prefix})
+                            msg_content = content_obj
                 except Exception:
                     pass
 
@@ -800,7 +813,8 @@ async def store_assistant_response(conversation_id: str, content: str, source: s
     if source == 'qq-judge':
         return
         
-    if source == 'qq-proactive' and '[SKIP]' in content.upper():
+    upper_stripped = content.strip().upper()
+    if source == 'qq-proactive' and (upper_stripped in ('SKIP', '[SKIP]') or '[SKIP]' in upper_stripped):
         return
     
     if skip_messages_table:
@@ -897,40 +911,47 @@ async def _embed_and_store_dialogue_memory(conversation_id: str, assistant_conte
         """, (conversation_id,))
         row = await cursor.fetchone()
         user_content = row['content'] if row else ''
-        
-        # 简单清理一下多模态格式
-        if isinstance(user_content, str) and user_content.startswith('['):
-            try:
-                arr = json.loads(user_content)
-                if isinstance(arr, list):
-                    text_parts = [item.get('text', '') for item in arr if item.get('type') == 'text']
-                    user_content = '\n'.join(text_parts)
-            except Exception as e:
-                import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
-                
-        # 预处理清洗元数据
-        from utils import clean_chat_text
-        cleaned_user = clean_chat_text(user_content).strip()
-        cleaned_ast = clean_chat_text(assistant_content).strip()
-                
-        # 2. 拼接成对存储
-        combined_text = f"User: {cleaned_user}\nAssistant: {cleaned_ast}"
-        
-        # 3. 调 embedding API
-        from embedding import get_embedding
-        emb_vector = await get_embedding(combined_text)
-        
-        emb_json = json.dumps(emb_vector) if emb_vector else None
-        
-        # 4. 存入 memories 表（精准更新或新增，避免重roll重复插入相同用户的对话对）
-        cursor = await db.execute("""
-            SELECT id FROM memories 
-            WHERE category = 'dialogue' 
-              AND content LIKE ?
-            ORDER BY id DESC LIMIT 1
-        """, (f"User: {cleaned_user}\nAssistant:%",))
-        existing_mem = await cursor.fetchone()
-        
+    finally:
+        await db.close()
+
+    # 简单清理一下多模态格式
+    if isinstance(user_content, str) and user_content.startswith('['):
+        try:
+            arr = json.loads(user_content)
+            if isinstance(arr, list):
+                text_parts = [item.get('text', '') for item in arr if item.get('type') == 'text']
+                user_content = '\n'.join(text_parts)
+        except Exception as e:
+            import logging; logging.getLogger(__name__).debug(f"Exception ignored: {e}")
+
+    # 预处理清洗元数据
+    from utils import clean_chat_text
+    cleaned_user = clean_chat_text(user_content).strip()
+    cleaned_ast = clean_chat_text(assistant_content).strip()
+
+    # 2. 拼接成对存储
+    combined_text = f"User: {cleaned_user}\nAssistant: {cleaned_ast}"
+
+    # 3. 调 embedding API（外部网络 IO 期间不占用数据库连接）
+    from embedding import get_embedding
+    emb_vector = await get_embedding(combined_text)
+    emb_json = json.dumps(emb_vector) if emb_vector else None
+
+    db = await get_db()
+    try:
+        # 4. 存入 memories 表（仅对足够长的近期用户输入做重roll覆盖，防止短回复误覆写历史记忆）
+        existing_mem = None
+        if len(cleaned_user) >= 12:
+            escaped_user = cleaned_user.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            cursor = await db.execute("""
+                SELECT id FROM memories 
+                WHERE category = 'dialogue' 
+                  AND created_at >= datetime('now', '+8 hours', '-1 hours')
+                  AND content LIKE ? ESCAPE '\\'
+                ORDER BY id DESC LIMIT 1
+            """, (f"User: {escaped_user}\nAssistant:%",))
+            existing_mem = await cursor.fetchone()
+
         if existing_mem:
             await db.execute("""
                 UPDATE memories 

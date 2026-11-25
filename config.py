@@ -5,9 +5,14 @@ Caeron Gateway - 配置管理模块
 """
 
 import logging
+import time
 from database import get_db
 
 logger = logging.getLogger(__name__)
+
+# 轻量内存缓存：减少每次请求重复开启 SQLite 读取高频开关配置
+_CONFIG_CACHE: dict[str, tuple[str, float]] = {}
+_CONFIG_TTL = 15.0
 
 # 默认配置项：key -> (value, description)
 DEFAULT_CONFIG = {
@@ -27,25 +32,31 @@ DEFAULT_CONFIG = {
     'feature_qq': ('1', 'QQ桥接功能'),
     'feature_health': ('1', '小米运动健康数据获取'),
     'feature_music': ('1', '网易云音乐状态获取'),
-    'feature_simlife': ('1', '模拟机生模块（SimLife 内心状态注入 + exec 命令协议）'),
 }
 
 
 async def get_config(key: str, default: str = '') -> str:
-    """从 config 表读取配置值"""
+    """从 config 表读取配置值（带 15s 内存缓存）"""
+    now_mono = time.monotonic()
+    cached = _CONFIG_CACHE.get(key)
+    if cached is not None and (now_mono - cached[1]) < _CONFIG_TTL:
+        return cached[0]
+
     db = await get_db()
     try:
         cursor = await db.execute(
             'SELECT value FROM config WHERE key = ?', (key,)
         )
         row = await cursor.fetchone()
-        return row['value'] if row else default
+        val = row['value'] if row else default
+        _CONFIG_CACHE[key] = (val, now_mono)
+        return val
     finally:
         await db.close()
 
 
 async def set_config(key: str, value: str, description: str = None) -> None:
-    """设置配置项（存在则更新，不存在则插入）"""
+    """设置配置项（存在则更新，不存在则插入，并立即刷新缓存）"""
     db = await get_db()
     try:
         await db.execute('''
@@ -56,6 +67,7 @@ async def set_config(key: str, value: str, description: str = None) -> None:
                 updated_at = datetime('now', '+8 hours')
         ''', (key, value, description))
         await db.commit()
+        _CONFIG_CACHE[key] = (value, time.monotonic())
     finally:
         await db.close()
 

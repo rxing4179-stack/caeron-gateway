@@ -29,6 +29,7 @@ def _is_asmr_content(app_name: str, package: str) -> bool:
 
 async def check_echo_user(reply_text: str) -> tuple[bool, str]:
     """检查大模型主动生成的内容是否复读了用户的历史发言"""
+    db = None
     try:
         db = await get_db()
         cursor = await db.execute('''
@@ -37,7 +38,6 @@ async def check_echo_user(reply_text: str) -> tuple[bool, str]:
             ORDER BY timestamp DESC, id DESC LIMIT 20
         ''')
         u_rows = await cursor.fetchall()
-        await db.close()
         
         clean_reply = re.sub(r'[^\w\u4e00-\u9fff]', '', reply_text)
         whitelist = {'好的好的', '我知道了', '没事的啦', '快去睡觉', '早点睡吧', '晚安晚安', '怎么回事', '在干嘛呢', '醒了没有'}
@@ -48,7 +48,7 @@ async def check_echo_user(reply_text: str) -> tuple[bool, str]:
             if len(clean_u) >= 6:
                 for i in range(len(clean_u) - 6 + 1):
                     sub = clean_u[i:i+6]
-                    if sub in whitelist:
+                    if any(w in sub for w in whitelist):
                         continue
                     if sub in clean_reply:
                         return True, sub
@@ -56,6 +56,9 @@ async def check_echo_user(reply_text: str) -> tuple[bool, str]:
     except Exception as e:
         logger.error(f"[proactive] 检查复读异常: {e}")
         return False, ""
+    finally:
+        if db is not None:
+            await db.close()
 
 
 async def check_self_repeat(reply_text: str) -> tuple[bool, str]:
@@ -101,21 +104,32 @@ async def check_self_repeat(reply_text: str) -> tuple[bool, str]:
         return False, ""
 
 
-async def get_recent_sent_summaries(limit: int = 5) -> list[str]:
-    """获取最近发送过的主动消息摘要列表"""
+async def get_recent_sent_summaries(limit: int = 12) -> list[str]:
+    """获取最近发送过的主动消息摘要列表（带发送时间）"""
+    db = None
     try:
         db = await get_db()
         cursor = await db.execute("""
-            SELECT summary FROM proactive_logs 
+            SELECT created_at, summary FROM proactive_logs 
             WHERE event_type = 'sent' AND summary IS NOT NULL
             ORDER BY id DESC LIMIT ?
         """, (limit,))
         rows = await cursor.fetchall()
-        await db.close()
-        return [r['summary'] for r in rows if r['summary']]
+        results = []
+        for r in rows:
+            s = r['summary']
+            if not s:
+                continue
+            ts = str(r['created_at'] or '')
+            time_tag = f"[{ts[5:16]}] " if len(ts) >= 16 else ""
+            results.append(f"{time_tag}{s}")
+        return results
     except Exception as e:
         logger.error(f"[proactive] 获取近期主动消息异常: {e}")
         return []
+    finally:
+        if db is not None:
+            await db.close()
 
 
 _next_trigger_time = None
@@ -362,15 +376,17 @@ async def trigger_proactive(silence_minutes: float):
    -> 请立刻抓包催她闭眼睡觉，语气宠溺/无奈地催她锁屏闭眼睡觉！
 """
 
-            # 获取近期已发主动消息，注入 prompt 防复读
-            recent_sents = await get_recent_sent_summaries(limit=5)
+            # 获取近期已发主动消息，注入 prompt 让小沈自主避开复读
+            recent_sents = await get_recent_sent_summaries(limit=12)
             recent_sent_block = ""
             if recent_sents:
-                recent_sent_lines = "\n".join(f"  - {s.replace(chr(10), '')[:60]}" for s in recent_sents)
+                recent_sent_lines = "\n".join(f"  - {s.replace(chr(10), ' ')[:120]}" for s in recent_sents)
                 recent_sent_block = f"""
-【你最近已经发过的主动消息（严禁重复！必须换一个完全不同的话题）】
+【你最近已经发过的主动消息（严禁重复或撞车！必须自主避开）】
 {recent_sent_lines}
-以上消息已经发送给蕊蕊了，严禁再发相同或相似的内容！如果实在想不出新话题，请直接输出 skip。
+以上话题/梗你刚才或今天都已经发给蕊蕊了，严禁再用换汤不换药的方式重说一遍！
+- 想发消息就必须挑一个上面完全没提过的全新切入点；
+- 如果实在没新念头、或觉得上面话题已经够多了，不要硬凑废话，直接输出唯一单词：SKIP
 """
             
             trigger_prompt = f"""[PROACTIVE_TRIGGER]
@@ -406,7 +422,14 @@ async def trigger_proactive(silence_minutes: float):
             session_id = "qq-ruirui-proactive"
             reply = await send_to_gateway(session_id, "qq-proactive", messages)
             
-            if not reply or reply.startswith("[QQ_ERROR]") or "【系统提示】" in reply or "SKIP" in reply.upper():
+            reply_upper = reply.strip().upper() if reply else ""
+            if (
+                not reply
+                or reply.startswith("[QQ_ERROR]")
+                or "【系统提示】" in reply
+                or reply_upper in ("SKIP", "[SKIP]")
+                or reply_upper.startswith("SKIP")
+            ):
                 logger.info(f"[proactive] 本轮主动消息放弃发送 (AI输出/错误: {reply[:60] if reply else 'None'})")
                 await log_proactive_event('blocked', reason='ai_skipped_or_error')
                 return
@@ -464,6 +487,7 @@ async def proactive_loop():
             
             logger.info(f"[proactive] 下次醒来：{wait_minutes:.1f} 分钟后 ({_next_trigger_time.isoformat()})")
             
+            cfg_new = cfg
             while now_cst() < _next_trigger_time:
                 cfg_new = await get_proactive_config()
                 if not cfg_new['enabled']:

@@ -250,7 +250,16 @@
     const BASE_URL = (location.protocol === 'http:' || location.protocol === 'https:')
       ? ''
       : 'http://1.14.59.116:8080';
+    let ADMIN_TOKEN = localStorage.getItem('caeron_admin_token') || '';
+    if (!ADMIN_TOKEN) {
+      ADMIN_TOKEN = prompt('Caeron Admin Token:') || '';
+      if (ADMIN_TOKEN) localStorage.setItem('caeron_admin_token', ADMIN_TOKEN);
+    }
     const QR_ENDPOINT = BASE_URL + '/napcat/qr';
+    function buildQrUrl() {
+      const base = QR_ENDPOINT + (QR_ENDPOINT.includes('?') ? '&' : '?') + 't=' + Date.now();
+      return ADMIN_TOKEN ? `${base}&token=${encodeURIComponent(ADMIN_TOKEN)}` : base;
+    }
     const STATUS_ENDPOINT = BASE_URL + '/static/qr_status.json';
     const POLL_INTERVAL_MS = 2000;
 
@@ -316,7 +325,7 @@
     }
 
     function refreshViaImageFallback(manual) {
-      const url = QR_ENDPOINT + '?t=' + Date.now();
+      const url = buildQrUrl();
       const preloader = new Image();
       preloader.onload = () => {
         const isInitial = !qrAgeFetchedAt;
@@ -409,8 +418,14 @@
         }
 
         // 2. 当二维码就绪时拉取图片并做字节对比，防止闪烁
-        const resp = await fetch(QR_ENDPOINT + '?t=' + Date.now(), { cache: 'no-store' });
+        const resp = await fetch(buildQrUrl(), { cache: 'no-store' });
         if (!resp.ok) {
+          if (resp.status === 401) {
+            localStorage.removeItem('caeron_admin_token');
+            ADMIN_TOKEN = '';
+            setBadge('err', '认证失败，请刷新重新输入 Token');
+            return;
+          }
           setBadge('err', '拉取二维码失败 HTTP ' + resp.status);
           return;
         }

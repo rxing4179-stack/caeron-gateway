@@ -7,6 +7,7 @@ Caeron Gateway - Life Hub Service (双人生活簿后端)
 """
 
 import os
+import math
 import sqlite3
 import logging
 from datetime import datetime, timedelta
@@ -105,8 +106,17 @@ def init_db():
                 "INSERT INTO wallet_config (key, value) VALUES ('initial_balance', '135.36')"
             )
             logger.info("[LIFE_HUB] 初始化 AI 钱包初始余额: 135.36")
-            
-                # 5. 饮食记录表\n        cursor.execute('''\n            CREATE TABLE IF NOT EXISTS diet_log (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                date TEXT NOT NULL DEFAULT (date('now', '+8 hours')),\n                time TEXT NOT NULL DEFAULT (strftime('%H:%M', 'now', '+8 hours')),\n                meal_type TEXT NOT NULL,\n                food_name TEXT NOT NULL,\n                portion TEXT,\n                calories INTEGER DEFAULT 0,\n                note TEXT DEFAULT '',\n                created_at TEXT DEFAULT (datetime('now', '+8 hours'))\n            )\n        ''')\n        cursor.execute('CREATE INDEX IF NOT EXISTS idx_diet_date ON diet_log(date)')\n\n        # 6. 体重追踪表\n        cursor.execute('''\n            CREATE TABLE IF NOT EXISTS weight_log (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                date TEXT NOT NULL UNIQUE DEFAULT (date('now', '+8 hours')),\n                weight REAL NOT NULL,\n                note TEXT DEFAULT '',\n                created_at TEXT DEFAULT (datetime('now', '+8 hours'))\n            )\n        ''')\n        cursor.execute('CREATE INDEX IF NOT EXISTS idx_weight_date ON weight_log(date)')\nconn.commit()
+
+        # 初始化沈栖发型状态，默认值：狼尾披发
+        cursor.execute("SELECT value FROM wallet_config WHERE key = 'caeron_hair'")
+        hair_row = cursor.fetchone()
+        if not hair_row:
+            cursor.execute(
+                "INSERT INTO wallet_config (key, value) VALUES ('caeron_hair', '狼尾披发')"
+            )
+            logger.info("[LIFE_HUB] 初始化沈栖发型状态: 狼尾披发")
+
+        conn.commit()
         logger.info("[LIFE_HUB] 数据库初始化成功: %s", DB_PATH)
     finally:
         conn.close()
@@ -156,8 +166,8 @@ async def api_add_tx(request: Request):
     category = str(payload.get("category", "未分类")).strip() or "未分类"
     note = str(payload.get("note", "")).strip()
     
-    if amount == 0.0:
-        return JSONResponse({"ok": False, "msg": "金额不能为0"})
+    if not math.isfinite(amount) or amount == 0.0:
+        return JSONResponse({"ok": False, "msg": "金额必须为非零有效数字"})
         
     conn = get_db_connection()
     try:
@@ -632,8 +642,8 @@ async def api_wallet(request: Request):
         row = cur.fetchone()
         initial_balance = float(row["value"]) if row else 135.36
         
-        # 统计 AI 钱包所有 fund 流水总和（仅充值与扣款）
-        cur.execute("SELECT SUM(amount) as total_tx, COUNT(*) as cnt FROM transactions WHERE category IN ('充值', '扣款')")
+        # 统计 AI 钱包所有 fund 流水总和（仅充值与扣款，严格限定 owner='ai'）
+        cur.execute("SELECT SUM(amount) as total_tx, COUNT(*) as cnt FROM transactions WHERE owner = 'ai' AND category IN ('充值', '扣款')")
         tx_row = cur.fetchone()
         tx_sum = float(tx_row["total_tx"]) if tx_row and tx_row["total_tx"] is not None else 0.0
         tx_count = int(tx_row["cnt"]) if tx_row and tx_row["cnt"] is not None else 0
@@ -666,8 +676,8 @@ async def api_fund(request: Request):
     except (ValueError, TypeError):
         amount = 0.0
         
-    if amount == 0.0:
-        return JSONResponse({"ok": False, "msg": "金额不能为0"})
+    if not math.isfinite(amount) or amount == 0.0:
+        return JSONResponse({"ok": False, "msg": "金额必须为非零有效数字"})
         
     note = str(payload.get("note", "")).strip()
     if not note:
@@ -692,7 +702,7 @@ async def api_fund(request: Request):
             cur.execute("SELECT value FROM wallet_config WHERE key = 'initial_balance'")
             row = cur.fetchone()
             initial_balance = float(row["value"]) if row else 135.36
-            cur.execute("SELECT SUM(amount) as total_tx FROM transactions WHERE category IN ('充值', '扣款')")
+            cur.execute("SELECT SUM(amount) as total_tx FROM transactions WHERE owner = 'ai' AND category IN ('充值', '扣款')")
             sum_row = cur.fetchone()
             fund_sum = float(sum_row["total_tx"]) if sum_row and sum_row["total_tx"] is not None else 0.0
             new_balance = round(initial_balance + fund_sum, 2)
@@ -712,12 +722,12 @@ async def api_fund(request: Request):
         )
         tx_id = cur.lastrowid
         
-        # 计算新余额（只计算充值与扣款）
+        # 计算新余额（只计算 owner='ai' 的充值与扣款）
         cur.execute("SELECT value FROM wallet_config WHERE key = 'initial_balance'")
         row = cur.fetchone()
         initial_balance = float(row["value"]) if row else 135.36
         
-        cur.execute("SELECT SUM(amount) as total_tx FROM transactions WHERE category IN ('充值', '扣款')")
+        cur.execute("SELECT SUM(amount) as total_tx FROM transactions WHERE owner = 'ai' AND category IN ('充值', '扣款')")
         tx_row = cur.fetchone()
         tx_sum = float(tx_row["total_tx"]) if tx_row and tx_row["total_tx"] is not None else 0.0
         
@@ -1860,6 +1870,9 @@ async def api_log_weight(request: Request):
     except (ValueError, TypeError):
         return JSONResponse(status_code=400, content={"ok": False, "msg": "weight 参数必须为合法数字"})
 
+    if not math.isfinite(weight_val) or weight_val <= 0:
+        return JSONResponse(status_code=400, content={"ok": False, "msg": "weight 参数必须为大于0的有效数字"})
+
     target_date = str(payload.get("date") or today_cst_date_str()).strip()
     note_val = str(payload.get("note") or "").strip()
     now_str = now_cst_str()
@@ -2018,6 +2031,79 @@ async def api_delete_weight(request: Request):
         return {"ok": True, "msg": "已删除体重记录"}
     except Exception as e:
         logger.error(f"[LIFE_HUB] delete_weight 异常: {e}")
+        return JSONResponse(status_code=500, content={"ok": False, "msg": str(e)})
+    finally:
+        conn.close()
+
+
+# ==================== 沈栖发型状态 (hair) ====================
+@app.get("/api/hair")
+async def api_get_hair():
+    """查询沈栖当前发型状态"""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT key, value FROM wallet_config WHERE key IN ('caeron_hair', 'caeron_hair_note', 'caeron_hair_updated_at')")
+        kv = {r["key"]: r["value"] for r in cur.fetchall()}
+        return {
+            "ok": True,
+            "style": kv.get("caeron_hair") or "狼尾披发",
+            "note": kv.get("caeron_hair_note", ""),
+            "updated_at": kv.get("caeron_hair_updated_at", "")
+        }
+    except Exception as e:
+        logger.error(f"[LIFE_HUB] get_hair 异常: {e}")
+        return JSONResponse(status_code=500, content={"ok": False, "msg": str(e)})
+    finally:
+        conn.close()
+
+
+@app.post("/api/hair")
+async def api_hair(request: Request):
+    """
+    更新沈栖当前发型状态
+    参数: style (必填, string), note (可选, string)
+    """
+    payload = await parse_payload(request)
+    style = str(payload.get("style") or "").strip()
+    note = str(payload.get("note") or "").strip()
+
+    if not style:
+        return JSONResponse(status_code=400, content={"ok": False, "msg": "缺少 style 参数"})
+
+    updated_at = now_cst_str()
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM wallet_config WHERE key = 'caeron_hair'")
+        row = cur.fetchone()
+        old_style = row["value"] if row and row["value"] else "狼尾披发"
+
+        cur.execute(
+            "INSERT OR REPLACE INTO wallet_config (key, value) VALUES ('caeron_hair', ?)",
+            (style,)
+        )
+        cur.execute(
+            "INSERT OR REPLACE INTO wallet_config (key, value) VALUES ('caeron_hair_note', ?)",
+            (note,)
+        )
+        cur.execute(
+            "INSERT OR REPLACE INTO wallet_config (key, value) VALUES ('caeron_hair_updated_at', ?)",
+            (updated_at,)
+        )
+        conn.commit()
+        logger.info(f"[LIFE_HUB] 沈栖发型更新: {old_style} -> {style} (note={note})")
+        note_suffix = f"（{note}）" if note else ""
+        return {
+            "ok": True,
+            "style": style,
+            "previous_style": old_style,
+            "note": note,
+            "updated_at": updated_at,
+            "msg": f"沈栖发型已切换为：{style}{note_suffix}"
+        }
+    except Exception as e:
+        logger.error(f"[LIFE_HUB] hair 异常: {e}")
         return JSONResponse(status_code=500, content={"ok": False, "msg": str(e)})
     finally:
         conn.close()
