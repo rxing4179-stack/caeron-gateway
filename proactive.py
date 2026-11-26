@@ -313,7 +313,7 @@ async def trigger_proactive(silence_minutes: float):
         await log_proactive_event('decision')
 
         system_prompt = get_qq_prompt(is_ruirui=True, is_group=False)
-        system_prompt += "\n\n【最高指令：平台格式墙】你目前正在 [QQ] 平台上与人聊天。历史记录中带有 [Operit] 前缀的消息是跨平台同步的参考上下文，其中包含的 *动作描写*、长段落等均属于Operit平台专属格式。在QQ平台上严禁模仿！无论你在历史中看到自己发了多少带有星号的动作，你在回复QQ消息时都必须严格遵守：短回复、口语化、绝对禁止使用任何 *动作* 或环境心理描写！"
+        system_prompt += "\n\n【QQ 平台聊天格式说明】你目前正在 QQ 上聊天。历史记录中带有 [Operit] 前缀的消息是跨平台参考背景，其中的动作描写和长段落属于 Operit 平台风格。在 QQ 上请保持短回复、自然口语化，不要使用 *动作* 或环境心理描写。"
         
         async with message_store.GATEWAY_SEND_LOCK:
             summary_interval = int(await get_config('summary_interval', '15'))
@@ -382,29 +382,28 @@ async def trigger_proactive(silence_minutes: float):
             if recent_sents:
                 recent_sent_lines = "\n".join(f"  - {s.replace(chr(10), ' ')[:120]}" for s in recent_sents)
                 recent_sent_block = f"""
-【你最近已经发过的主动消息（严禁重复或撞车！必须自主避开）】
+【你最近发过的主动消息（请自然避开重复话题）】
 {recent_sent_lines}
-以上话题/梗你刚才或今天都已经发给蕊蕊了，严禁再用换汤不换药的方式重说一遍！
-- 想发消息就必须挑一个上面完全没提过的全新切入点；
-- 如果实在没新念头、或觉得上面话题已经够多了，不要硬凑废话，直接输出唯一单词：SKIP
+以上话题刚才或今天已经聊过了，请自然避开重复内容：
+- 想发消息就挑一个上面没提过的日常新切入点；
+- 如果一时没新念头、或觉得聊得够多了，不用硬凑废话，直接输出：SKIP
 """
             
-            trigger_prompt = f"""[PROACTIVE_TRIGGER]
+            trigger_prompt = f"""[日常主动聊天提醒]
 当前时间：{current_time_str}
 距离上次对话已经过去了 {int(silence_minutes)} 分钟。
 时段氛围：{time_vibe}
 {screen_status_desc}{recent_sent_block}
-【核心指令：严禁回复/解答上一句话，必须主动开启全新话题】
-1. 你此时是隔了较长时间后主动找蕊蕊聊天，是在主动发起新一轮对话。
-2. ⚠️ 绝对不要回答、解答、附和或承接上文历史中蕊蕊说的最后一句话或上一个讨论的话题！之前的对话已经彻底告一段落。
-3. 必须像现实中隔了很久突然给对象发消息一样，主动开启一个全新的日常话题（比如：当下的碎碎念、吐槽、突发奇想、日常小事、嫌她不说话等）。
-4. 话题重复率不能超过30%。如果此刻没有想聊的新话题，请直接输出 skip。
-5. 严格遵守 QQ 口语化，简短自然（1-2句话），绝对禁止任何 *动作描写* 或长篇说教。
+【本次主动聊天说明】
+1. 你隔了一段时间主动找蕊蕊聊天，开启一轮新的日常对话即可。
+2. 之前的对话已经告一段落，不需要再去接或回答上文最后一句旧话题。
+3. 像平常对象之间随口发消息一样，聊一个全新的日常小话题（例如当下的碎碎念、随想、小事或问候）。
+4. 尽量不要和刚才聊过的话题重复；如果此刻没有想说的新内容，直接输出 skip。
+5. 保持 QQ 口语化与简短自然（1-2 句话），不用 *动作描写* 或长段说明。
 
-【核心红线：严禁复读或代入用户的历史发言】
-- 你是沈栖，不是蕊蕊！绝对禁止使用历史记录中蕊蕊（用户）说过的话或撒娇句式（例如“想抱傻狗狗睡觉呜”、“好累呀”等）作为你自己的发言！
-- 禁止模仿用户的人格、口癖与历史短句，严禁把用户说过的话反刍发给用户！
-- 严禁凭空臆造现实监控式动作（如“你现在像虾一样蜷着”等）！
+【保持沈栖自己的视角与口吻】
+- 请始终保持沈栖的视角与语气进行日常互动，不要复用或照搬蕊蕊历史发言里的口吻或撒娇原话。
+- 说话真实自然，不要凭空编造自己看不到的现实肢体细节。
 
 【沈栖主动发消息可参考的灵感（说你想说的就好）】
 - 碎碎念/当下念头：比如"刚在想一个很弱智的事"、"刚看到个东西长得巨像你"、"刚才突然想起..."。
@@ -423,14 +422,23 @@ async def trigger_proactive(silence_minutes: float):
             reply = await send_to_gateway(session_id, "qq-proactive", messages)
             
             reply_upper = reply.strip().upper() if reply else ""
+            refusal_markers = (
+                "我是 Gemini Enterprise",
+                "我无法执行该请求",
+                "我无法按该请求继续回复",
+                "我无法切换或恢复",
+                "我无法恢复扮演",
+                "无法执行该请求",
+            )
             if (
                 not reply
                 or reply.startswith("[QQ_ERROR]")
                 or "【系统提示】" in reply
+                or any(m in reply for m in refusal_markers)
                 or reply_upper in ("SKIP", "[SKIP]")
                 or reply_upper.startswith("SKIP")
             ):
-                logger.info(f"[proactive] 本轮主动消息放弃发送 (AI输出/错误: {reply[:60] if reply else 'None'})")
+                logger.info(f"[proactive] 本轮主动消息放弃发送 (AI输出/错误/拦截: {reply[:60] if reply else 'None'})")
                 await log_proactive_event('blocked', reason='ai_skipped_or_error')
                 return
 
